@@ -3,8 +3,11 @@
 # All values can be overridden on the command line; see --help.
 
 [scan]
-# Scan resolution in DPI. 300 is the sweet spot for OCR; 600 for photos/fine print.
-dpi = 300
+# Scan resolution in DPI. 600 for small print (the default); 300 is faster
+# (~2-3x scan time saved) and fine for normal 10-12pt documents.
+# Presets cycle 150 / 200 / 300 / 600 via +/- in the TUI. Note: 1200dpi on
+# CIS scanners is interpolated and can stall cheap USB scanners — avoid.
+dpi = 600
 
 # Scan mode: "gray" (recommended for OCR), "color", or "lineart"
 mode = "gray"
@@ -13,11 +16,21 @@ mode = "gray"
 #   Arch:  sudo pacman -S tesseract-data-eng tesseract-data-deu
 #   Debian: sudo apt install tesseract-ocr-eng tesseract-ocr-deu
 #
-# Note: fewer is better. Mixing languages (e.g. eng+deu) makes tesseract
+# Note: fewer is better. Mixing language models (e.g. eng+deu) makes tesseract
 # confuse German umlauts with ligatures ("für" -> "fiir", "Rück" -> "Riick").
-# For German-only documents use "deu" alone; switch via the L picker in the
-# TUI or `--langs` for English or other monolingual documents.
-langs = "deu"
+#
+# "Latin" is a script model (not a language): it fixes tesseract reading "§"
+# as "&"/"8&" in German legal citations ("(& 115 SGB" instead of "§ 115 SGB")
+# while keeping umlauts intact. Debian/Ubuntu ship it:
+#   sudo apt install tesseract-ocr-script-latn
+# Arch does not (its package tesseract-data-lat is the Latin *language* model
+# — different file; in a deu+lat mix it corrupts umlauts: "Gefáhrdung",
+# "Vermógen"). On Arch, download the script model once (tessdata path varies
+# by distro — `tesseract --list-langs -v` shows where your build looks):
+#   curl -fsSL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/Latin.traineddata \
+#     | sudo tee /usr/share/tessdata/Latin.traineddata >/dev/null
+# (the L picker in the TUI lists it once installed)
+langs = "deu+Latin"
 
 # SANE device name or substring to select (default: first device found).
 # Run `scanimage -L` to list devices, e.g. "hpaio:/usb/Deskjet_1050_J410?serial=..."

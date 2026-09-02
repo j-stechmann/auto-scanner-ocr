@@ -14,7 +14,7 @@ use crate::config::{self, Config};
     about = "Scan with a flatbed SANE scanner and produce a searchable OCR PDF - now with a terminal UI."
 )]
 pub struct Cli {
-    /// Scan resolution in DPI (default 300)
+    /// Scan resolution in DPI (default 600)
     #[arg(short = 'd', long)]
     pub dpi: Option<u16>,
 
@@ -22,7 +22,7 @@ pub struct Cli {
     #[arg(short = 'M', long)]
     pub mode: Option<String>,
 
-    /// OCR languages, plus-separated (default eng+deu)
+    /// OCR languages, plus-separated (default deu+Latin)
     #[arg(short = 'l', long)]
     pub langs: Option<String>,
 

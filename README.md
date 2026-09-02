@@ -108,13 +108,18 @@ page 2 on the glass, press `s` again — page 1 is already being cleaned and
 OCRed in the background. Press `f` when done; the PDF lands in
 `~/Documents/scans/` as `YYYY-MM-DD_HHMMSS.pdf`.
 
+**Small print**: the default is 600 dpi for dense small-print documents.
+For normal 10–12pt text, 300 dpi scans 2–3× faster with equal OCR quality
+(`-d 300` or the `-` key). Higher than 600 is pointless on flatbeds:
+1200 dpi is interpolated and can stall cheap USB scanners mid-pass.
+
 ### Options
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `-d, --dpi N` | scan resolution | 300 |
+| `-d, --dpi N` | scan resolution | 600 |
 | `-M, --mode` | `gray`, `color` or `lineart` | gray |
-| `-l, --langs A+B` | OCR languages, plus-separated | eng+deu |
+| `-l, --langs A+B` | OCR languages, plus-separated | deu+Latin |
 | `-o, --output DIR` | where PDFs are written | ~/Documents/scans |
 | `-e, --device NAME` | SANE device name or substring | first found |
 | `--no-unpaper` | skip the unpaper cleanup step | — |
@@ -131,21 +136,43 @@ the command line. Same format as before:
 
 ```toml
 [scan]
-dpi = 300
+dpi = 600              # 300 for normal print (faster); 600 for small print
 mode = "gray"          # gray | color | lineart
-langs = "deu"
+langs = "deu+Latin"
 device = "auto"
 output = "~/Documents/scans"
 unpaper = true
 notify = true
 ```
 
-**About `langs`**: tesseract degrades when languages are mixed — German
+**About `langs`**: tesseract degrades when language models are mixed — German
 umlauts turn into ligature confusions (`für` → `fiir`, `Rück` → `Riick`,
 `Grüßen` → `GruRen`) when `eng+deu` is combined. For monolingual documents
-use a single language (`deu`, `eng`, …) and switch via the `L` picker or
-`--langs` when you scan in another language. Measured on a real German
-letter: `deu` alone produced zero broken umlauts; any mix produced several.
+stick to German plus the `Latin` script model (the default `deu+Latin`) or a
+single language (`deu`, `eng`, …) and switch via the `L` picker or `--langs`
+when you scan in another language. Measured on a real German letter: `deu`
+alone and `deu+Latin` both produced zero broken umlauts; any `eng` mix
+produced several.
+
+**About `Latin`**: `Latin` is a tesseract *script* model, not a language —
+it fixes the `§` → `&` artifact in German legal citations (`& 115 SGB`
+instead of `§ 115 SGB`) without hurting umlauts, at ~0.3s extra per page.
+Debian/Ubuntu ship it (`sudo apt install tesseract-ocr-script-latn`); Arch
+does not (its `tesseract-data-lat` is the Latin *language* model — a
+different file that degrades umlauts in `deu+lat` mixes). On Arch, or when
+your distro lacks the package, download the script model once — note that
+tesseract's tessdata path varies (`tesseract --list-langs -v` shows where
+your build looks):
+
+```sh
+curl -fsSL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/Latin.traineddata \
+  | sudo tee /usr/share/tessdata/Latin.traineddata >/dev/null
+```
+
+Without it, `deu` alone misreads `§` as `&`/`8&`/`$` regardless of scan
+quality (verified up to 600 dpi) — it's a model limitation, not an input
+problem. `--doctor` prints the install hint when `Latin` is configured but
+missing.
 
 ### Image preview protocols
 
@@ -166,9 +193,14 @@ isolated child process.
 - The TUI runs the same checks at startup; if something is missing you'll see
   the diagnostics screen immediately instead of a mid-scan failure.
 - **Wrong umlauts in the OCR text (`fiir` instead of `für`)?** Your `langs`
-  mixes two languages — pick the document's language alone with `L` (or set
-  `langs = "deu"` in the config). Mixed-language OCR reliably garbles
+  mixes two language models — pick the document's language alone with `L`
+  (or set `langs = "deu"` in the config). Mixed-language OCR reliably garbles
   umlauts; single-language OCR reads them correctly.
+- **`§` read as `&`, `8&` or `$` (`& 115 SGB` instead of `§ 115 SGB`)?** The
+  `deu` model alone misreads thin `§` glyphs as a model limitation — no scan
+  setting fixes it (verified up to 600 dpi). Add the `Latin` script model:
+  `langs = "deu+Latin"` and install the data file (see "About `Latin`"
+  above).
 - Logs are written to `~/.local/state/auto-scanner-ocr/auto-scanner-ocr.log`;
   add `-v` to see them in the terminal.
 - Scanner not found? Check USB, power, and `scanimage -L`. For HP devices run

@@ -175,9 +175,19 @@ pub async fn run_checks(cfg: &Config) -> Report {
                 status: if ok { Status::Ok } else { Status::Fail },
                 detail: String::new(),
                 hint: (!ok).then(|| {
-                    format!(
-                        "pacman: sudo pacman -S tesseract-data-{lang} / apt: sudo apt install tesseract-ocr-{lang}"
-                    )
+                    if let Some(pkg) = crate::config::script_lang_package(lang) {
+                        // Script models are single traineddata files; some
+                        // distros ship them, others need a manual download.
+                        format!(
+                            "apt: sudo apt install {pkg}\n  \
+                             arch/other (tessdata dir may differ; see `tesseract --list-langs -v`):\n  \
+                             curl -fsSL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/{lang}.traineddata | sudo tee /usr/share/tessdata/{lang}.traineddata >/dev/null"
+                        )
+                    } else {
+                        format!(
+                            "pacman: sudo pacman -S tesseract-data-{lang} / apt: sudo apt install tesseract-ocr-{lang}"
+                        )
+                    }
                 }),
             });
         }

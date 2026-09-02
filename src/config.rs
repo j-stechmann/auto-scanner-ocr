@@ -29,9 +29,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            dpi: 300,
+            dpi: 600,
             mode: "gray".into(),
-            langs: "eng+deu".into(),
+            langs: "deu+Latin".into(),
             device: "auto".into(),
             output: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -128,7 +128,9 @@ pub fn load_config(explicit: Option<&PathBuf>) -> Result<Config> {
 }
 
 /// Validation shared by config load and CLI overrides (parity: dpi >= 150,
-/// known mode, lowercase-plus langs pattern).
+/// known mode, plus-separated langs pattern). Lang parts are lowercase codes
+/// (`deu`, `chi_sim`, …) or the script model `Latin` (needed for `§` — the
+/// `deu` model alone misreads it as `&`; see README troubleshooting).
 pub fn validate(cfg: Config) -> Result<Config> {
     if cfg.dpi < 150 {
         anyhow::bail!(
@@ -145,20 +147,45 @@ pub fn validate(cfg: Config) -> Result<Config> {
     }
     if !langs_valid(&cfg.langs) {
         anyhow::bail!(
-            "invalid langs '{}' (use plus-separated lowercase codes, e.g. eng+deu)",
+            "invalid langs '{}' (use plus-separated codes, e.g. deu+Latin)",
             cfg.langs
         );
     }
     Ok(cfg)
 }
 
+/// Script-model names allowed alongside lowercase language codes, paired
+/// with the Debian/Ubuntu package suffix for the ones distros ship.
+/// `Latin` is a tesseract script model (tessdata `script/Latin.traineddata`);
+/// it recognizes `§` reliably where language models fail.
+const SCRIPT_LANGS: &[(&str, &str)] = &[("Latin", "latn")];
+
+/// True when `lang` names a tesseract script model (not a language code).
+pub fn is_script_lang(lang: &str) -> bool {
+    SCRIPT_LANGS.iter().any(|(name, _)| *name == lang)
+}
+
+/// Debian/Ubuntu package shipping the script model, if one exists.
+pub fn script_lang_package(lang: &str) -> Option<String> {
+    SCRIPT_LANGS
+        .iter()
+        .find(|(name, _)| *name == lang)
+        .map(|(_, suffix)| format!("tesseract-ocr-script-{suffix}"))
+}
+
 pub fn langs_valid(langs: &str) -> bool {
     if langs.is_empty() {
         return false;
     }
-    langs
-        .split('+')
-        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+    langs.split('+').all(|part| {
+        if part.is_empty() {
+            return false;
+        }
+        if is_script_lang(part) {
+            return true;
+        }
+        part.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+    })
 }
 
 #[cfg(test)]
@@ -168,9 +195,9 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let cfg = Config::default();
-        assert_eq!(cfg.dpi, 300);
+        assert_eq!(cfg.dpi, 600);
         assert_eq!(cfg.mode, "gray");
-        assert_eq!(cfg.langs, "eng+deu");
+        assert_eq!(cfg.langs, "deu+Latin");
         assert_eq!(cfg.device, "auto");
         assert!(cfg.unpaper && cfg.notify);
     }
@@ -180,11 +207,14 @@ mod tests {
         assert!(langs_valid("eng"));
         assert!(langs_valid("eng+deu"));
         assert!(langs_valid("chi_sim+eng"));
+        assert!(langs_valid("deu+Latin"));
+        assert!(langs_valid("Latin"));
         assert!(!langs_valid(""));
         assert!(!langs_valid("eng+"));
         assert!(!langs_valid("+eng"));
         assert!(!langs_valid("eng++deu"));
         assert!(!langs_valid("Eng"));
+        assert!(!langs_valid("eng+Latin2"));
         assert!(!langs_valid("en-gb"));
         assert!(!langs_valid("en gb"));
     }
