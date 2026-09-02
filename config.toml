@@ -1,0 +1,28 @@
+# auto-scanner-ocr configuration
+# Copy to ~/.config/auto-scanner-ocr/config.toml (or keep next to the script)
+# All values can be overridden on the command line; see --help.
+
+[scan]
+# Scan resolution in DPI. 300 is the sweet spot for OCR; 600 for photos/fine print.
+dpi = 300
+
+# Scan mode: "gray" (recommended for OCR), "color", or "lineart"
+mode = "gray"
+
+# OCR languages, plus-separated. Language data must be installed, e.g.:
+#   Arch:  sudo pacman -S tesseract-data-eng tesseract-data-deu
+#   Debian: sudo apt install tesseract-ocr-eng tesseract-ocr-deu
+langs = "eng+deu"
+
+# SANE device name or substring to select (default: first device found).
+# Run `scanimage -L` to list devices, e.g. "hpaio:/usb/Deskjet_1050_J410?serial=..."
+device = "auto"
+
+# Directory where finished searchable PDFs are written
+output = "~/Documents/scans"
+
+# Deskew/clean pages with unpaper before OCR (grayscale/lineart only)
+unpaper = true
+
+# Desktop notifications (needs libnotify)
+notify = true
