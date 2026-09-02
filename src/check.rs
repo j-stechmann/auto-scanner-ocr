@@ -170,14 +170,23 @@ pub async fn run_checks(cfg: &Config) -> Report {
         };
         for lang in cfg.langs.split('+').filter(|l| !l.is_empty()) {
             let ok = have.iter().any(|l| l == lang);
+            // Script models (e.g. Latin) ship outside distro language packs;
+            // they are single traineddata files downloaded from tessdata repos.
+            let script = lang.chars().next().is_some_and(|c| c.is_ascii_uppercase());
             items.push(CheckItem {
                 what: format!("tesseract language '{lang}'"),
                 status: if ok { Status::Ok } else { Status::Fail },
                 detail: String::new(),
                 hint: (!ok).then(|| {
-                    format!(
-                        "pacman: sudo pacman -S tesseract-data-{lang} / apt: sudo apt install tesseract-ocr-{lang}"
-                    )
+                    if script {
+                        format!(
+                            "download a script model (no distro package exists), e.g.:\n  curl -sL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/{lang}.traineddata | sudo tee /usr/share/tessdata/{lang}.traineddata >/dev/null"
+                        )
+                    } else {
+                        format!(
+                            "pacman: sudo pacman -S tesseract-data-{lang} / apt: sudo apt install tesseract-ocr-{lang}"
+                        )
+                    }
                 }),
             });
         }
