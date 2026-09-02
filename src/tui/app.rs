@@ -7,6 +7,7 @@ use anyhow::Result;
 use ratatui::crossterm::event::{
     Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
+use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -77,8 +78,9 @@ pub struct App {
     pub picker_available: bool,
     /// Pane geometry from the last frame (hit-testing + preview sync).
     pub pane_rects: Option<crate::tui::ui::PaneRects>,
-    /// Whether the preview worker has a renderable image for the selection.
-    pub preview_ready: bool,
+    /// Preview grid cell rects from the last frame: (page id, cell rect),
+    /// in draw order. Used for click-to-select on the contact sheet.
+    pub preview_cells: Vec<(crate::session::PageId, Rect)>,
     /// Spinner frame counter (bumped on ticks).
     pub tick: u64,
 }
@@ -118,7 +120,7 @@ impl App {
             langs_cache: Vec::new(),
             picker_available: false,
             pane_rects: None,
-            preview_ready: false,
+            preview_cells: Vec::new(),
             tick: 0,
         }
     }
@@ -267,27 +269,26 @@ pub async fn run_tui(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        // Poll preview work before drawing so fresh encodings appear fast.
+        // Reconcile thumbnails against the page list, then poll completed
+        // decodes/encodes before drawing so fresh results appear fast.
+        // (Per-frame reconcile also makes the preview follow selection and
+        // list changes from ANY source, not just session events.)
+        preview.on_pages_changed(&app);
         let _preview_changed = preview.poll() | preview.poll_resizes();
-        app.preview_ready = preview.has_image();
 
         // Draw.
         terminal.draw(|f| ui::draw(f, &mut app, &mut preview))?;
-        // Post-draw: check whether the preview needs a different size.
-        if let Some(rects) = app.pane_rects {
-            // Must match the rect used for rendering (inside the block
-            // border), or the encode size and render guard disagree and the
-            // image only ever shows after a resize-triggered full redraw.
-            preview.sync_area(rects.preview_inner);
+        // Post-draw: kick per-cell re-encodes for the current grid geometry.
+        if !app.preview_cells.is_empty() {
+            preview.sync_cells(&app.preview_cells);
         }
-        preview.mark_rendered(&app);
 
         tokio::select! {
             // Terminal input.
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(ev)) => {
-                        handle_event(&mut app, &mut preview, &cmd_tx, ev).await?;
+                        handle_event(&mut app, &cmd_tx, ev).await?;
                     }
                     Some(Err(e)) => return Err(anyhow::anyhow!("terminal event error: {e}")),
                     None => return Ok(()),
@@ -295,7 +296,7 @@ pub async fn run_tui(
             }
             // Session actor events.
             Some(ev) = event_rx.recv() => {
-                handle_session_event(&mut app, &mut preview, ev).await;
+                handle_session_event(&mut app, ev).await;
             }
             // Diagnostics results.
             Some(tx) = diag_rx.recv() => {
@@ -318,7 +319,7 @@ pub async fn run_tui(
     Ok(())
 }
 
-async fn handle_session_event(app: &mut App, preview: &mut PreviewWorker, ev: Event) {
+async fn handle_session_event(app: &mut App, ev: Event) {
     match ev {
         Event::Pages { pages, meta } => {
             let selection_was_valid = app.selected < pages.len();
@@ -334,7 +335,6 @@ async fn handle_session_event(app: &mut App, preview: &mut PreviewWorker, ev: Ev
                 }
             }
             app.sync_selection();
-            preview.on_pages_changed(app);
         }
         Event::Status(msg) => app.set_status(msg),
         Event::Finished {
@@ -394,7 +394,6 @@ enum UiAction {
 
 async fn handle_event(
     app: &mut App,
-    preview: &mut PreviewWorker,
     cmd_tx: &mpsc::Sender<session::Cmd>,
     ev: CtEvent,
 ) -> Result<()> {
@@ -426,9 +425,7 @@ async fn handle_event(
                 UiAction::None => {}
             }
         }
-        CtEvent::Mouse(mouse) => handle_mouse(app, preview, mouse, cmd_tx).await,
-        CtEvent::Resize(_, _) => preview.on_resize(),
-        CtEvent::FocusLost | CtEvent::FocusGained | CtEvent::Paste(_) => {}
+        CtEvent::Mouse(mouse) => handle_mouse(app, mouse, cmd_tx).await,
         _ => {}
     }
     Ok(())
@@ -638,7 +635,6 @@ async fn open_result(path: &std::path::Path) {
 
 async fn handle_mouse(
     app: &mut App,
-    preview: &mut PreviewWorker,
     mouse: ratatui::crossterm::event::MouseEvent,
     cmd_tx: &mpsc::Sender<session::Cmd>,
 ) {
@@ -647,32 +643,44 @@ async fn handle_mouse(
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(pane) = ui::hit_test(app, pos) {
                 app.focus = pane;
-                if pane == Pane::Sidebar {
-                    if let Some(idx) = ui::sidebar_index_at(app, pos) {
-                        app.selected = idx;
-                        app.text_scroll = 0;
+                match pane {
+                    Pane::Sidebar => {
+                        if let Some(idx) = ui::sidebar_index_at(app, pos) {
+                            app.selected = idx;
+                            app.text_scroll = 0;
+                        }
                     }
+                    // Clicking a contact-sheet cell selects that page (ids
+                    // make this exact, unlike the sidebar's offset guess).
+                    Pane::Preview => {
+                        if let Some(id) = ui::preview_cell_at(app, pos) {
+                            if let Some(idx) = app.pages.iter().position(|p| p.id == id) {
+                                app.selected = idx;
+                                app.text_scroll = 0;
+                            }
+                        }
+                    }
+                    Pane::Text => {}
                 }
             }
         }
         MouseEventKind::ScrollUp => match ui::hit_test(app, pos) {
-            Some(Pane::Sidebar) => {
+            // Sidebar and Preview grid both move the selection.
+            Some(Pane::Sidebar) | Some(Pane::Preview) => {
                 if app.selected > 0 {
                     app.selected -= 1;
                 }
             }
             Some(Pane::Text) => app.text_scroll = app.text_scroll.saturating_sub(1),
-            Some(Pane::Preview) => preview.scroll(-1),
             None => {}
         },
         MouseEventKind::ScrollDown => match ui::hit_test(app, pos) {
-            Some(Pane::Sidebar) => {
+            Some(Pane::Sidebar) | Some(Pane::Preview) => {
                 if app.selected + 1 < app.pages.len() {
                     app.selected += 1;
                 }
             }
             Some(Pane::Text) => app.text_scroll = app.text_scroll.saturating_add(1),
-            Some(Pane::Preview) => preview.scroll(1),
             None => {}
         },
         _ => {}

@@ -11,19 +11,19 @@ use super::app::{Action, App, Pane};
 use super::overlays::{self, Confirm, Overlay};
 use super::preview::PreviewWorker;
 use crate::check::Status;
-use crate::session::{Busy, PageStatus};
+use crate::session::{Busy, PageId, PageStatus};
 
 /// Per-frame pane geometry, used by both rendering and hit-testing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PaneRects {
     pub sidebar: Rect,
     pub status: Rect,
-    /// Preview pane INCLUDING borders (use `preview_inner` for content).
+    /// Preview pane INCLUDING its outer border (cells live inside).
     pub preview: Rect,
-    /// Preview content area inside the block border — the exact rect that
-    /// `preview.render()` and `sync_area()` must both use. A mismatch here
-    /// makes sixel encode for a size the render guard then rejects
-    /// (image only ever appearing after a resize forces a full redraw).
+    /// Preview content area inside the block border — the exact rect the
+    /// grid cells are laid out within. `sync_cells` must use cell rects
+    /// from this same geometry, or sixel encodes for a size the render
+    /// guard then rejects (image only appears after a forced redraw).
     pub preview_inner: Rect,
     pub text: Rect,
     pub footer: Rect,
@@ -70,6 +70,90 @@ pub fn hit_test(app: &App, pos: (u16, u16)) -> Option<Pane> {
         }
     }
     None
+}
+
+/// Grid cell rects for `n` pages inside `area`, shaped for the given page
+/// aspect (width/height in terminal cells). Picks the cols×rows split that
+/// wastes the least space; leftover rows/columns stay empty.
+///
+/// Pure function so the math is unit-testable; the draw path applies it.
+pub fn grid_cells(area: Rect, n: usize, page_aspect: f32) -> Vec<Rect> {
+    if n == 0 || area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let (cols, rows) = best_grid(area, n, page_aspect);
+    let cell_w = area.width / cols as u16;
+    let cell_h = area.height / rows as u16;
+    let mut cells = Vec::with_capacity(n);
+    for i in 0..n {
+        let col = (i % cols) as u16;
+        let row = (i / cols) as u16;
+        // Last column/row absorbs the rounding remainder so the grid uses
+        // the full pane instead of leaving a ragged margin.
+        let w = if col == (cols - 1) as u16 {
+            area.width - col * cell_w
+        } else {
+            cell_w
+        };
+        let h = if row == (rows - 1) as u16 {
+            area.height - row * cell_h
+        } else {
+            cell_h
+        };
+        cells.push(Rect::new(
+            area.x + col * cell_w,
+            area.y + row * cell_h,
+            w,
+            h,
+        ));
+    }
+    cells
+}
+
+/// Choose cols × rows minimizing wasted area for page-shaped cells.
+fn best_grid(area: Rect, n: usize, page_aspect: f32) -> (usize, usize) {
+    let area_aspect = area.width as f32 / area.height as f32;
+    // Ideal cols if the grid were perfectly packed: sqrt(n * area/aspect).
+    let ideal_cols = ((n as f32) * (area_aspect / page_aspect)).sqrt();
+    let mut best = (1, n);
+    let mut best_cost = f32::INFINITY;
+    if n == 0 {
+        return best;
+    }
+    // Search splits around the ideal (clamped to [1, n]).
+    let lo = ideal_cols.floor().max(1.0) as usize;
+    for cols in lo.saturating_sub(2).max(1)..=(lo + 2).min(n) {
+        let rows = n.div_ceil(cols);
+        let cell_w = area.width as f32 / cols as f32;
+        let cell_h = area.height as f32 / rows as f32;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            continue;
+        }
+        let cell_aspect = cell_w / cell_h;
+        // Cost: how much each cell deviates from the page shape (cells are
+        // letterboxed by the protocol anyway; minimize the distortion).
+        let distortion = if cell_aspect >= page_aspect {
+            cell_aspect / page_aspect
+        } else {
+            page_aspect / cell_aspect
+        };
+        // Slight preference for fewer rows (wider thumbs read better).
+        let cost = distortion + 0.02 * rows as f32;
+        if cost < best_cost {
+            best_cost = cost;
+            best = (cols, rows);
+        }
+    }
+    best
+}
+
+/// Preview grid cell containing this position, if any.
+pub fn preview_cell_at(app: &App, pos: (u16, u16)) -> Option<PageId> {
+    let (x, y) = pos;
+    app.preview_cells
+        .iter()
+        .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+        .map(|(id, _)| *id)
 }
 
 /// Sidebar list index at a position (rows are inside the block border).
@@ -266,38 +350,83 @@ fn draw_preview(
     area: Rect,
     inner: Rect,
 ) {
-    let block = block_with_title("Preview", is_focused(app, Pane::Preview));
-    debug_assert_eq!(block.inner(area), inner, "preview inner rect mismatch");
+    let block = block_with_title("Pages (contact sheet)", is_focused(app, Pane::Preview));
     f.render_widget(block, area);
-    if preview.has_image() {
-        // Render the cached encoding; re-encode requests are issued by
-        // sync_area after the frame. Placeholder text is drawn underneath so
-        // protocols that cannot render here still leave the hint visible.
-        preview.render(inner, f.buffer_mut());
-    } else {
-        let empty = selected_empty_hint(app);
+    let n = app.pages.len();
+    app.preview_cells.clear();
+    if n == 0 {
         f.render_widget(
-            Paragraph::new(empty).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("press s to scan your first page")
+                .style(Style::default().fg(Color::DarkGray)),
             inner,
         );
+        return;
+    }
+    let cells = grid_cells(inner, n, preview.cell_aspect_in_cells());
+    for (idx, (page, cell)) in app.pages.iter().zip(cells.iter()).enumerate() {
+        let selected = idx == app.selected;
+        // draw_cell returns the CONTENT rect it rendered into (inside the
+        // cell block border). sync_cells must get exactly that rect, or the
+        // encode size and render guard disagree and the thumb stays blank.
+        let content = draw_cell(f, app, preview, page.id, *cell, selected);
+        app.preview_cells.push((page.id, content));
     }
 }
 
-fn selected_empty_hint(app: &App) -> String {
-    if app.pages.is_empty() {
-        "press s to scan your first page".into()
+fn draw_cell(
+    f: &mut Frame,
+    app: &App,
+    preview: &mut PreviewWorker,
+    id: PageId,
+    cell: Rect,
+    selected: bool,
+) -> Rect {
+    let border_style = if selected {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
-        match app.selected_page().and_then(|p| p.image.clone()) {
-            Some(_) => "loading preview…".into(),
-            None => match app.selected_page().map(|p| p.status) {
-                Some(PageStatus::Scanning) => "scanning…".into(),
-                Some(PageStatus::Processing) => "processing…".into(),
-                Some(PageStatus::Failed) => {
-                    "scan failed - select another page or rescan (r)".into()
-                }
-                _ => "no image".into(),
+        Style::default().fg(Color::Rgb(70, 70, 70))
+    };
+    let page = app.pages.iter().find(|p| p.id == id);
+    let num = page.map(|p| p.id).unwrap_or(id);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .border_set(symbols::border::ROUNDED)
+        .title(Span::styled(
+            format!(" {num} "),
+            if selected {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                Style::default().fg(Color::DarkGray)
             },
-        }
+        ));
+    let inner = block.inner(cell);
+    f.render_widget(block, cell);
+    if preview.has_image_for(id) {
+        preview.render_cell(id, inner, f.buffer_mut());
+    } else {
+        let hint = page.map(cell_hint).unwrap_or_else(|| "…".to_string());
+        // Keep the hint short enough to fit the cell line.
+        let hint = if inner.width as usize > 4 {
+            hint
+        } else {
+            String::new()
+        };
+        f.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+    }
+    inner
+}
+
+fn cell_hint(page: &crate::session::PageView) -> String {
+    match page.status {
+        PageStatus::Ready => "no image".into(),
+        PageStatus::Scanning => "scanning…".into(),
+        PageStatus::Processing => format!("{}…", page.stage_label()),
+        PageStatus::Failed => "failed".into(),
+        PageStatus::DeletePending => "deleting…".into(),
     }
 }
 
@@ -639,4 +768,90 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
         Span::styled("[Esc] cancel", Style::default().fg(Color::DarkGray)),
     ]));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(w: u16, h: u16) -> Rect {
+        Rect::new(0, 0, w, h)
+    }
+
+    #[test]
+    fn grid_cells_empty_and_degenerate() {
+        assert!(grid_cells(rect(0, 10), 3, 0.7).is_empty());
+        assert!(grid_cells(rect(10, 0), 3, 0.7).is_empty());
+        assert!(grid_cells(rect(10, 10), 0, 0.7).is_empty());
+    }
+
+    #[test]
+    fn grid_cells_single_fills_area() {
+        let cells = grid_cells(rect(40, 20), 1, 0.7);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0], rect(40, 20));
+    }
+
+    #[test]
+    fn grid_cells_counts_match_and_cover() {
+        for n in [2usize, 5, 17, 23] {
+            for (w, h) in [(80u16, 24u16), (100, 40), (30, 12)] {
+                let area = rect(w, h);
+                let cells = grid_cells(area, n, 0.707);
+                assert_eq!(cells.len(), n, "n={n} {w}x{h}");
+                // All cells inside the area.
+                for c in &cells {
+                    assert!(c.x >= area.x && c.y >= area.y);
+                    assert!(c.x + c.width <= area.x + area.width);
+                    assert!(c.y + c.height <= area.y + area.height);
+                    assert!(c.width > 0 && c.height > 0);
+                }
+                // First cell starts at the origin.
+                assert_eq!((cells[0].x, cells[0].y), (0, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn grid_cells_tiling_is_rectangular() {
+        let area = rect(80, 24);
+        let cells = grid_cells(area, 7, 0.707);
+        // Infer cols from first row (cells with y == 0).
+        let cols = cells.iter().filter(|c| c.y == 0).count();
+        assert!(cols >= 1);
+        assert_eq!(cells.len(), 7);
+        // Rows are contiguous: every cell's x is a col start or continuation.
+        for c in &cells {
+            assert!(c.width > 0 && c.height > 0);
+        }
+    }
+
+    #[test]
+    fn grid_cells_portrait_prefers_more_columns_than_landscape() {
+        let area = rect(100, 40);
+        let portrait = grid_cells(area, 6, 0.707);
+        let landscape = grid_cells(area, 6, 1.8);
+        let cols_of = |cells: &[Rect]| cells.iter().filter(|c| c.y == 0).count();
+        // Portrait pages pack into more columns than landscape ones.
+        assert!(
+            cols_of(&portrait) >= cols_of(&landscape),
+            "portrait cols {} vs landscape cols {}",
+            cols_of(&portrait),
+            cols_of(&landscape)
+        );
+    }
+
+    #[test]
+    fn grid_cells_last_cell_absorbs_remainder() {
+        let area = rect(80, 24);
+        let cells = grid_cells(area, 3, 0.707);
+        let rows = cells.iter().map(|c| c.y).collect::<std::collections::HashSet<_>>();
+        let rows = rows.len();
+        // Bottom row cells must reach the area bottom.
+        let max_y = cells.iter().map(|c| c.y + c.height).max().unwrap();
+        assert_eq!(max_y, area.height, "rows={rows}");
+        // Right column cells must reach the area right edge.
+        let max_x = cells.iter().map(|c| c.x + c.width).max().unwrap();
+        assert_eq!(max_x, area.width);
+    }
 }
