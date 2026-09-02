@@ -551,6 +551,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--doctor", action="store_true", help="check dependencies and environment, then exit")
     p.add_argument("--verbose", action="store_true", help="also print log output to the terminal")
     p.add_argument("--version", action="version", version=f"{PROGRAM} {VERSION}")
+
+    # optional richer completion when the argcomplete package is installed;
+    # otherwise use the bundled bash script (completion/auto_scanner_ocr.bash)
+    try:
+        import argcomplete  # type: ignore[import-not-found]
+
+        argcomplete.autocomplete(p)
+    except ImportError:
+        pass
+
     return p.parse_args(argv)
 
 
