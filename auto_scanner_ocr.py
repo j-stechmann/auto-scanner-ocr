@@ -48,7 +48,7 @@ BIN_HINTS = {
         "apt": "sudo apt install sane hplip",
     }),
     "ocrmypdf": ("OCRmyPDF (searchable PDFs)", {
-        "pacman": "sudo pacman -S ocrmypdf",
+        "pacman": "yay -S ocrmypdf   # AUR, not in official repos (or: uv tool install ocrmypdf)",
         "apt": "sudo apt install ocrmypdf",
     }),
     "tesseract": ("Tesseract OCR engine", {

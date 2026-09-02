@@ -27,10 +27,11 @@ want to scan.
 
 ## Install
 
-Arch:
+Arch (note: `ocrmypdf` is in the AUR, not the official repos):
 
 ```sh
-sudo pacman -S --needed sane hplip ocrmypdf tesseract tesseract-data-eng tesseract-data-deu img2pdf unpaper libnotify
+sudo pacman -S --needed sane hplip tesseract tesseract-data-eng tesseract-data-deu img2pdf unpaper libnotify
+yay -S ocrmypdf            # AUR; alternative without an AUR helper: uv tool install ocrmypdf
 ```
 
 Debian/Ubuntu:
