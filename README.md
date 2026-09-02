@@ -43,7 +43,7 @@ sudo apt install sane hplip ocrmypdf tesseract-ocr tesseract-ocr-eng tesseract-o
 Then:
 
 ```sh
-git clone <your-repo-url>
+git clone https://github.com/j-stechmann/auto-scanner-ocr
 cd auto-scanner-ocr
 chmod +x auto_scanner_ocr.py
 ```
