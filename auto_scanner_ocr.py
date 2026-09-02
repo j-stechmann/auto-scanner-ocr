@@ -416,7 +416,10 @@ def build_pdf(images: list[Path], out_pdf: Path, cfg: dict, args) -> None:
     """img2pdf (lossless) -> ocrmypdf (text layer, deskew/clean fallbacks)."""
     with tempfile.TemporaryDirectory(prefix=f"{PROGRAM}-") as tmp:
         raw_pdf = Path(tmp) / "raw.pdf"
-        proc = run(["img2pdf", *[str(i) for i in images], "-o", str(raw_pdf)], timeout=300)
+        proc = run(
+            ["img2pdf", f"--imgsize", f"{cfg['dpi']}dpi", *[str(i) for i in images], "-o", str(raw_pdf)],
+            timeout=300,
+        )
         if proc.returncode != 0:
             raise fail_with_log("PDF assembly (img2pdf)", proc)
 
@@ -425,6 +428,8 @@ def build_pdf(images: list[Path], out_pdf: Path, cfg: dict, args) -> None:
             "--language", cfg["langs"],
             "--output-type", "pdfa",
             "--optimize", "0",
+            "--rotate-pages",  # auto-fix pages placed upside down / sideways
+            "--rotate-pages-threshold", "10",  # default 14 skips pages unpaper "fuzzed" (seen: 12.18)
         ]
         if not cfg["unpaper"] or cfg["mode"] == "color":
             # no unpaper pass happened -> let ocrmypdf deskew/clean
