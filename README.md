@@ -126,7 +126,7 @@ in any PDF viewer.
 
 ## License
 
-GPL-3.0-or-later — see [LICENSE](LICENSE).
+GPL-2.0-or-later — see [LICENSE](LICENSE).
 
 [OCRmyPDF]: https://github.com/ocrmypdf/OCRmyPDF
 [Tesseract]: https://github.com/tesseract-ocr/tesseract
