@@ -12,7 +12,12 @@ mode = "gray"
 # OCR languages, plus-separated. Language data must be installed, e.g.:
 #   Arch:  sudo pacman -S tesseract-data-eng tesseract-data-deu
 #   Debian: sudo apt install tesseract-ocr-eng tesseract-ocr-deu
-langs = "eng+deu"
+#
+# Note: fewer is better. Mixing languages (e.g. eng+deu) makes tesseract
+# confuse German umlauts with ligatures ("für" -> "fiir", "Rück" -> "Riick").
+# For German-only documents use "deu" alone; switch via the L picker in the
+# TUI or `--langs` for English or other monolingual documents.
+langs = "deu"
 
 # SANE device name or substring to select (default: first device found).
 # Run `scanimage -L` to list devices, e.g. "hpaio:/usb/Deskjet_1050_J410?serial=..."

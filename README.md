@@ -1,33 +1,58 @@
-# Flatbed scan → searchable OCR PDF, in one command.
+# Flatbed scan → searchable OCR PDF, in a terminal UI.
 
-**auto-scanner-ocr** is a small Python CLI for Linux that drives a flatbed
-SANE scanner (e.g. HP Deskjet 1050a) and turns each scan into a
-**searchable PDF** — the page image plus an invisible OCR text layer, so you
-can select, copy and Ctrl+F the text in any PDF viewer.
+**auto-scanner-ocr** is a Rust TUI for Linux that drives a flatbed SANE
+scanner (e.g. HP Deskjet 1050a) and turns your scans into **searchable
+PDFs** — the page image plus an invisible OCR text layer, so you can select,
+copy and Ctrl+F the text in any PDF viewer.
 
-No daemons, no web servers, no hotkeys: you run it in a terminal when you
-want to scan.
+No daemons, no web servers: you run it in a terminal when you want to scan.
 
 ## Features
 
-- Single-page mode and multi-page mode (pages are processed in the background
-  while you place the next one; merged into one PDF)
-- OCR text layer via [OCRmyPDF]/[Tesseract], multiple languages (default: English + German)
-- Page cleanup: deskew + border cleaning via unpaper (with OCRmyPDF fallback)
-- Startup dependency check on every run, plus a `--doctor` command for troubleshooting
-- Desktop notifications (optional), log file for debugging
-- Single file, Python standard library only (Python 3.11+)
+- **Live TUI**: page list with per-page status (scanning → cleaning → OCR →
+  ready), image preview (kitty/sixel when your terminal supports it,
+  halfblock fallback everywhere), extracted OCR text pane
+- **Multi-page by default**: keep scanning while earlier pages clean/OCR in
+  the background — the scanner is free as soon as a capture ends, so you
+  never wait on the previous page; live per-page and session timers show
+  what's happening at all times; delete, reorder (`J/K` or `←/→`), rotate
+  (`R`), and rescan individual pages before building
+- **Searchable PDFs** via [OCRmyPDF]/[Tesseract], multiple languages
+  (default: English + German); PDF/A output with automatic page-rotation fix
+- **Page cleanup**: deskew + border cleaning via unpaper (grayscale/lineart),
+  with OCRmyPDF `--deskew --clean` fallback when unpaper didn't run
+- **Diagnostics screen** (`!`) with install hints when something is missing —
+  opens automatically if a preflight check fails; headless `--doctor` kept
+- **Desktop notifications** (optional), always-on log file for debugging
+- Keyboard-first (vim keys **and** arrows), mouse support (click to focus,
+  scroll panes)
 
 ## Requirements
 
+- Rust 1.88+ (to build; a prebuilt binary just needs the tools below)
 - Linux with SANE (`sane`), HPLIP for HP devices (`hplip`)
-- `ocrmypdf`, `tesseract` (+ language data), `img2pdf`, `unpaper`
+- `ocrmypdf`, `tesseract` (+ language data), `img2pdf`
+- `unpaper` (optional, recommended for grayscale scans)
 - `libnotify` for notifications (optional)
 - A SANE-compatible scanner (USB-only models like the Deskjet 1050a work fine)
 
 ## Install
 
-Arch (note: `ocrmypdf` is in the AUR, not the official repos):
+Build from source:
+
+```sh
+git clone https://github.com/j-stechmann/auto-scanner-ocr
+cd auto-scanner-ocr
+cargo build --release
+```
+
+Put the binary on your PATH (optional):
+
+```sh
+ln -s "$PWD/target/release/auto-scanner-ocr" ~/.local/bin/auto-scanner-ocr
+```
+
+Arch dependencies (note: `ocrmypdf` is in the AUR, not the official repos):
 
 ```sh
 sudo pacman -S --needed sane hplip tesseract tesseract-data-eng tesseract-data-deu img2pdf unpaper libnotify
@@ -38,20 +63,6 @@ Debian/Ubuntu:
 
 ```sh
 sudo apt install sane hplip ocrmypdf tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu img2pdf unpaper libnotify
-```
-
-Then:
-
-```sh
-git clone https://github.com/j-stechmann/auto-scanner-ocr
-cd auto-scanner-ocr
-chmod +x auto_scanner_ocr.py
-```
-
-Optional: put the script (or a symlink) on your PATH:
-
-```sh
-ln -s "$PWD/auto_scanner_ocr.py" ~/.local/bin/scan
 ```
 
 ### Set up the scanner (once)
@@ -65,64 +76,114 @@ sudo hp-setup -i      # HP-specific setup, then try scanimage -L again
 ## Usage
 
 ```sh
-./auto_scanner_ocr.py                # single page → searchable PDF
-./auto_scanner_ocr.py -m             # multi-page: Enter scans next page, q finishes
-./auto_scanner_ocr.py --doctor       # check dependencies and scanner, then exit
-./auto_scanner_ocr.py --help         # all options
+auto-scanner-ocr              # start the TUI
+auto-scanner-ocr --doctor     # check dependencies and scanner, then exit
+auto-scanner-ocr --help       # all options
 ```
 
-Typical session (`-m`):
+Inside the TUI:
 
-```
-$ ./auto_scanner_ocr.py -m
-Multi-page mode: place page 1 on the scanner glass.
-[page 1] press Enter to scan, 'q'+Enter to finish:
-  page 1 captured - processing in background…
-Place page 2 on the glass (or 'q' to finish).
-[page 2] press Enter to scan, 'q'+Enter to finish: q
-Building searchable PDF (2 page(s), OCR langs: eng+deu)…
-Done: /home/you/Documents/scans/2026-09-02_143005.pdf (812 KB)
-```
+| Key | Action |
+|---|---|
+| `s` / `Enter` | Scan next page (while the Pages pane is focused for Enter) |
+| `Esc` / `c` | Cancel a running scan |
+| `j`/`k` or `↑`/`↓` | Select page (Pages) · scroll (Text) |
+| `J`/`K` or `←`/`→` | Move page down/up (Pages pane) |
+| `r` | Rescan page (keeps the old image until the new scan succeeds) |
+| `R` / `<` | Rotate page 90° clockwise / counter-clockwise |
+| `d` | Delete page (kills the job if it's still processing) |
+| `1`–`9` | Jump to page N |
+| `f` | Build the searchable PDF (confirm dialog shows the output path) |
+| `o` | Open the finished PDF with `xdg-open` |
+| `n` | New session |
+| `m` | Cycle scan mode: gray → color → lineart |
+| `+`/`=` / `-` | DPI presets 150 / 200 / 300 / 600 |
+| `L` | OCR language picker (lists installed tesseract data) |
+| `Tab` / click | Cycle pane focus (Pages → Preview → Text) |
+| `?` / `!` | Help / diagnostics (press `r` inside to re-run checks) |
+| `q` / `Ctrl-C` | Quit (confirm if pages aren't saved) |
+
+Typical session: put page 1 on the glass, press `s`, wait for the scan, put
+page 2 on the glass, press `s` again — page 1 is already being cleaned and
+OCRed in the background. Press `f` when done; the PDF lands in
+`~/Documents/scans/` as `YYYY-MM-DD_HHMMSS.pdf`.
 
 ### Options
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `-m, --multi` | multi-page session, merged into one PDF | off |
-| `--dpi N` | scan resolution | 300 |
-| `--mode` | `gray`, `color` or `lineart` | gray |
-| `--langs A+B` | OCR languages, plus-separated | eng+deu |
-| `--output DIR` | where PDFs are written | ~/Documents/scans |
-| `--device NAME` | SANE device name or substring | first found |
+| `-d, --dpi N` | scan resolution | 300 |
+| `-M, --mode` | `gray`, `color` or `lineart` | gray |
+| `-l, --langs A+B` | OCR languages, plus-separated | eng+deu |
+| `-o, --output DIR` | where PDFs are written | ~/Documents/scans |
+| `-e, --device NAME` | SANE device name or substring | first found |
 | `--no-unpaper` | skip the unpaper cleanup step | — |
 | `--no-notify` | disable desktop notifications | — |
 | `--config FILE` | use a specific config file | ./config.toml or ~/.config/auto-scanner-ocr/config.toml |
+| `--doctor` | check dependencies and scanner, then exit | — |
+| `-v, --verbose` | also print log output to the terminal | — |
 
 ### Configuration
 
-Defaults live in `config.toml` next to the script (or
+Defaults live in `config.toml` (keep it next to the binary, or at
 `~/.config/auto-scanner-ocr/config.toml`); every value can be overridden on
-the command line.
+the command line. Same format as before:
+
+```toml
+[scan]
+dpi = 300
+mode = "gray"          # gray | color | lineart
+langs = "deu"
+device = "auto"
+output = "~/Documents/scans"
+unpaper = true
+notify = true
+```
+
+**About `langs`**: tesseract degrades when languages are mixed — German
+umlauts turn into ligature confusions (`für` → `fiir`, `Rück` → `Riick`,
+`Grüßen` → `GruRen`) when `eng+deu` is combined. For monolingual documents
+use a single language (`deu`, `eng`, …) and switch via the `L` picker or
+`--langs` when you scan in another language. Measured on a real German
+letter: `deu` alone produced zero broken umlauts; any mix produced several.
+
+### Image preview protocols
+
+The preview auto-detects the terminal's graphics protocol via a short-lived
+probe process: kitty graphics and sixel render native images; everywhere
+else it falls back to unicode halfblocks. Inside tmux the probe queries
+raw (tmux swallows answers to its own passthrough-wrapped queries), so sixel
+works in tmux too when the outer terminal (e.g. foot) supports it.
+Detection never interferes with keyboard input — the probe runs in an
+isolated child process.
 
 ## Troubleshooting
 
-- Run `./auto_scanner_ocr.py --doctor` — it checks every dependency, tesseract
-  language data, scanner detection and the output directory, and prints install
-  hints for anything missing.
-- The tool always runs a startup check before scanning; if something is
-  missing you'll see exactly what (and how to install it) instead of a
-  mid-scan failure.
+- Run `auto-scanner-ocr --doctor` — it checks every dependency, tesseract
+  language data, scanner detection and the output directory, and prints
+  install hints for anything missing. Inside the TUI, `!` shows the same
+  checks with `r` to re-run them.
+- The TUI runs the same checks at startup; if something is missing you'll see
+  the diagnostics screen immediately instead of a mid-scan failure.
+- **Wrong umlauts in the OCR text (`fiir` instead of `für`)?** Your `langs`
+  mixes two languages — pick the document's language alone with `L` (or set
+  `langs = "deu"` in the config). Mixed-language OCR reliably garbles
+  umlauts; single-language OCR reads them correctly.
 - Logs are written to `~/.local/state/auto-scanner-ocr/auto-scanner-ocr.log`;
-  add `--verbose` to see them in the terminal.
+  add `-v` to see them in the terminal.
 - Scanner not found? Check USB, power, and `scanimage -L`. For HP devices run
   `sudo hp-setup -i` once.
+- Scans left over from a crashed session live under
+  `~/.local/state/auto-scanner-ocr/sessions/` and are safe to delete when no
+  scan is running.
 
 ## The result
 
-Each run produces `YYYY-MM-DD_HHMMSS.pdf` in your output directory: a PDF/A
-document whose visible layer is your scan (deskewed and cleaned) and whose
-invisible text layer contains the OCR result — searchable and copy-pastable
-in any PDF viewer.
+Each finish produces `YYYY-MM-DD_HHMMSS.pdf` in your output directory
+(collision-safe `_2` suffixes): a PDF/A document whose visible layer is your
+scans (deskewed and cleaned) and whose invisible text layer contains the OCR
+result — searchable and copy-pastable in any PDF viewer. If ocrmypdf fails,
+the PDF is still saved (without a text layer) and the TUI tells you so.
 
 ## License
 
