@@ -157,9 +157,12 @@ produced several.
 **About `Latin`**: `Latin` is a tesseract *script* model, not a language —
 it fixes the `§` → `&` artifact in German legal citations (`& 115 SGB`
 instead of `§ 115 SGB`) without hurting umlauts, at ~0.3s extra per page.
-It ships in no distro package (Arch's `tesseract-data-lat` is the Latin
-*language* model — a different file that degrades umlauts in `deu+lat`
-mixes); install the script model once:
+Debian/Ubuntu ship it (`sudo apt install tesseract-ocr-script-latn`); Arch
+does not (its `tesseract-data-lat` is the Latin *language* model — a
+different file that degrades umlauts in `deu+lat` mixes). On Arch, or when
+your distro lacks the package, download the script model once — note that
+tesseract's tessdata path varies (`tesseract --list-langs -v` shows where
+your build looks):
 
 ```sh
 curl -sL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/Latin.traineddata \

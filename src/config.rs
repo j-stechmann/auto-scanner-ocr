@@ -154,10 +154,24 @@ pub fn validate(cfg: Config) -> Result<Config> {
     Ok(cfg)
 }
 
-/// Script-model names allowed alongside lowercase language codes.
+/// Script-model names allowed alongside lowercase language codes, paired
+/// with the Debian/Ubuntu package suffix for the ones distros ship.
 /// `Latin` is a tesseract script model (tessdata `script/Latin.traineddata`);
 /// it recognizes `§` reliably where language models fail.
-const SCRIPT_LANGS: &[&str] = &["Latin"];
+const SCRIPT_LANGS: &[(&str, &str)] = &[("Latin", "latn")];
+
+/// True when `lang` names a tesseract script model (not a language code).
+pub fn is_script_lang(lang: &str) -> bool {
+    SCRIPT_LANGS.iter().any(|(name, _)| *name == lang)
+}
+
+/// Debian/Ubuntu package shipping the script model, if one exists.
+pub fn script_lang_package(lang: &str) -> Option<String> {
+    SCRIPT_LANGS
+        .iter()
+        .find(|(name, _)| *name == lang)
+        .map(|(_, suffix)| format!("tesseract-ocr-script-{suffix}"))
+}
 
 pub fn langs_valid(langs: &str) -> bool {
     if langs.is_empty() {
@@ -167,7 +181,7 @@ pub fn langs_valid(langs: &str) -> bool {
         if part.is_empty() {
             return false;
         }
-        if SCRIPT_LANGS.contains(&part) {
+        if is_script_lang(part) {
             return true;
         }
         part.chars().all(|c| c.is_ascii_lowercase() || c == '_')

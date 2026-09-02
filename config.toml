@@ -21,10 +21,12 @@ mode = "gray"
 #
 # "Latin" is a script model (not a language): it fixes tesseract reading "§"
 # as "&"/"8&" in German legal citations ("(& 115 SGB" instead of "§ 115 SGB")
-# while keeping umlauts intact. It ships in no distro package (the Arch
-# package tesseract-data-lat is the Latin *language* model — different file;
-# in a deu+lat mix it corrupts umlauts: "Gefáhrdung", "Vermógen"). Install
-# the script model once:
+# while keeping umlauts intact. Debian/Ubuntu ship it:
+#   sudo apt install tesseract-ocr-script-latn
+# Arch does not (its package tesseract-data-lat is the Latin *language* model
+# — different file; in a deu+lat mix it corrupts umlauts: "Gefáhrdung",
+# "Vermógen"). On Arch, download the script model once (tessdata path varies
+# by distro — `tesseract --list-langs -v` shows where your build looks):
 #   curl -sL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/Latin.traineddata \
 #     | sudo tee /usr/share/tessdata/Latin.traineddata >/dev/null
 # (the L picker in the TUI lists it once installed)

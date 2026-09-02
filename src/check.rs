@@ -170,17 +170,18 @@ pub async fn run_checks(cfg: &Config) -> Report {
         };
         for lang in cfg.langs.split('+').filter(|l| !l.is_empty()) {
             let ok = have.iter().any(|l| l == lang);
-            // Script models (e.g. Latin) ship outside distro language packs;
-            // they are single traineddata files downloaded from tessdata repos.
-            let script = lang.chars().next().is_some_and(|c| c.is_ascii_uppercase());
             items.push(CheckItem {
                 what: format!("tesseract language '{lang}'"),
                 status: if ok { Status::Ok } else { Status::Fail },
                 detail: String::new(),
                 hint: (!ok).then(|| {
-                    if script {
+                    if let Some(pkg) = crate::config::script_lang_package(lang) {
+                        // Script models are single traineddata files; some
+                        // distros ship them, others need a manual download.
                         format!(
-                            "download a script model (no distro package exists), e.g.:\n  curl -sL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/{lang}.traineddata | sudo tee /usr/share/tessdata/{lang}.traineddata >/dev/null"
+                            "apt: sudo apt install {pkg}\n  \
+                             arch/other (tessdata dir may differ; see `tesseract --list-langs -v`):\n  \
+                             curl -sL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/{lang}.traineddata | sudo tee /usr/share/tessdata/{lang}.traineddata >/dev/null"
                         )
                     } else {
                         format!(
