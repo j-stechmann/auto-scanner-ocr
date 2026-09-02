@@ -104,24 +104,6 @@ Defaults live in `config.toml` next to the script (or
 `~/.config/auto-scanner-ocr/config.toml`); every value can be overridden on
 the command line.
 
-### Shell completion
-
-A dependency-free bash completion script ships in
-`completion/auto_scanner_ocr.bash` — it completes flags, scan modes, DPI
-suggestions, installed tesseract languages (prefix-aware: `--langs eng+`
-offers `eng+deu`, …) and live SANE device names. Activate it in your
-`~/.bashrc`:
-
-```sh
-source /path/to/auto-scanner-ocr/completion/auto_scanner_ocr.bash
-```
-
-It registers both `auto_scanner_ocr.py` and the `scan` alias. If the
-optional [`argcomplete`](https://kisly.github.io/argcomplete/) package is
-installed (`uv tool install argcomplete` / `pip install argcomplete` +
-`eval "$(register-python-argcomplete auto_scanner_ocr.py)"`), the script
-automatically uses it instead.
-
 ## Troubleshooting
 
 - Run `./auto_scanner_ocr.py --doctor` — it checks every dependency, tesseract
