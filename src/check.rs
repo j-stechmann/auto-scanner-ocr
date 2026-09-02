@@ -181,7 +181,7 @@ pub async fn run_checks(cfg: &Config) -> Report {
                         format!(
                             "apt: sudo apt install {pkg}\n  \
                              arch/other (tessdata dir may differ; see `tesseract --list-langs -v`):\n  \
-                             curl -sL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/{lang}.traineddata | sudo tee /usr/share/tessdata/{lang}.traineddata >/dev/null"
+                             curl -fsSL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/{lang}.traineddata | sudo tee /usr/share/tessdata/{lang}.traineddata >/dev/null"
                         )
                     } else {
                         format!(

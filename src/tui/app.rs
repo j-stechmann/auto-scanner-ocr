@@ -96,7 +96,14 @@ impl App {
             mode: cfg.mode.clone(),
         };
         let mut status_lines = vec!["ready - press s to scan, ? for help".into()];
-        if cfg.langs.contains('+') {
+        // Only real language mixes (e.g. eng+deu) garble umlauts; a script
+        // model like Latin alongside one language is safe (and fixes §).
+        let lang_count = cfg
+            .langs
+            .split('+')
+            .filter(|part| !part.is_empty() && !crate::config::is_script_lang(part))
+            .count();
+        if lang_count > 1 {
             status_lines.push(
                 "hint: mixed OCR languages can garble umlauts (für→fiir) - press L to pick a single language".into(),
             );

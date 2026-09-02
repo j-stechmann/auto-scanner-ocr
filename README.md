@@ -165,7 +165,7 @@ tesseract's tessdata path varies (`tesseract --list-langs -v` shows where
 your build looks):
 
 ```sh
-curl -sL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/Latin.traineddata \
+curl -fsSL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/Latin.traineddata \
   | sudo tee /usr/share/tessdata/Latin.traineddata >/dev/null
 ```
 

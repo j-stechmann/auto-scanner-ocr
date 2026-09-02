@@ -27,7 +27,7 @@ mode = "gray"
 # — different file; in a deu+lat mix it corrupts umlauts: "Gefáhrdung",
 # "Vermógen"). On Arch, download the script model once (tessdata path varies
 # by distro — `tesseract --list-langs -v` shows where your build looks):
-#   curl -sL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/Latin.traineddata \
+#   curl -fsSL https://github.com/tesseract-ocr/tessdata_fast/raw/main/script/Latin.traineddata \
 #     | sudo tee /usr/share/tessdata/Latin.traineddata >/dev/null
 # (the L picker in the TUI lists it once installed)
 langs = "deu+Latin"
