@@ -56,6 +56,43 @@ impl Cleanup {
     pub const ALL: [&'static str; 3] = ["off", "conservative", "legacy"];
 }
 
+/// When the per-page preview OCR (tesseract txt for the TUI text pane) runs.
+/// The final PDF's text layer always comes from ocrmypdf at finish and is
+/// unaffected by this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreviewOcr {
+    /// OCR every page right after capture (previous behavior).
+    Eager,
+    /// OCR on demand: only the selected page's text is extracted, when it
+    /// has none yet. Default: avoids 2-9s of tesseract per page that the
+    /// user may never look at, and never delays the next scan.
+    #[default]
+    Lazy,
+    /// Never OCR for the text pane (rotate does not re-OCR either).
+    Off,
+}
+
+impl PreviewOcr {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "eager" => Some(PreviewOcr::Eager),
+            "lazy" => Some(PreviewOcr::Lazy),
+            "off" => Some(PreviewOcr::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreviewOcr::Eager => "eager",
+            PreviewOcr::Lazy => "lazy",
+            PreviewOcr::Off => "off",
+        }
+    }
+
+    pub const ALL: [&'static str; 3] = ["eager", "lazy", "off"];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub dpi: u16,
@@ -64,6 +101,8 @@ pub struct Config {
     pub device: String,
     pub output: PathBuf,
     pub cleanup: Cleanup,
+    /// When the per-page preview OCR for the TUI text pane runs.
+    pub preview_ocr: PreviewOcr,
     /// Extra argv words appended to the unpaper command (before the file
     /// arguments), e.g. `["--blackfilter-intensity", "40"]`. Only used when
     /// cleanup != off.
@@ -74,7 +113,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            dpi: 600,
+            // 300 is the OCR sweet spot and 2-3x faster per capture; use
+            // 600 for dense small print (CLI -d / TUI +/-).
+            dpi: 300,
             mode: "gray".into(),
             langs: "deu+Latin".into(),
             device: "auto".into(),
@@ -82,6 +123,7 @@ impl Default for Config {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("Documents/scans"),
             cleanup: Cleanup::default(),
+            preview_ocr: PreviewOcr::default(),
             unpaper_extra_args: Vec::new(),
             notify: true,
         }
@@ -107,6 +149,7 @@ struct ScanSection {
     /// Legacy key: migrated to `cleanup` (see migrate_unpaper).
     unpaper: Option<bool>,
     cleanup: Option<String>,
+    preview_ocr: Option<String>,
     unpaper_extra_args: Option<Vec<String>>,
     notify: Option<bool>,
 }
@@ -155,6 +198,7 @@ pub fn load_config(explicit: Option<&PathBuf>) -> Result<Config> {
         cleanup: d.cleanup,
         cleanup_explicit: false,
         unpaper_legacy: None,
+        preview_ocr: d.preview_ocr,
         unpaper_extra_args: d.unpaper_extra_args,
         notify: d.notify,
     };
@@ -191,6 +235,16 @@ pub fn load_config(explicit: Option<&PathBuf>) -> Result<Config> {
                 cfg.cleanup_explicit = true;
             }
             None => anyhow::bail!("invalid cleanup '{}' (use: {})", v, Cleanup::ALL.join(", ")),
+        }
+    }
+    if let Some(v) = &section.preview_ocr {
+        match PreviewOcr::parse(v) {
+            Some(p) => cfg.preview_ocr = p,
+            None => anyhow::bail!(
+                "invalid preview_ocr '{}' (use: {})",
+                v,
+                PreviewOcr::ALL.join(", ")
+            ),
         }
     }
     if let Some(v) = section.unpaper_extra_args {
@@ -239,6 +293,7 @@ fn migrate_unpaper(mut cfg: LoadedConfig) -> Config {
         device: cfg.device,
         output: cfg.output,
         cleanup: cfg.cleanup,
+        preview_ocr: cfg.preview_ocr,
         unpaper_extra_args: cfg.unpaper_extra_args,
         notify: cfg.notify,
     }
@@ -258,6 +313,7 @@ pub struct LoadedConfig {
     /// both-keys-present migration warning).
     pub cleanup_explicit: bool,
     pub unpaper_legacy: Option<bool>,
+    pub preview_ocr: PreviewOcr,
     pub unpaper_extra_args: Vec<String>,
     pub notify: bool,
 }
@@ -333,11 +389,12 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let cfg = Config::default();
-        assert_eq!(cfg.dpi, 600);
+        assert_eq!(cfg.dpi, 300);
         assert_eq!(cfg.mode, "gray");
         assert_eq!(cfg.langs, "deu+Latin");
         assert_eq!(cfg.device, "auto");
         assert_eq!(cfg.cleanup, Cleanup::Off);
+        assert_eq!(cfg.preview_ocr, PreviewOcr::Lazy);
         assert!(cfg.unpaper_extra_args.is_empty());
         assert!(cfg.notify);
     }
@@ -351,6 +408,18 @@ mod tests {
         for mode in Cleanup::ALL {
             let c = Cleanup::parse(mode).unwrap();
             assert_eq!(c.as_str(), mode);
+        }
+    }
+
+    #[test]
+    fn preview_ocr_parse_and_str() {
+        assert_eq!(PreviewOcr::parse("eager"), Some(PreviewOcr::Eager));
+        assert_eq!(PreviewOcr::parse("lazy"), Some(PreviewOcr::Lazy));
+        assert_eq!(PreviewOcr::parse("off"), Some(PreviewOcr::Off));
+        assert_eq!(PreviewOcr::parse("nope"), None);
+        for mode in PreviewOcr::ALL {
+            let p = PreviewOcr::parse(mode).unwrap();
+            assert_eq!(p.as_str(), mode);
         }
     }
 
@@ -391,6 +460,7 @@ mod tests {
             cleanup: Cleanup::Off,
             cleanup_explicit: false,
             unpaper_legacy: None,
+            preview_ocr: PreviewOcr::Lazy,
             unpaper_extra_args: Vec::new(),
             notify: true,
         }
@@ -459,6 +529,21 @@ mod file_tests {
         let section = data.scan.unwrap();
         assert_eq!(section.dpi, Some(600));
         assert_eq!(section.mode.as_deref(), Some("color"));
+    }
+
+    #[test]
+    fn parses_preview_ocr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cfg(dir.path(), "[scan]\npreview_ocr = \"eager\"\n");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let data: RawConfig = toml::from_str(&raw).unwrap();
+        let section = data.scan.unwrap();
+        assert_eq!(section.preview_ocr.as_deref(), Some("eager"));
+        // Flat form works too.
+        let path = write_cfg(dir.path(), "preview_ocr = \"off\"\n");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let data: RawConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(data.flat.preview_ocr.as_deref(), Some("off"));
     }
 
     #[test]

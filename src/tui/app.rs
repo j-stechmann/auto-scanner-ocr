@@ -14,7 +14,7 @@ use tokio_stream::StreamExt;
 
 use crate::backend::pdf::BuildOutcome;
 use crate::check::Report;
-use crate::config::Config;
+use crate::config::{Config, PreviewOcr};
 use crate::notify::{self, Urgency};
 use crate::session::{self, Busy, Event, PageStatus, PageView, SessionMeta};
 
@@ -160,29 +160,35 @@ impl App {
     /// Guard feedback for the footer: is this key action currently allowed?
     pub fn action_allowed(&self, action: Action) -> bool {
         let busy = self.busy();
-        let jobs_running = self.meta.as_ref().map(|m| m.jobs_running).unwrap_or(0);
         match action {
             // Scanning overlaps with per-page processing (scanner is the
             // exclusive resource; jobs run in the background).
             Action::Scan => matches!(busy, Busy::Idle),
+            // Mirrors the actor guard: a live per-page job (preview OCR or
+            // rotate, visible as text_pending or a non-Ready status) blocks
+            // rescan/rotate of that page.
             Action::Rescan => {
                 matches!(busy, Busy::Idle)
-                    && self
-                        .selected_page()
-                        .is_some_and(|p| matches!(p.status, PageStatus::Ready | PageStatus::Failed))
+                    && self.selected_page().is_some_and(|p| {
+                        matches!(p.status, PageStatus::Ready | PageStatus::Failed)
+                            && !p.text_pending
+                    })
             }
-            Action::Rotate => {
-                jobs_running == 0
-                    && self
-                        .selected_page()
-                        .is_some_and(|p| matches!(p.status, PageStatus::Ready))
-            }
+            Action::Rotate => self.selected_page().is_some_and(|p| {
+                matches!(p.status, PageStatus::Ready) && !p.text_pending
+            }),
             Action::Delete => !self.pages.is_empty(),
             Action::Reorder => !self.pages.is_empty(),
             Action::Finish => {
                 !self.pages.is_empty()
                     && matches!(busy, Busy::Idle)
-                    && self.pages.iter().all(|p| p.status == PageStatus::Ready)
+                    && self.pages.iter().all(|p| {
+                        // Preview OCR for the text pane never gates the
+                        // build (the PDF text layer comes from ocrmypdf).
+                        p.status == PageStatus::Ready
+                            || (p.status == PageStatus::Processing
+                                && p.stage.is_some_and(|s| s == session::Stage::Ocr))
+                    })
             }
             Action::Open => self.last_result.is_some(),
             Action::Cancel => busy == Busy::Scanning,
@@ -311,9 +317,11 @@ pub async fn run_tui(
                 app.report = Some(report.clone());
                 let _ = tx.send(report).await;
             }
-            // Periodic tick: elapsed timers, spinner frames.
+            // Periodic tick: elapsed timers, spinner frames, and the lazy
+            // preview-OCR request for the selected page.
             _ = tick.tick() => {
                 app.tick = app.tick.wrapping_add(1);
+                request_text_if_needed(&app, &cmd_tx).await;
             }
         }
 
@@ -594,6 +602,25 @@ async fn handle_key(
 async fn send(app: &App, cmd_tx: &mpsc::Sender<session::Cmd>, action: CommandAction) {
     if let Some(cmd) = to_cmd(app, action) {
         let _ = cmd_tx.send(cmd).await;
+    }
+}
+
+/// Lazy preview OCR: when the selected Ready page has no text yet, ask the
+/// actor to extract it (called on every tick). The actor validates
+/// idempotently and silently — duplicates here are harmless; it never
+/// pushes "blocked" status lines for this command.
+async fn request_text_if_needed(app: &App, cmd_tx: &mpsc::Sender<session::Cmd>) {
+    if app.cfg.preview_ocr != PreviewOcr::Lazy || app.busy() == Busy::Finishing {
+        return;
+    }
+    if let Some(p) = app.selected_page() {
+        // `text.is_some()` is the guard (not non-empty): lazy OCR
+        // legitimately produces Some("") which must not re-trigger.
+        if p.status == PageStatus::Ready && p.text.is_none() && !p.text_pending {
+            let _ = cmd_tx
+                .send(session::Cmd::RequestText(p.id))
+                .await;
+        }
     }
 }
 

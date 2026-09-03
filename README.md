@@ -11,8 +11,10 @@ No daemons, no web servers: you run it in a terminal when you want to scan.
 
 - **Live TUI**: page list with per-page status (scanning → cleaning → OCR →
   ready), image preview (kitty/sixel when your terminal supports it,
-  halfblock fallback everywhere), extracted OCR text pane
-- **Multi-page by default**: keep scanning while earlier pages clean/OCR in
+  halfblock fallback everywhere), extracted OCR text pane (`preview_ocr`:
+  on-demand per page, per capture, or off — the PDF's text layer is
+  unaffected)
+- **Multi-page by default**: keep scanning while earlier pages clean in
   the background — the scanner is free as soon as a capture ends, so you
   never wait on the previous page; live per-page and session timers show
   what's happening at all times; delete, reorder (`J/K` or `←/→`), rotate
@@ -107,26 +109,30 @@ Inside the TUI:
 | `q` / `Ctrl-C` | Quit (confirm if pages aren't saved) |
 
 Typical session: put page 1 on the glass, press `s`, wait for the scan, put
-page 2 on the glass, press `s` again — page 1 is already being cleaned and
-OCRed in the background. Press `f` when done; the PDF lands in
+page 2 on the glass, press `s` again — the scanner is free as soon as page
+1's capture ends (its text-pane OCR and cleanup continue in the background,
+and under the default `preview_ocr = "lazy"` text is only extracted when
+you view the page). Press `f` when done; the PDF lands in
 `~/Documents/scans/` as `YYYY-MM-DD_HHMMSS.pdf`.
 
-**Small print**: the default is 600 dpi for dense small-print documents.
-For normal 10–12pt text, 300 dpi scans 2–3× faster with equal OCR quality
-(`-d 300` or the `-` key). Higher than 600 is pointless on flatbeds:
-1200 dpi is interpolated and can stall cheap USB scanners mid-pass.
+**Small print**: the default is 300 dpi — the OCR sweet spot, 2–3× faster
+per capture and fine for normal 10–12pt text. For dense small print use
+600 dpi (`-d 600` or the `+` key). Higher than 600 is pointless on
+flatbeds: 1200 dpi is interpolated and can stall cheap USB scanners
+mid-pass.
 
 ### Options
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `-d, --dpi N` | scan resolution | 600 |
+| `-d, --dpi N` | scan resolution | 300 |
 | `-M, --mode` | `gray`, `color` or `lineart` | gray |
 | `-l, --langs A+B` | OCR languages, plus-separated | deu+Latin |
 | `-o, --output DIR` | where PDFs are written | ~/Documents/scans |
 | `-e, --device NAME` | SANE device name or substring | first found |
 | `--no-unpaper` | alias for `--cleanup off` | — |
 | `--cleanup MODE` | page cleanup: `off`, `conservative` or `legacy` | off |
+| `--preview-ocr MODE` | text-pane OCR: `eager` (after capture), `lazy` (on demand) or `off` | lazy |
 | `--no-notify` | disable desktop notifications | — |
 | `--config FILE` | use a specific config file | ./config.toml or ~/.config/auto-scanner-ocr/config.toml |
 | `--doctor` | check dependencies and scanner, then exit | — |
@@ -140,12 +146,13 @@ the command line. Same format as before:
 
 ```toml
 [scan]
-dpi = 600              # 300 for normal print (faster); 600 for small print
+dpi = 300              # OCR sweet spot; 600 for dense small print
 mode = "gray"          # gray | color | lineart
 langs = "deu+Latin"
 device = "auto"
 output = "~/Documents/scans"
 cleanup = "off"        # off | conservative | legacy
+preview_ocr = "lazy"   # lazy (on demand) | eager (after capture) | off
 unpaper_extra_args = []  # extra unpaper argv when cleanup != off
 notify = true
 ```
@@ -159,6 +166,15 @@ detection misfires and can erase page edges (measured: a whole table wiped).
 passthrough, kept as a hook for `unpaper_extra_args`). Old configs with
 `unpaper = true` map to `conservative` (with a deprecation warning);
 `unpaper = false` maps to `off`.
+
+**About `preview_ocr`**: this controls only the per-page OCR that fills the
+"Extracted text" pane in the TUI — the final PDF always gets its searchable
+text layer from ocrmypdf at finish, whatever you pick here.
+`lazy` (the default) extracts text only for the page you are currently
+viewing, on demand: flipping pages never runs tesseract you didn't ask for,
+and scans never wait on OCR. `eager` OCRs every page right after capture so
+the pane is always filled. `off` skips the pane entirely (rotate then also
+skips its re-OCR).
 
 **About `langs`**: tesseract degrades when language models are mixed — German
 umlauts turn into ligature confusions (`für` → `fiir`, `Rück` → `Riick`,

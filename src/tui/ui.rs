@@ -11,6 +11,7 @@ use super::app::{Action, App, Pane};
 use super::overlays::{self, Confirm, Overlay};
 use super::preview::PreviewWorker;
 use crate::check::Status;
+use crate::config::PreviewOcr;
 use crate::session::{Busy, PageId, PageStatus};
 
 /// Per-frame pane geometry, used by both rendering and hit-testing.
@@ -441,11 +442,22 @@ fn draw_text(f: &mut Frame, app: &mut App, area: Rect) {
         .and_then(|p| p.text.clone())
         .unwrap_or_default();
     let content: Vec<Line> = if text.is_empty() {
-        let hint = match app.selected_page().map(|p| p.status) {
-            Some(PageStatus::Failed) => app
+        let hint = match (
+            app.selected_page().map(|p| p.status),
+            app.selected_page().is_some_and(|p| p.text_pending),
+        ) {
+            (Some(PageStatus::Failed), _) => app
                 .selected_page()
                 .and_then(|p| p.error.clone())
                 .unwrap_or_else(|| "unknown error".into()),
+            // Lazy OCR in flight for this page.
+            (_, true) => "extracting text…".into(),
+            // Preview OCR disabled by config: the emptiness is expected.
+            (Some(PageStatus::Ready), false)
+                if app.cfg.preview_ocr == PreviewOcr::Off =>
+            {
+                "(preview OCR disabled)".into()
+            }
             _ => "(no text extracted yet)".into(),
         };
         vec![Line::from(Span::styled(
@@ -532,6 +544,24 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ));
     }
+    // Live dpi/mode hint (discoverability of +/- and m; the header shows
+    // the same values). String spans because the value is dynamic.
+    let settings_allowed = app.action_allowed(Action::Settings);
+    let settings_style = if settings_allowed {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    spans.push(Span::styled(" +/-", settings_style));
+    spans.push(Span::styled(
+        format!(" {}dpi ·", app.settings.dpi),
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(" m", settings_style));
+    spans.push(Span::styled(
+        format!(" {} ·", app.settings.mode),
+        Style::default().fg(Color::DarkGray),
+    ));
     spans.push(Span::styled(" Tab", Style::default().fg(Color::Cyan)));
     spans.push(Span::styled(
         " pane · ",

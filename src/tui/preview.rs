@@ -406,6 +406,7 @@ mod tests {
                 image: Some(PathBuf::from(format!("/tmp/fake_{i}.png"))),
                 image_gen: 0,
                 text: None,
+                text_pending: false,
                 error: None,
                 dpi: 300,
                 mode: "gray".into(),

@@ -3,11 +3,12 @@
 # All values can be overridden on the command line; see --help.
 
 [scan]
-# Scan resolution in DPI. 600 for small print (the default); 300 is faster
-# (~2-3x scan time saved) and fine for normal 10-12pt documents.
-# Presets cycle 150 / 200 / 300 / 600 via +/- in the TUI. Note: 1200dpi on
-# CIS scanners is interpolated and can stall cheap USB scanners — avoid.
-dpi = 600
+# Scan resolution in DPI. 300 is the default and the OCR sweet spot (2-3x
+# faster per capture than 600, fine for normal 10-12pt documents); use 600
+# for dense small print. Presets cycle 150 / 200 / 300 / 600 via +/- in the
+# TUI. Note: 1200dpi on CIS scanners is interpolated and can stall cheap USB
+# scanners — avoid.
+dpi = 300
 
 # Scan mode: "gray" (recommended for OCR), "color", or "lineart"
 mode = "gray"
@@ -53,6 +54,15 @@ output = "~/Documents/scans"
 # "conservative"/"off" (with a deprecation warning). An explicit `cleanup`
 # key always wins.
 cleanup = "off"
+
+# Per-page preview OCR for the TUI text pane ("Extracted text"). One of:
+#   "lazy"  (default) extract text only for the page you are viewing,
+#           on demand — never delays the next scan
+#   "eager" OCR every page right after capture (pane always filled)
+#   "off"   never extract text for the pane
+# The final PDF's text layer always comes from ocrmypdf at finish and is
+# unaffected by this setting.
+preview_ocr = "lazy"
 
 # Extra argv words appended to the unpaper command (before the file
 # arguments); only used when cleanup != "off". Example:

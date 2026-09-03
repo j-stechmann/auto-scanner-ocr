@@ -14,7 +14,7 @@ use crate::config::{self, Config};
     about = "Scan with a flatbed SANE scanner and produce a searchable OCR PDF - now with a terminal UI."
 )]
 pub struct Cli {
-    /// Scan resolution in DPI (default 600)
+    /// Scan resolution in DPI (default 300)
     #[arg(short = 'd', long)]
     pub dpi: Option<u16>,
 
@@ -47,6 +47,13 @@ pub struct Cli {
     /// Skip the unpaper cleanup step (alias for --cleanup off)
     #[arg(long)]
     pub no_unpaper: bool,
+
+    /// When the per-page preview OCR for the TUI text pane runs: eager
+    /// (right after capture), lazy (on demand when viewing a page) or off.
+    /// The final PDF text layer always comes from ocrmypdf either way.
+    /// Overrides the config file.
+    #[arg(long)]
+    pub preview_ocr: Option<String>,
 
     /// Disable desktop notifications
     #[arg(long)]
@@ -102,6 +109,18 @@ impl Cli {
         if self.no_unpaper {
             cfg.cleanup = config::Cleanup::Off;
         }
+        if let Some(v) = &self.preview_ocr {
+            match config::PreviewOcr::parse(v) {
+                Some(p) => cfg.preview_ocr = p,
+                None => {
+                    anyhow::bail!(
+                        "invalid preview_ocr '{}' (use: {})",
+                        v,
+                        config::PreviewOcr::ALL.join(", ")
+                    )
+                }
+            }
+        }
         if self.no_notify {
             cfg.notify = false;
         }
@@ -151,6 +170,22 @@ mod tests {
         assert_eq!(cfg.cleanup, config::Cleanup::Legacy);
 
         let c = cli(&["--cleanup", "nope"]);
+        assert!(c.apply_overrides(Config::default()).is_err());
+    }
+
+    #[test]
+    fn preview_ocr_override() {
+        let c = cli(&["--preview-ocr", "eager"]);
+        let cfg = c.apply_overrides(Config::default()).unwrap();
+        assert_eq!(cfg.preview_ocr, config::PreviewOcr::Eager);
+
+        // Default is lazy; "off" disables.
+        assert_eq!(Config::default().preview_ocr, config::PreviewOcr::Lazy);
+        let c = cli(&["--preview-ocr", "off"]);
+        let cfg = c.apply_overrides(Config::default()).unwrap();
+        assert_eq!(cfg.preview_ocr, config::PreviewOcr::Off);
+
+        let c = cli(&["--preview-ocr", "nope"]);
         assert!(c.apply_overrides(Config::default()).is_err());
     }
 
