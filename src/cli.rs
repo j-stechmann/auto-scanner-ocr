@@ -38,7 +38,13 @@ pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Skip the unpaper cleanup step
+    /// Page cleanup: off (ocrmypdf cleans at finish), conservative
+    /// (content-safe unpaper passthrough) or legacy (old unpaper filters;
+    /// can erase page edges). Overrides the config file.
+    #[arg(long)]
+    pub cleanup: Option<String>,
+
+    /// Skip the unpaper cleanup step (alias for --cleanup off)
     #[arg(long)]
     pub no_unpaper: bool,
 
@@ -81,8 +87,20 @@ impl Cli {
         if let Some(v) = &self.device {
             cfg.device = v.clone();
         }
+        if let Some(v) = &self.cleanup {
+            match config::Cleanup::parse(v) {
+                Some(c) => cfg.cleanup = c,
+                None => {
+                    anyhow::bail!(
+                        "invalid cleanup '{}' (use: {})",
+                        v,
+                        config::Cleanup::ALL.join(", ")
+                    )
+                }
+            }
+        }
         if self.no_unpaper {
-            cfg.unpaper = false;
+            cfg.cleanup = config::Cleanup::Off;
         }
         if self.no_notify {
             cfg.notify = false;
@@ -118,8 +136,22 @@ mod tests {
         let c = cli(&["--dpi", "150", "--no-unpaper", "--no-notify"]);
         let cfg = c.apply_overrides(Config::default()).unwrap();
         assert_eq!(cfg.dpi, 150);
-        assert!(!cfg.unpaper);
+        assert_eq!(cfg.cleanup, config::Cleanup::Off);
         assert!(!cfg.notify);
+    }
+
+    #[test]
+    fn cleanup_override() {
+        let c = cli(&["--cleanup", "conservative"]);
+        let cfg = c.apply_overrides(Config::default()).unwrap();
+        assert_eq!(cfg.cleanup, config::Cleanup::Conservative);
+
+        let c = cli(&["--cleanup", "legacy"]);
+        let cfg = c.apply_overrides(Config::default()).unwrap();
+        assert_eq!(cfg.cleanup, config::Cleanup::Legacy);
+
+        let c = cli(&["--cleanup", "nope"]);
+        assert!(c.apply_overrides(Config::default()).is_err());
     }
 
     #[test]

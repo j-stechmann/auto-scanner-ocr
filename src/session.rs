@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::pdf::{self, BuildOutcome};
 use crate::backend::scan;
-use crate::config::Config;
+use crate::config::{Cleanup, Config};
 
 /// Unique per-page id (never reused; reorder never renames files).
 pub type PageId = u32;
@@ -77,8 +77,14 @@ pub struct Page {
     /// When the current stage started (drives the live elapsed timer).
     pub stage_started: Option<Instant>,
     pub rotated: bool,
-    pub unpaper_ran: bool,
-    pub unpaper_failed: bool,
+    /// True when this page's image was fully cleaned+deskewed by unpaper
+    /// (legacy mode, gray/lineart, unpaper succeeded). Pages without it get
+    /// deskew/clean from ocrmypdf at finish.
+    pub unpaper_deskewed: bool,
+    /// True when the scanner rejected the requested settings and a fallback
+    /// attempt (dropping --mode and/or --resolution) succeeded instead; the
+    /// recorded dpi may then differ from the actual image scale.
+    pub used_fallback: bool,
     /// Bumped when the image content changes (rotate/rescan) so the preview
     /// worker knows to re-encode even at the same path.
     pub image_gen: u32,
@@ -189,7 +195,8 @@ enum Job {
         path: PathBuf,
         /// Process settings: the job chains scan -> unpaper -> OCR itself so
         /// the actor never awaits these (only completion notifications).
-        unpaper_enabled: bool,
+        cleanup: Cleanup,
+        unpaper_extra_args: Vec<String>,
         langs: String,
         dir: PathBuf,
         token: CancellationToken,
@@ -214,8 +221,10 @@ enum JobDone {
         is_rescan: bool,
         /// Final image path (possibly the unpaper `_clean` variant).
         image: PathBuf,
-        unpaper_ran: bool,
-        unpaper_failed: bool,
+        /// Legacy-unpaper fully cleaned this page (see Page::unpaper_deskewed).
+        unpaper_deskewed: bool,
+        /// Scanner rejected requested settings; fallback attempt succeeded.
+        used_fallback: bool,
         text: Option<String>,
         result: anyhow::Result<()>,
     },
@@ -383,7 +392,13 @@ impl Session {
                     Err("no scan in progress".into())
                 }
             }
-            Cmd::Delete(_) | Cmd::Move { .. } => Ok(()),
+            Cmd::Delete(_) | Cmd::Move { .. } => {
+                // Files must stay put while the build reads them.
+                if self.busy == Busy::Finishing {
+                    return Err("building PDF - wait for it to finish".into());
+                }
+                Ok(())
+            }
             Cmd::Finish => {
                 if self.pages.is_empty() {
                     return Err("no pages scanned yet".into());
@@ -462,16 +477,16 @@ impl Session {
                 id,
                 is_rescan,
                 image,
-                unpaper_ran,
-                unpaper_failed,
+                unpaper_deskewed,
+                used_fallback,
                 text,
                 result,
             } => self.on_scan_done(
                 id,
                 is_rescan,
                 image,
-                unpaper_ran,
-                unpaper_failed,
+                unpaper_deskewed,
+                used_fallback,
                 text,
                 result,
             ),
@@ -505,8 +520,8 @@ impl Session {
                     stage: Some(Stage::Scan),
                     stage_started: Some(Instant::now()),
                     rotated: false,
-                    unpaper_ran: false,
-                    unpaper_failed: false,
+                    unpaper_deskewed: false,
+                    used_fallback: false,
                     image_gen: 0,
                 });
                 self.notify_pages();
@@ -520,7 +535,8 @@ impl Session {
                     dpi,
                     mode,
                     path,
-                    unpaper_enabled: self.cfg.unpaper,
+                    cleanup: self.cfg.cleanup,
+                    unpaper_extra_args: self.cfg.unpaper_extra_args.clone(),
                     langs: self.cfg.langs.clone(),
                     dir: self.dir.clone(),
                     token,
@@ -543,7 +559,8 @@ impl Session {
                     dpi,
                     mode,
                     path,
-                    unpaper_enabled: self.cfg.unpaper,
+                    cleanup: self.cfg.cleanup,
+                    unpaper_extra_args: self.cfg.unpaper_extra_args.clone(),
                     langs: self.cfg.langs.clone(),
                     dir: self.dir.clone(),
                     token,
@@ -563,7 +580,8 @@ impl Session {
                     dpi,
                     mode,
                     path,
-                    unpaper_enabled,
+                    cleanup,
+                    unpaper_extra_args,
                     langs,
                     dir,
                     token,
@@ -572,10 +590,15 @@ impl Session {
                     // only receives the final result and stays responsive.
                     let result = scan::scan_page(&device, dpi, &mode, &path, &token).await;
                     match result {
-                        Ok(()) => {
-                            let (image, unpaper_ran) =
-                                pdf::maybe_unpaper(&path, unpaper_enabled, &mode).await;
-                            let unpaper_failed = unpaper_enabled && mode != "color" && !unpaper_ran;
+                        Ok(scan::ScanOutcome { used_fallback }) => {
+                            if used_fallback {
+                                tracing::warn!(
+                                    "scanner rejected --resolution/--mode; fallback used (page dpi metadata may differ from request)"
+                                );
+                            }
+                            let (image, unpaper_deskewed) =
+                                pdf::maybe_unpaper(&path, cleanup, &unpaper_extra_args, &mode)
+                                    .await;
                             let text = if token.is_cancelled() {
                                 None
                             } else {
@@ -587,8 +610,8 @@ impl Session {
                                 id,
                                 is_rescan,
                                 image,
-                                unpaper_ran,
-                                unpaper_failed,
+                                unpaper_deskewed,
+                                used_fallback,
                                 text,
                                 result: Ok(()),
                             }
@@ -597,8 +620,8 @@ impl Session {
                             id,
                             is_rescan,
                             image: path,
-                            unpaper_ran: false,
-                            unpaper_failed: false,
+                            unpaper_deskewed: false,
+                            used_fallback: false,
                             text: None,
                             result: Err(e),
                         },
@@ -645,8 +668,8 @@ impl Session {
         id: PageId,
         is_rescan: bool,
         image: PathBuf,
-        unpaper_ran: bool,
-        unpaper_failed: bool,
+        unpaper_deskewed: bool,
+        used_fallback: bool,
         text: Option<String>,
         result: anyhow::Result<()>,
     ) {
@@ -676,8 +699,8 @@ impl Session {
                 }
                 if let Some(p) = self.pages.iter_mut().find(|p| p.id == id) {
                     p.image = Some(image);
-                    p.unpaper_ran = unpaper_ran;
-                    p.unpaper_failed = unpaper_failed;
+                    p.unpaper_deskewed = unpaper_deskewed;
+                    p.used_fallback = used_fallback;
                     p.text = text;
                     p.status = PageStatus::Ready;
                     p.stage = None;
@@ -685,7 +708,20 @@ impl Session {
                     p.image_gen += 1;
                 }
                 self.notify_pages();
-                self.status(format!("page {id} ready"));
+                let note = match (used_fallback, unpaper_deskewed) {
+                    (true, _) => " - scanner rejected resolution/mode; page size may differ",
+                    (false, false)
+                        if self.cfg.cleanup == Cleanup::Legacy
+                            && self.cfg.unpaper_extra_args.is_empty() =>
+                    {
+                        // Normal for color pages in legacy mode (unpaper is
+                        // grayscale-only); ocrmypdf deskews at finish.
+                        ""
+                    }
+                    (false, false) => " - unpaper cleanup unavailable; ocrmypdf deskews at finish",
+                    (false, true) => "",
+                };
+                self.status(format!("page {id} ready{note}"));
             }
             Err(e) => {
                 let cancelled = e.to_string() == "cancelled";
@@ -788,19 +824,23 @@ impl Session {
         self.notify_pages();
         self.status("building searchable PDF…");
 
-        let images: Vec<PathBuf> = self.pages.iter().filter_map(|p| p.image.clone()).collect();
-        let unpaper_ran = self.pages.iter().any(|p| p.unpaper_ran);
-        // Pages where unpaper was supposed to run but didn't (failed or
-        // skipped): let ocrmypdf deskew/clean them.
-        let any_raw_page = self.pages.iter().any(|p| p.unpaper_failed);
+        // Per-page DPI (pages may be scanned at different resolutions within
+        // one session via the +/- presets); (image path, dpi) pairs.
+        let pages: Vec<(PathBuf, u16)> = self
+            .pages
+            .iter()
+            .filter_map(|p| p.image.clone().map(|img| (img, p.dpi)))
+            .collect();
+        // Pages NOT fully cleaned+deskewed by unpaper (cleanup off/failed,
+        // color pages in legacy mode): ocrmypdf deskews/cleans them.
+        let any_page_needing_cleanup = self.pages.iter().any(|p| !p.unpaper_deskewed);
         let manually_rotated = self.pages.iter().any(|p| p.rotated);
 
         let plan = pdf::BuildPlan {
-            images,
-            unpaper_ran,
+            pages,
+            any_page_needing_cleanup,
             manually_rotated,
-            any_raw_page,
-            dpi: self.cfg.dpi,
+            cleanup: self.cfg.cleanup,
             langs: self.cfg.langs.clone(),
             out_pdf: self.out_pdf.clone(),
         };

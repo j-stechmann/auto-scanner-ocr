@@ -39,8 +39,25 @@ device = "auto"
 # Directory where finished searchable PDFs are written
 output = "~/Documents/scans"
 
-# Deskew/clean pages with unpaper before OCR (grayscale/lineart only)
-unpaper = true
+# Page cleanup. One of:
+#   "off"           (default) no unpaper pass; ocrmypdf --deskew --clean
+#                   handles deskew/cleanup once at finish. Fastest and
+#                   content-safe.
+#   "conservative"  unpaper with every content-altering filter disabled
+#                   (verified no-op passthrough). Useful as a hook for
+#                   unpaper_extra_args experiments.
+#   "legacy"        unpaper's original filter stack. WARNING: its mask/border
+#                   detection misfires on flatbed scans and can ERASE page
+#                   edges (tables, margins). Kept for opt-in comparisons.
+# Legacy configs that set `unpaper = true/false` keep working: they map to
+# "conservative"/"off" (with a deprecation warning). An explicit `cleanup`
+# key always wins.
+cleanup = "off"
+
+# Extra argv words appended to the unpaper command (before the file
+# arguments); only used when cleanup != "off". Example:
+#   unpaper_extra_args = ["--blackfilter-intensity", "40"]
+unpaper_extra_args = []
 
 # Desktop notifications (needs libnotify)
 notify = true

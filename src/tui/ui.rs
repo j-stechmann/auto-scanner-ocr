@@ -382,7 +382,9 @@ fn draw_cell(
     selected: bool,
 ) -> Rect {
     let border_style = if selected {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Rgb(70, 70, 70))
     };
@@ -845,7 +847,10 @@ mod tests {
     fn grid_cells_last_cell_absorbs_remainder() {
         let area = rect(80, 24);
         let cells = grid_cells(area, 3, 0.707);
-        let rows = cells.iter().map(|c| c.y).collect::<std::collections::HashSet<_>>();
+        let rows = cells
+            .iter()
+            .map(|c| c.y)
+            .collect::<std::collections::HashSet<_>>();
         let rows = rows.len();
         // Bottom row cells must reach the area bottom.
         let max_y = cells.iter().map(|c| c.y + c.height).max().unwrap();

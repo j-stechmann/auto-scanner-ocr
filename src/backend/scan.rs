@@ -76,6 +76,15 @@ pub fn select_device<'a>(devices: &'a [Device], wanted: &str) -> Option<&'a Devi
     devices.iter().find(|d| d.name.contains(wanted))
 }
 
+/// Per-page scan result details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanOutcome {
+    /// True when the scanner rejected the requested settings and a fallback
+    /// attempt (dropping --mode and/or --resolution) succeeded instead; the
+    /// actual image scale may then differ from the requested dpi.
+    pub used_fallback: bool,
+}
+
 /// Capture one page from the scanner into `out_path` (PNG).
 ///
 /// Retry ladder (parity with Python scan_page, one strict improvement):
@@ -86,13 +95,15 @@ pub fn select_device<'a>(devices: &'a [Device], wanted: &str) -> Option<&'a Devi
 ///
 /// Success requires rc 0 AND non-empty stdout (parity).
 /// Cancellation kills scanimage (process group) between or during attempts.
+/// Returns which attempt level succeeded so callers can warn about silent
+/// fallbacks (they change page dimensions and OCR scale).
 pub async fn scan_page(
     device: &str,
     dpi: u16,
     mode: &str,
     out_path: &Path,
     token: &CancellationToken,
-) -> Result<()> {
+) -> Result<ScanOutcome> {
     let base: Vec<String> = vec![
         "scanimage".into(),
         "-d".into(),
@@ -121,7 +132,7 @@ pub async fn scan_page(
     let mut last_output: Option<Output> = None;
     let mut last_err: Option<RunError> = None;
 
-    for attempt in &attempts {
+    for (attempt_idx, attempt) in attempts.iter().enumerate() {
         if token.is_cancelled() {
             return Err(process::RunError::Cancelled.into());
         }
@@ -137,7 +148,16 @@ pub async fn scan_page(
                     tokio::fs::rename(&part, out_path)
                         .await
                         .with_context(|| format!("renaming into {}", out_path.display()))?;
-                    return Ok(());
+                    if attempt_idx > 0 {
+                        tracing::warn!(
+                            "scan attempt {}/3 succeeded ({}); requested settings were rejected",
+                            attempt_idx + 1,
+                            attempts.len()
+                        );
+                    }
+                    return Ok(ScanOutcome {
+                        used_fallback: attempt_idx > 0,
+                    });
                 }
                 last_output = Some(output);
             }

@@ -15,6 +15,46 @@ pub const SCANIMAGE_MODES: [(&str, &str); 3] =
 
 pub const DPI_PRESETS: [u16; 4] = [150, 200, 300, 600];
 
+/// Page cleanup strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cleanup {
+    /// No unpaper pass; ocrmypdf --deskew --clean does the cleanup at finish.
+    /// Default: unpaper's default filters destroy flatbed page content and
+    /// its deskew never fires on flatbed scans (both measured), so the pass
+    /// is a no-op that only costs seconds per page.
+    #[default]
+    Off,
+    /// unpaper with all content-altering filters disabled
+    /// (--no-mask-scan --no-border-scan --no-border-align --no-blackfilter
+    /// --no-grayfilter --no-blurfilter --no-deskew): a verified no-op
+    /// passthrough kept for `unpaper_extra_args` experimentation.
+    Conservative,
+    /// Legacy behavior: unpaper's full default filter stack. WARNING: this
+    /// is the mode that erases page edges (the missing-table bug).
+    Legacy,
+}
+
+impl Cleanup {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Cleanup::Off),
+            "conservative" => Some(Cleanup::Conservative),
+            "legacy" => Some(Cleanup::Legacy),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cleanup::Off => "off",
+            Cleanup::Conservative => "conservative",
+            Cleanup::Legacy => "legacy",
+        }
+    }
+
+    pub const ALL: [&'static str; 3] = ["off", "conservative", "legacy"];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub dpi: u16,
@@ -22,7 +62,11 @@ pub struct Config {
     pub langs: String,
     pub device: String,
     pub output: PathBuf,
-    pub unpaper: bool,
+    pub cleanup: Cleanup,
+    /// Extra argv words appended to the unpaper command (before the file
+    /// arguments), e.g. `["--blackfilter-intensity", "40"]`. Only used when
+    /// cleanup != off.
+    pub unpaper_extra_args: Vec<String>,
     pub notify: bool,
 }
 
@@ -36,7 +80,8 @@ impl Default for Config {
             output: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("Documents/scans"),
-            unpaper: true,
+            cleanup: Cleanup::default(),
+            unpaper_extra_args: Vec::new(),
             notify: true,
         }
     }
@@ -58,7 +103,10 @@ struct ScanSection {
     langs: Option<String>,
     device: Option<String>,
     output: Option<String>,
+    /// Legacy key: migrated to `cleanup` (see migrate_unpaper).
     unpaper: Option<bool>,
+    cleanup: Option<String>,
+    unpaper_extra_args: Option<Vec<String>>,
     notify: Option<bool>,
 }
 
@@ -94,9 +142,22 @@ pub fn expand_path(s: &str) -> Result<PathBuf> {
 }
 
 pub fn load_config(explicit: Option<&PathBuf>) -> Result<Config> {
-    let mut cfg = Config::default();
+    let mut cfg = LoadedConfig {
+        dpi: 600,
+        mode: "gray".into(),
+        langs: "deu+Latin".into(),
+        device: "auto".into(),
+        output: dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Documents/scans"),
+        cleanup: Cleanup::default(),
+        cleanup_explicit: false,
+        unpaper_legacy: None,
+        unpaper_extra_args: Vec::new(),
+        notify: true,
+    };
     let Some(path) = find_config(explicit)? else {
-        return Ok(cfg);
+        return Ok(migrate_unpaper(cfg));
     };
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read config file {}", path.display()))?;
@@ -119,12 +180,84 @@ pub fn load_config(explicit: Option<&PathBuf>) -> Result<Config> {
         cfg.output = expand_path(&v)?;
     }
     if let Some(v) = section.unpaper {
-        cfg.unpaper = v;
+        cfg.unpaper_legacy = Some(v);
+    }
+    if let Some(v) = &section.cleanup {
+        match Cleanup::parse(v) {
+            Some(c) => {
+                cfg.cleanup = c;
+                cfg.cleanup_explicit = true;
+            }
+            None => anyhow::bail!("invalid cleanup '{}' (use: {})", v, Cleanup::ALL.join(", ")),
+        }
+    }
+    if let Some(v) = section.unpaper_extra_args {
+        cfg.unpaper_extra_args = v;
     }
     if let Some(v) = section.notify {
         cfg.notify = v;
     }
+    let cfg = migrate_unpaper(cfg);
     validate(cfg)
+}
+
+/// Legacy-key migration. Rules (user-approved):
+/// - explicit `cleanup` wins; a coexisting `unpaper` key is ignored with a
+///   warning.
+/// - `unpaper = false` -> `cleanup = "off"`.
+/// - `unpaper = true` -> `cleanup = "conservative"` + deprecation warning
+///   (the old default destroyed flatbed page content; `cleanup = "legacy"`
+///   restores the exact old behavior).
+/// - neither key -> `cleanup = "off"` (the struct default).
+fn migrate_unpaper(mut cfg: LoadedConfig) -> Config {
+    let warn = |msg: &str| tracing::warn!("{msg}");
+    if let Some(legacy) = cfg.unpaper_legacy {
+        if cfg.cleanup_explicit {
+            warn(
+                "config has both 'unpaper' and 'cleanup'; \
+                 ignoring 'unpaper' ('cleanup' wins)",
+            );
+        } else {
+            let new_mode = if legacy {
+                warn(
+                    "config key 'unpaper' is deprecated; \
+                     use cleanup = \"conservative\" (or \"off\" / \"legacy\")",
+                );
+                Cleanup::Conservative
+            } else {
+                Cleanup::Off
+            };
+            cfg.cleanup = new_mode;
+        }
+    }
+    Config {
+        dpi: cfg.dpi,
+        mode: cfg.mode,
+        langs: cfg.langs,
+        device: cfg.device,
+        output: cfg.output,
+        cleanup: cfg.cleanup,
+        unpaper_extra_args: cfg.unpaper_extra_args,
+        notify: cfg.notify,
+    }
+}
+
+/// The config under construction (mirrors `Config` but with the legacy
+/// `unpaper` key still unresolved).
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub dpi: u16,
+    pub mode: String,
+    pub langs: String,
+    pub device: String,
+    pub output: PathBuf,
+    pub cleanup: Cleanup,
+    /// True when the config file set `cleanup` explicitly (drives the
+    /// both-keys-present migration warning).
+    pub cleanup_explicit: bool,
+    pub unpaper_legacy: Option<bool>,
+    pub unpaper_extra_args: Vec<String>,
+    pub notify: bool,
 }
 
 /// Validation shared by config load and CLI overrides (parity: dpi >= 150,
@@ -150,6 +283,9 @@ pub fn validate(cfg: Config) -> Result<Config> {
             "invalid langs '{}' (use plus-separated codes, e.g. deu+Latin)",
             cfg.langs
         );
+    }
+    if cfg.unpaper_extra_args.iter().any(|a| a.trim().is_empty()) {
+        anyhow::bail!("unpaper_extra_args must be non-empty strings");
     }
     Ok(cfg)
 }
@@ -199,7 +335,63 @@ mod tests {
         assert_eq!(cfg.mode, "gray");
         assert_eq!(cfg.langs, "deu+Latin");
         assert_eq!(cfg.device, "auto");
-        assert!(cfg.unpaper && cfg.notify);
+        assert_eq!(cfg.cleanup, Cleanup::Off);
+        assert!(cfg.unpaper_extra_args.is_empty());
+        assert!(cfg.notify);
+    }
+
+    #[test]
+    fn cleanup_parse_and_str() {
+        assert_eq!(Cleanup::parse("off"), Some(Cleanup::Off));
+        assert_eq!(Cleanup::parse("conservative"), Some(Cleanup::Conservative));
+        assert_eq!(Cleanup::parse("legacy"), Some(Cleanup::Legacy));
+        assert_eq!(Cleanup::parse("nope"), None);
+        for mode in Cleanup::ALL {
+            let c = Cleanup::parse(mode).unwrap();
+            assert_eq!(c.as_str(), mode);
+        }
+    }
+
+    #[test]
+    fn legacy_unpaper_key_migrates() {
+        // unpaper = true -> conservative + deprecation warning path.
+        let cfg = migrate_unpaper(LoadedConfig {
+            unpaper_legacy: Some(true),
+            ..test_loaded()
+        });
+        assert_eq!(cfg.cleanup, Cleanup::Conservative);
+        // unpaper = false -> off.
+        let cfg = migrate_unpaper(LoadedConfig {
+            unpaper_legacy: Some(false),
+            ..test_loaded()
+        });
+        assert_eq!(cfg.cleanup, Cleanup::Off);
+        // Explicit cleanup (even "off") wins over unpaper.
+        let cfg = migrate_unpaper(LoadedConfig {
+            unpaper_legacy: Some(true),
+            cleanup: Cleanup::Off,
+            cleanup_explicit: true,
+            ..test_loaded()
+        });
+        assert_eq!(cfg.cleanup, Cleanup::Off);
+        // Neither key -> default (off).
+        let cfg = migrate_unpaper(test_loaded());
+        assert_eq!(cfg.cleanup, Cleanup::Off);
+    }
+
+    fn test_loaded() -> LoadedConfig {
+        LoadedConfig {
+            dpi: 600,
+            mode: "gray".into(),
+            langs: "deu+Latin".into(),
+            device: "auto".into(),
+            output: PathBuf::from("/tmp/scans"),
+            cleanup: Cleanup::Off,
+            cleanup_explicit: false,
+            unpaper_legacy: None,
+            unpaper_extra_args: Vec::new(),
+            notify: true,
+        }
     }
 
     #[test]

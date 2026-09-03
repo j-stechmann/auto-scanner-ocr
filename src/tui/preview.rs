@@ -203,7 +203,13 @@ impl PreviewWorker {
             })();
             match result {
                 Ok((proto, aspect)) => {
-                    let _ = tx.send(Loaded::Protocol(id, Box::new(proto), path.clone(), gen, aspect));
+                    let _ = tx.send(Loaded::Protocol(
+                        id,
+                        Box::new(proto),
+                        path.clone(),
+                        gen,
+                        aspect,
+                    ));
                 }
                 Err(e) => {
                     let _ = tx.send(Loaded::Failed(id, path.clone(), gen, format!("{e:#}")));
@@ -309,10 +315,9 @@ impl PreviewWorker {
                     // needs_resize returns the exact rect to encode for. It
                     // must be passed on verbatim (see module doc: encode
                     // rect != render rect re-encodes + flashes every frame).
-                    thumb.protocol.resize_encode(
-                        &Resize::Fit(Some(FilterType::Triangle)),
-                        rect_px,
-                    );
+                    thumb
+                        .protocol
+                        .resize_encode(&Resize::Fit(Some(FilterType::Triangle)), rect_px);
                     kicks += 1;
                 }
             }
@@ -459,8 +464,7 @@ mod tests {
         let mut w = worker();
         let app = test_app_with_pages(1);
         let path = app.pages[0].image.clone().unwrap();
-        w.failed
-            .insert((path, app.pages[0].image_gen));
+        w.failed.insert((path, app.pages[0].image_gen));
         w.on_pages_changed(&app);
         assert!(w.decoding.is_empty());
     }
@@ -508,4 +512,3 @@ mod tests {
         assert_eq!(same.height(), 600);
     }
 }
-
