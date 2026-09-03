@@ -160,28 +160,36 @@ impl App {
     /// Guard feedback for the footer: is this key action currently allowed?
     pub fn action_allowed(&self, action: Action) -> bool {
         let busy = self.busy();
+        // After a successful build the session dir is gone: page commands
+        // would run against missing images. Mirror the actor's guards here.
+        let finished = self.meta.as_ref().is_some_and(|m| m.finished);
         match action {
             // Scanning overlaps with per-page processing (scanner is the
             // exclusive resource; jobs run in the background).
-            Action::Scan => matches!(busy, Busy::Idle),
+            Action::Scan => matches!(busy, Busy::Idle) && !finished,
             // Mirrors the actor guard: a live per-page job (preview OCR or
             // rotate, visible as text_pending or a non-Ready status) blocks
             // rescan/rotate of that page.
             Action::Rescan => {
                 matches!(busy, Busy::Idle)
+                    && !finished
                     && self.selected_page().is_some_and(|p| {
                         matches!(p.status, PageStatus::Ready | PageStatus::Failed)
                             && !p.text_pending
                     })
             }
-            Action::Rotate => self
-                .selected_page()
-                .is_some_and(|p| matches!(p.status, PageStatus::Ready) && !p.text_pending),
+            Action::Rotate => {
+                !finished
+                    && self
+                        .selected_page()
+                        .is_some_and(|p| matches!(p.status, PageStatus::Ready) && !p.text_pending)
+            }
             Action::Delete => !self.pages.is_empty(),
             Action::Reorder => !self.pages.is_empty(),
             Action::Finish => {
                 !self.pages.is_empty()
                     && matches!(busy, Busy::Idle)
+                    && !finished
                     && self.pages.iter().all(|p| {
                         // Preview OCR for the text pane never gates the
                         // build (the PDF text layer comes from ocrmypdf).
@@ -610,7 +618,13 @@ async fn send(app: &App, cmd_tx: &mpsc::Sender<session::Cmd>, action: CommandAct
 /// idempotently and silently — duplicates here are harmless; it never
 /// pushes "blocked" status lines for this command.
 async fn request_text_if_needed(app: &App, cmd_tx: &mpsc::Sender<session::Cmd>) {
-    if app.cfg.preview_ocr != PreviewOcr::Lazy || app.busy() == Busy::Finishing {
+    if app.cfg.preview_ocr != PreviewOcr::Lazy
+        || app.busy() == Busy::Finishing
+        // Post-finish the session dir is gone; the actor drops these
+        // requests, so stop sending them (and the filesystem probing
+        // behind the actor's existence check).
+        || app.meta.as_ref().is_some_and(|m| m.finished)
+    {
         return;
     }
     if let Some(p) = app.selected_page() {

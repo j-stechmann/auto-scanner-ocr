@@ -41,7 +41,7 @@ pub enum PageStatus {
     Scanning,
     /// unpaper/rotate/ocr running.
     Processing,
-    /// Image ready + text extracted.
+    /// Image ready (preview text may be absent under lazy/off OCR).
     Ready,
     /// Scan or processing failed (message in `error`).
     Failed,
@@ -146,7 +146,8 @@ pub enum Cmd {
     CancelScan,
     /// Rescan page (non-destructive: old image kept until success).
     Rescan(PageId),
-    /// Rotate page image 90° CW (false = CCW) and re-OCR.
+    /// Rotate page image 90° CW (false = CCW); re-OCRs only under eager
+    /// preview OCR (lazy re-extracts on demand).
     Rotate(PageId, bool),
     /// Delete page (kills job if processing; deferred if scanning).
     Delete(PageId),
@@ -176,6 +177,10 @@ pub struct SessionMeta {
     pub jobs_running: usize,
     pub output_path: PathBuf,
     pub dirty: bool,
+    /// True after a successful finish: the session dir is deleted (pages
+    /// remain in the list as inert stubs), so preview-OCR requests are
+    /// pointless. A *failed* build leaves the dir intact and this false.
+    pub finished: bool,
 }
 
 /// Events actor -> TUI.
@@ -303,6 +308,11 @@ pub struct Session {
     /// id; a token can be superseded by a newer job for the same page, so
     /// completion handlers remove entries only on token identity match.
     jobs: HashMap<PageId, CancellationToken>,
+    /// True after a successful finish removed the session dir: pages remain
+    /// in the list but their images are gone, so preview-OCR requests must
+    /// not spawn. Reset by `new_session` (and never set on a failed build,
+    /// which keeps the dir — lazy OCR resumes there).
+    finished: bool,
     event_tx: mpsc::Sender<Event>,
     job_tx: mpsc::UnboundedSender<JobDone>,
 }
@@ -329,6 +339,7 @@ impl Session {
             busy_since: None,
             scan_token: None,
             jobs: HashMap::new(),
+            finished: false,
             event_tx,
             job_tx,
         })
@@ -379,6 +390,7 @@ impl Session {
             jobs_running: self.jobs.len(),
             output_path: self.out_pdf.clone(),
             dirty: self.dirty(),
+            finished: self.finished,
         }
     }
 
@@ -410,6 +422,9 @@ impl Session {
                 if self.busy == Busy::Finishing {
                     return Err("building PDF - scan once it finishes".into());
                 }
+                if self.finished {
+                    return Err("PDF already built - press n for a new session".into());
+                }
                 if self
                     .pages
                     .iter()
@@ -426,6 +441,9 @@ impl Session {
                 if self.busy == Busy::Finishing {
                     return Err("building PDF - rescan once it finishes".into());
                 }
+                if self.finished {
+                    return Err("PDF already built - press n for a new session".into());
+                }
                 if self.jobs.contains_key(id) {
                     return Err("page busy - rescan once its text is extracted".into());
                 }
@@ -438,6 +456,9 @@ impl Session {
             Cmd::Rotate(id, _) => {
                 if self.busy == Busy::Finishing {
                     return Err("building PDF - rotate once it finishes".into());
+                }
+                if self.finished {
+                    return Err("PDF already built - press n for a new session".into());
                 }
                 if self.jobs.contains_key(id) {
                     return Err("page busy - rotate after its text is extracted".into());
@@ -471,6 +492,9 @@ impl Session {
                 }
                 if self.busy == Busy::Scanning {
                     return Err("scan in progress - finish after it completes".into());
+                }
+                if self.finished {
+                    return Err("PDF already built - press n for a new session".into());
                 }
                 if let Some(p) = self.pages.iter().find(|p| p.status == PageStatus::Failed) {
                     return Err(format!(
@@ -883,7 +907,13 @@ impl Session {
     /// Validates silently — the TUI tick re-sends until the request
     /// applies, so nothing here may push "blocked" status lines.
     fn request_text(&mut self, id: PageId) {
-        if self.cfg.preview_ocr != PreviewOcr::Lazy || self.busy == Busy::Finishing {
+        if self.cfg.preview_ocr != PreviewOcr::Lazy
+            || self.busy == Busy::Finishing
+            // Post-finish the session dir is deleted; page stubs must not
+            // respawn tesseract (the TUI tick keeps sending until this
+            // guard's meta twin stops it in the UI).
+            || self.finished
+        {
             return;
         }
         // Cap concurrent OCR jobs (flipping through many pages must not
@@ -1140,6 +1170,10 @@ impl Session {
             Ok(outcome) => {
                 let size = pdf::size_kb(&self.out_pdf);
                 let _ = std::fs::remove_dir_all(&self.dir);
+                // The dir is gone: mark the session finished so the lazy
+                // tick stops re-requesting preview text for the lingering
+                // page stubs.
+                self.finished = true;
                 self.status(format!(
                     "done: {} ({} KB) - o to open",
                     self.out_pdf.display(),
@@ -1200,6 +1234,7 @@ impl Session {
                 // Cancel that page's job; its completion handler finishes
                 // the deletion (and the job checks the pending flag).
                 // DeletePending: a second `d` — just re-cancel the token.
+                let was_processing = page.status == PageStatus::Processing;
                 if let Some(p) = self.pages.iter_mut().find(|p| p.id == id) {
                     p.status = PageStatus::DeletePending;
                 }
@@ -1207,7 +1242,9 @@ impl Session {
                     t.cancel();
                 }
                 self.notify_pages();
-                self.status("deleting page…");
+                if was_processing {
+                    self.status("deleting page…");
+                }
             }
             _ => {
                 // Ready/Failed page — but under lazy preview OCR a job may
@@ -1254,6 +1291,7 @@ impl Session {
         }
         self.busy = Busy::Idle;
         self.busy_since = None;
+        self.finished = false;
         self.out_pdf = pdf::unique_path(&self.cfg.output, pdf::stamp_now());
         self.dir = state_dir().join("sessions").join(pdf::stamp_now());
         let _ = std::fs::create_dir_all(&self.dir);
@@ -1677,6 +1715,76 @@ mod tests {
             "no OCR spawned for a vanished image"
         );
         assert!(s.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finish_stops_lazy_requests_and_new_session_re_arms() {
+        // Post-finish the session dir is deleted while page stubs linger
+        // Ready with text=None: the finished flag (set by on_finish_done)
+        // must block both the actor-side spawn and (via meta) the TUI
+        // tick's 4x/sec re-send. Also gates the page/finish commands whose
+        // guards used to pass against the deleted dir.
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+        assert!(!s.meta().finished);
+        s.handle_job_done(JobDone::Finish {
+            result: Ok(pdf::BuildOutcome::Searchable),
+        })
+        .await;
+        assert!(s.finished, "success sets the flag via on_finish_done");
+        assert!(!s.dir.exists(), "session dir removed by the build");
+        s.request_text(1);
+        assert!(
+            !s.pages[0].text_pending,
+            "finished flag blocks preview OCR despite the stub page"
+        );
+        assert!(s.jobs.is_empty());
+        assert!(s.meta().finished, "flag surfaces in the TUI meta");
+        assert!(
+            s.guard(&Cmd::ScanNext {
+                dpi: 300,
+                mode: "gray".into()
+            })
+            .is_err(),
+            "scan blocked against the deleted dir"
+        );
+        assert!(s.guard(&Cmd::Rescan(1)).is_err());
+        assert!(s.guard(&Cmd::Rotate(1, true)).is_err());
+        assert!(
+            s.guard(&Cmd::Finish).is_err(),
+            "re-finish blocked (images are gone)"
+        );
+        assert!(s.guard(&Cmd::Delete(1)).is_ok(), "stubs stay deletable");
+        // A new session resets it (a fresh dir makes lazy OCR valid again).
+        s.new_session();
+        assert!(!s.meta().finished);
+        assert!(s
+            .guard(&Cmd::ScanNext {
+                dpi: 300,
+                mode: "gray".into()
+            })
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_finish_keeps_lazy_requests_alive() {
+        // A failed build does not delete the session dir, so preview OCR
+        // must keep working afterwards.
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+        s.handle_job_done(JobDone::Finish {
+            result: Err(anyhow::anyhow!("ocrmypdf exploded")),
+        })
+        .await;
+        assert!(!s.finished, "failed build does not set the flag");
+        s.request_text(1);
+        assert!(s.pages[0].text_pending, "lazy OCR still works");
     }
 
     #[tokio::test]
