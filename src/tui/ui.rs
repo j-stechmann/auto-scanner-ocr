@@ -442,21 +442,27 @@ fn draw_text(f: &mut Frame, app: &mut App, area: Rect) {
         .and_then(|p| p.text.clone())
         .unwrap_or_default();
     let content: Vec<Line> = if text.is_empty() {
+        let page = app.selected_page();
         let hint = match (
-            app.selected_page().map(|p| p.status),
-            app.selected_page().is_some_and(|p| p.text_pending),
+            page.map(|p| p.status),
+            page.is_some_and(|p| p.text_pending),
+            // The attempt for this exact image failed (no auto-retry).
+            page.is_some_and(|p| p.ocr_failed_gen == Some(p.image_gen)),
         ) {
-            (Some(PageStatus::Failed), _) => app
+            (Some(PageStatus::Failed), _, _) => app
                 .selected_page()
                 .and_then(|p| p.error.clone())
                 .unwrap_or_else(|| "unknown error".into()),
             // Lazy OCR in flight for this page.
-            (_, true) => "extracting text…".into(),
+            (_, true, _) => "extracting text…".into(),
             // Preview OCR disabled by config: the emptiness is expected.
-            (Some(PageStatus::Ready), false)
-                if app.cfg.preview_ocr == PreviewOcr::Off =>
-            {
+            (Some(PageStatus::Ready), false, _) if app.cfg.preview_ocr == PreviewOcr::Off => {
                 "(preview OCR disabled)".into()
+            }
+            // Attempt failed for the current image: retrying is pointless
+            // (missing language data, unreadable file); rescan/rotate re-arms.
+            (Some(PageStatus::Ready), false, true) => {
+                "(preview OCR failed - rescan or rotate to retry)".into()
             }
             _ => "(no text extracted yet)".into(),
         };

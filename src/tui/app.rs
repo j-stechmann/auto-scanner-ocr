@@ -174,9 +174,9 @@ impl App {
                             && !p.text_pending
                     })
             }
-            Action::Rotate => self.selected_page().is_some_and(|p| {
-                matches!(p.status, PageStatus::Ready) && !p.text_pending
-            }),
+            Action::Rotate => self
+                .selected_page()
+                .is_some_and(|p| matches!(p.status, PageStatus::Ready) && !p.text_pending),
             Action::Delete => !self.pages.is_empty(),
             Action::Reorder => !self.pages.is_empty(),
             Action::Finish => {
@@ -615,11 +615,16 @@ async fn request_text_if_needed(app: &App, cmd_tx: &mpsc::Sender<session::Cmd>) 
     }
     if let Some(p) = app.selected_page() {
         // `text.is_some()` is the guard (not non-empty): lazy OCR
-        // legitimately produces Some("") which must not re-trigger.
-        if p.status == PageStatus::Ready && p.text.is_none() && !p.text_pending {
-            let _ = cmd_tx
-                .send(session::Cmd::RequestText(p.id))
-                .await;
+        // legitimately produces Some("") which must not re-trigger. A
+        // failed attempt for the current image is also not retried (the
+        // actor would drop it silently anyway); rescan/rotate bumps
+        // image_gen and re-arms the request.
+        if p.status == PageStatus::Ready
+            && p.text.is_none()
+            && !p.text_pending
+            && p.ocr_failed_gen != Some(p.image_gen)
+        {
+            let _ = cmd_tx.send(session::Cmd::RequestText(p.id)).await;
         }
     }
 }

@@ -407,6 +407,7 @@ mod tests {
                 image_gen: 0,
                 text: None,
                 text_pending: false,
+                ocr_failed_gen: None,
                 error: None,
                 dpi: 300,
                 mode: "gray".into(),

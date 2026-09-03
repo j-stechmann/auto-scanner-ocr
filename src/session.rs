@@ -78,6 +78,12 @@ pub struct Page {
     /// True while a preview-OCR job for this page is running (the text pane
     /// shows "extracting text…"). Only set under lazy preview OCR.
     pub text_pending: bool,
+    /// Generation of the image whose preview OCR last failed. Stops the lazy
+    /// tick from re-requesting a hopeless extraction forever (persistent
+    /// tesseract failure: missing language data, corrupt image). Keyed to
+    /// `image_gen`, so any new image content (rescan/rotate) implicitly
+    /// clears it. Never fails the page.
+    pub ocr_failed_gen: Option<u32>,
     pub error: Option<String>,
     pub stage: Option<Stage>,
     /// When the current stage started (drives the live elapsed timer).
@@ -107,6 +113,7 @@ pub struct PageView {
     pub image_gen: u32,
     pub text: Option<String>,
     pub text_pending: bool,
+    pub ocr_failed_gen: Option<u32>,
     pub error: Option<String>,
     pub dpi: u16,
     pub mode: String,
@@ -217,8 +224,11 @@ enum Job {
         id: PageId,
         image: PathBuf,
         /// Set when the job was spawned; echoed back so the completion
-        /// handler can tell which job finished when two OCR jobs for the
-        /// same page briefly overlap (rescan race).
+        /// handler can verify the page's image is unchanged. Rarely needed:
+        /// guards block rescan/rotate while an OCR job runs, and finish
+        /// only unblocks them after cancelling the job — but the cancelled
+        /// job's completion can still arrive after a post-finish rescan
+        /// bumped the gen.
         image_gen: u32,
         langs: String,
         dir: PathBuf,
@@ -257,8 +267,11 @@ enum JobDone {
     OcrText {
         id: PageId,
         /// Image the text was extracted from, plus the `image_gen` at spawn
-        /// time: completions that no longer match the page's current image
-        /// (rescan/rotate/delete raced the OCR) are stale and dropped.
+        /// time: completions whose generation no longer matches the page are
+        /// treated as stale and dropped. Mostly unreachable (`jobs.contains_key`
+        /// blocks rescan/rotate while an OCR job runs), but reachable after a
+        /// finish: the cancelled job's completion can arrive once the build is
+        /// done and a rescan has already bumped the gen.
         image: PathBuf,
         image_gen: u32,
         result: anyhow::Result<String>,
@@ -350,6 +363,7 @@ impl Session {
                 image_gen: p.image_gen,
                 text: p.text.clone(),
                 text_pending: p.text_pending,
+                ocr_failed_gen: p.ocr_failed_gen,
                 error: p.error.clone(),
                 dpi: p.dpi,
                 mode: p.mode.clone(),
@@ -535,18 +549,21 @@ impl Session {
                 unpaper_deskewed,
                 used_fallback,
                 result,
-            } => self.on_scan_done(id, is_rescan, image, unpaper_deskewed, used_fallback, result),
+            } => self.on_scan_done(
+                id,
+                is_rescan,
+                image,
+                unpaper_deskewed,
+                used_fallback,
+                result,
+            ),
             JobDone::OcrText {
                 id,
                 image,
                 image_gen,
                 result,
             } => self.on_ocr_text_done(id, image, image_gen, result),
-            JobDone::Rotate {
-                id,
-                reocr,
-                result,
-            } => self.on_rotate_done(id, reocr, result),
+            JobDone::Rotate { id, reocr, result } => self.on_rotate_done(id, reocr, result),
             JobDone::Finish { result } => self.on_finish_done(result),
         }
     }
@@ -573,6 +590,7 @@ impl Session {
                     image: None,
                     text: None,
                     text_pending: false,
+                    ocr_failed_gen: None,
                     error: None,
                     stage: Some(Stage::Scan),
                     stage_started: Some(Instant::now()),
@@ -605,6 +623,7 @@ impl Session {
                     p.stage_started = Some(Instant::now());
                     p.error = None;
                     p.image_gen += 1;
+                    p.ocr_failed_gen = None;
                 }
                 self.notify_pages();
                 self.status(format!("rescanning page {id} ({dpi}dpi {mode})…"));
@@ -698,8 +717,7 @@ impl Session {
                             if token.is_cancelled() {
                                 Err("cancelled".to_string())
                             } else {
-                                match scan::ocr_text_cancellable(&image, &langs, &dir, &token)
-                                    .await
+                                match scan::ocr_text_cancellable(&image, &langs, &dir, &token).await
                                 {
                                     Ok(text) => Ok(Some(text)),
                                     Err(e) if e.to_string() == "cancelled" => {
@@ -774,6 +792,7 @@ impl Session {
                     p.used_fallback = used_fallback;
                     p.text = None;
                     p.text_pending = false;
+                    p.ocr_failed_gen = None;
                     p.image_gen += 1;
                     p.image_gen
                 };
@@ -879,7 +898,14 @@ impl Session {
         let Some(page) = self.pages.iter().find(|p| p.id == id) else {
             return;
         };
-        if page.status != PageStatus::Ready || page.text.is_some() || page.text_pending {
+        if page.status != PageStatus::Ready
+            || page.text.is_some()
+            || page.text_pending
+            // A previous attempt for this exact image failed (missing
+            // language data, corrupt file, …): don't respawn tesseract on
+            // every tick. A rescan/rotate bumps image_gen and re-arms.
+            || page.ocr_failed_gen == Some(page.image_gen)
+        {
             return;
         }
         // The image must still exist on disk. After a successful finish the
@@ -911,8 +937,10 @@ impl Session {
     /// Preview-OCR job finished. Invariants (per the concurrency review):
     /// - cancelled jobs never fail the page;
     /// - OCR errors never set Failed (the PDF text layer is independent);
-    /// - stale completions (image/gen mismatch after rescan/rotate/delete)
-    ///   are dropped;
+    /// - stale completions (image/gen mismatch) are dropped — rare: guards
+    ///   block rescan/rotate while an OCR job runs, but a finish cancels
+    ///   the job and a post-finish rescan can bump the gen before the
+    ///   cancelled job's completion arrives;
     /// - the jobs entry is removed only when this completion still matches
     ///   the page (guards keep at most one OCR job per page alive, so the
     ///   generation check identifies the entry's owner).
@@ -977,8 +1005,11 @@ impl Session {
             }
             Err(e) if current => {
                 // Non-cancelled OCR failure: page still becomes ready with
-                // no text — preview text must not block anything.
+                // no text — preview text must not block anything. Record
+                // the failed generation so the lazy tick doesn't retry the
+                // same hopeless image forever (status spam).
                 finish_stage(p);
+                p.ocr_failed_gen = Some(image_gen);
                 self.status(format!("preview OCR failed for page {id}: {e:#}"));
             }
             Err(_) => {
@@ -1007,6 +1038,8 @@ impl Session {
             if !reocr {
                 p.text = None;
                 p.text_pending = false;
+                // New image content: re-arm the lazy auto-retry.
+                p.ocr_failed_gen = None;
             }
         }
         let token = CancellationToken::new();
@@ -1512,7 +1545,8 @@ mod tests {
         std::fs::write(&img, b"x").unwrap();
         s.handle_job_done(scan_ok(1, img.clone())).await;
         s.request_text(1);
-        s.handle_job_done(ocr_ok(1, img.clone(), 1, "pre-rotation")).await;
+        s.handle_job_done(ocr_ok(1, img.clone(), 1, "pre-rotation"))
+            .await;
         assert_eq!(s.pages[0].text.as_deref(), Some("pre-rotation"));
 
         s.start_rotate(1, true);
@@ -1579,7 +1613,12 @@ mod tests {
         s.request_text(1);
         assert!(s.guard(&Cmd::Rescan(1)).is_err());
         // A different page can still be scanned meanwhile.
-        assert!(s.guard(&Cmd::ScanNext { dpi: 300, mode: "gray".into() }).is_ok());
+        assert!(s
+            .guard(&Cmd::ScanNext {
+                dpi: 300,
+                mode: "gray".into()
+            })
+            .is_ok());
     }
 
     #[tokio::test]
@@ -1638,5 +1677,80 @@ mod tests {
             "no OCR spawned for a vanished image"
         );
         assert!(s.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistent_ocr_failure_is_not_retried_for_same_image() {
+        // Regression: a deterministic OCR failure (missing language data,
+        // corrupt image) cleared text_pending, so the lazy tick re-sent
+        // RequestText every 250ms — a ~4x/sec status spam loop. The failed
+        // generation must block auto-retry until the image changes.
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+
+        s.request_text(1);
+        assert!(s.pages[0].text_pending);
+        s.handle_job_done(JobDone::OcrText {
+            id: 1,
+            image: img.clone(),
+            image_gen: 1,
+            result: Err(anyhow::anyhow!("tesseract: no such language data")),
+        })
+        .await;
+        let p = &s.pages[0];
+        assert_eq!(p.status, PageStatus::Ready, "OCR failure stays cosmetic");
+        assert_eq!(p.ocr_failed_gen, Some(1), "failure recorded for the gen");
+        assert!(!p.text_pending);
+
+        // The tick's re-request for the same image is now a silent no-op.
+        s.request_text(1);
+        assert!(s.jobs.is_empty(), "no respawn after a recorded failure");
+
+        // Rescan bumps image_gen: the failure flag is cleared and OCR re-arms.
+        if let Some(p) = s.pages.iter_mut().find(|p| p.id == 1) {
+            p.image_gen += 1;
+        }
+        s.request_text(1);
+        assert!(s.pages[0].text_pending, "new image gets a fresh attempt");
+    }
+
+    #[tokio::test]
+    async fn rotate_re_arms_lazy_ocr_after_failure() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+
+        s.request_text(1);
+        s.handle_job_done(JobDone::OcrText {
+            id: 1,
+            image: img.clone(),
+            image_gen: 1,
+            result: Err(anyhow::anyhow!("boom")),
+        })
+        .await;
+        assert_eq!(s.pages[0].ocr_failed_gen, Some(1));
+        s.request_text(1);
+        assert!(s.jobs.is_empty(), "still blocked");
+
+        // Rotate succeeds: new image content clears the failure flag.
+        s.start_rotate(1, true);
+        s.handle_job_done(JobDone::Rotate {
+            id: 1,
+            reocr: false,
+            result: Ok(None),
+        })
+        .await;
+        assert_eq!(s.pages[0].status, PageStatus::Ready);
+        assert_eq!(
+            s.pages[0].ocr_failed_gen, None,
+            "rotate re-arms the lazy retry"
+        );
+        s.request_text(1);
+        assert!(s.pages[0].text_pending);
     }
 }
