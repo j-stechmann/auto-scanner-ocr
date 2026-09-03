@@ -85,8 +85,13 @@ const HINTS: &[(&str, &str, &str)] = &[
         "pacman: sudo pacman -S img2pdf / apt: sudo apt install img2pdf",
     ),
     (
+        "pdfunite",
+        "pdfunite (merges pages of mixed DPI, optional)",
+        "pacman: sudo pacman -S poppler / apt: sudo apt install poppler-utils",
+    ),
+    (
         "unpaper",
-        "unpaper (deskew/clean, optional)",
+        "unpaper (legacy cleanup; optional)",
         "pacman: sudo pacman -S unpaper / apt: sudo apt install unpaper",
     ),
     (
@@ -110,27 +115,51 @@ pub async fn run_checks(cfg: &Config) -> Report {
         let found = crate::backend::which(bin).is_some();
         let item = match *bin {
             "unpaper" => {
-                if !cfg.unpaper {
-                    CheckItem {
-                        what: format!("{bin} ({what})"),
-                        status: Status::Skip,
-                        detail: "disabled in config".into(),
-                        hint: None,
+                // Tiered by cleanup mode: off needs no unpaper (ocrmypdf
+                // cleans at finish); conservative treats it as an optional
+                // passthrough; legacy wants it (its absence degrades to
+                // ocrmypdf cleanup, never a hard failure).
+                let status = match cfg.cleanup {
+                    crate::config::Cleanup::Off => Status::Skip,
+                    _ if found => Status::Ok,
+                    _ => Status::Warn,
+                };
+                let detail = match (cfg.cleanup, found) {
+                    (crate::config::Cleanup::Off, _) => {
+                        format!("cleanup = {}", cfg.cleanup.as_str())
                     }
-                } else if found {
-                    CheckItem {
-                        what: format!("{bin} ({what})"),
-                        status: Status::Ok,
-                        detail: String::new(),
-                        hint: None,
+                    (_, true) => String::new(),
+                    (crate::config::Cleanup::Conservative, false) => {
+                        "not installed; ocrmypdf deskews/cleans at finish".into()
                     }
-                } else {
-                    CheckItem {
-                        what: format!("{bin} ({what})"),
-                        status: Status::Fail,
-                        detail: String::new(),
-                        hint: hint_for(bin).map(str::to_string),
+                    (crate::config::Cleanup::Legacy, false) => {
+                        "not installed; pages fall back to ocrmypdf cleanup".into()
                     }
+                };
+                CheckItem {
+                    what: format!("{bin} ({what})"),
+                    status,
+                    detail,
+                    hint: (status == Status::Warn)
+                        .then(|| hint_for(bin).map(str::to_string))
+                        .flatten(),
+                }
+            }
+            "pdfunite" => {
+                // Only needed when a session mixes DPIs; a warning is enough.
+                CheckItem {
+                    what: format!("{bin} ({what})"),
+                    status: if found { Status::Ok } else { Status::Warn },
+                    detail: if found {
+                        String::new()
+                    } else {
+                        "mixed-DPI sessions will fail to build".into()
+                    },
+                    hint: if found {
+                        None
+                    } else {
+                        hint_for(bin).map(str::to_string)
+                    },
                 }
             }
             "notify-send" => CheckItem {

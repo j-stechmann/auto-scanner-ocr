@@ -19,8 +19,10 @@ No daemons, no web servers: you run it in a terminal when you want to scan.
   (`R`), and rescan individual pages before building
 - **Searchable PDFs** via [OCRmyPDF]/[Tesseract], multiple languages
   (default: English + German); PDF/A output with automatic page-rotation fix
-- **Page cleanup**: deskew + border cleaning via unpaper (grayscale/lineart),
-  with OCRmyPDF `--deskew --clean` fallback when unpaper didn't run
+- **Page cleanup**: ocrmypdf `--deskew --clean` at finish (default
+  `cleanup = "off"`); optional unpaper modes — a content-safe conservative
+  passthrough, or the legacy filter stack (which can erase page edges on
+  flatbed scans)
 - **Diagnostics screen** (`!`) with install hints when something is missing —
   opens automatically if a preflight check fails; headless `--doctor` kept
 - **Desktop notifications** (optional), always-on log file for debugging
@@ -32,7 +34,8 @@ No daemons, no web servers: you run it in a terminal when you want to scan.
 - Rust 1.88+ (to build; a prebuilt binary just needs the tools below)
 - Linux with SANE (`sane`), HPLIP for HP devices (`hplip`)
 - `ocrmypdf`, `tesseract` (+ language data), `img2pdf`
-- `unpaper` (optional, recommended for grayscale scans)
+- `poppler-utils` for `pdfunite` (only needed when one session mixes DPIs)
+- `unpaper` (optional; only for the unpaper cleanup modes)
 - `libnotify` for notifications (optional)
 - A SANE-compatible scanner (USB-only models like the Deskjet 1050a work fine)
 
@@ -55,14 +58,14 @@ ln -s "$PWD/target/release/auto-scanner-ocr" ~/.local/bin/auto-scanner-ocr
 Arch dependencies (note: `ocrmypdf` is in the AUR, not the official repos):
 
 ```sh
-sudo pacman -S --needed sane hplip tesseract tesseract-data-eng tesseract-data-deu img2pdf unpaper libnotify
+sudo pacman -S --needed sane hplip tesseract tesseract-data-eng tesseract-data-deu img2pdf poppler unpaper libnotify
 yay -S ocrmypdf            # AUR; alternative without an AUR helper: uv tool install ocrmypdf
 ```
 
 Debian/Ubuntu:
 
 ```sh
-sudo apt install sane hplip ocrmypdf tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu img2pdf unpaper libnotify
+sudo apt install sane hplip ocrmypdf tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu img2pdf poppler-utils unpaper libnotify
 ```
 
 ### Set up the scanner (once)
@@ -122,7 +125,8 @@ For normal 10–12pt text, 300 dpi scans 2–3× faster with equal OCR quality
 | `-l, --langs A+B` | OCR languages, plus-separated | deu+Latin |
 | `-o, --output DIR` | where PDFs are written | ~/Documents/scans |
 | `-e, --device NAME` | SANE device name or substring | first found |
-| `--no-unpaper` | skip the unpaper cleanup step | — |
+| `--no-unpaper` | alias for `--cleanup off` | — |
+| `--cleanup MODE` | page cleanup: `off`, `conservative` or `legacy` | off |
 | `--no-notify` | disable desktop notifications | — |
 | `--config FILE` | use a specific config file | ./config.toml or ~/.config/auto-scanner-ocr/config.toml |
 | `--doctor` | check dependencies and scanner, then exit | — |
@@ -141,9 +145,20 @@ mode = "gray"          # gray | color | lineart
 langs = "deu+Latin"
 device = "auto"
 output = "~/Documents/scans"
-unpaper = true
+cleanup = "off"        # off | conservative | legacy
+unpaper_extra_args = []  # extra unpaper argv when cleanup != off
 notify = true
 ```
+
+**About `cleanup`**: the default `off` skips unpaper entirely — ocrmypdf's
+`--deskew --clean` (which runs unpaper internally with conservative
+settings) does the real work once at finish. unpaper's own default filter
+stack (`legacy`) is tuned for book scans: on flatbed scans its mask/border
+detection misfires and can erase page edges (measured: a whole table wiped).
+`conservative` disables every content-altering filter (a verified pixel-identical
+passthrough, kept as a hook for `unpaper_extra_args`). Old configs with
+`unpaper = true` map to `conservative` (with a deprecation warning);
+`unpaper = false` maps to `off`.
 
 **About `langs`**: tesseract degrades when language models are mixed — German
 umlauts turn into ligature confusions (`für` → `fiir`, `Rück` → `Riick`,
@@ -214,8 +229,10 @@ isolated child process.
 Each finish produces `YYYY-MM-DD_HHMMSS.pdf` in your output directory
 (collision-safe `_2` suffixes): a PDF/A document whose visible layer is your
 scans (deskewed and cleaned) and whose invisible text layer contains the OCR
-result — searchable and copy-pastable in any PDF viewer. If ocrmypdf fails,
-the PDF is still saved (without a text layer) and the TUI tells you so.
+result — searchable and copy-pastable in any PDF viewer. Pages keep the
+scanner window size of their own capture (mixed-DPI sessions are merged with
+`pdfunite`). If ocrmypdf fails, the PDF is still saved (without a text
+layer) and the TUI tells you so.
 
 ## License
 
