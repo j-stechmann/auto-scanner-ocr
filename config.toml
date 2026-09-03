@@ -44,8 +44,8 @@ output = "~/Documents/scans"
 #                   handles deskew/cleanup once at finish. Fastest and
 #                   content-safe.
 #   "conservative"  unpaper with every content-altering filter disabled
-#                   (verified no-op passthrough). Useful as a hook for
-#                   unpaper_extra_args experiments.
+#                   (verified pixel-identical passthrough). Useful as a hook
+#                   for unpaper_extra_args experiments.
 #   "legacy"        unpaper's original filter stack. WARNING: its mask/border
 #                   detection misfires on flatbed scans and can ERASE page
 #                   edges (tables, margins). Kept for opt-in comparisons.

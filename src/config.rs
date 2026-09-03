@@ -26,8 +26,9 @@ pub enum Cleanup {
     Off,
     /// unpaper with all content-altering filters disabled
     /// (--no-mask-scan --no-border-scan --no-border-align --no-blackfilter
-    /// --no-grayfilter --no-blurfilter --no-deskew): a verified no-op
-    /// passthrough kept for `unpaper_extra_args` experimentation.
+    /// --no-grayfilter --no-blurfilter --no-noisefilter --no-deskew): a
+    /// verified pixel-identical passthrough kept for `unpaper_extra_args`
+    /// experimentation.
     Conservative,
     /// Legacy behavior: unpaper's full default filter stack. WARNING: this
     /// is the mode that erases page edges (the missing-table bug).
@@ -142,19 +143,20 @@ pub fn expand_path(s: &str) -> Result<PathBuf> {
 }
 
 pub fn load_config(explicit: Option<&PathBuf>) -> Result<Config> {
+    // Seed from Config::default() so the two can never drift apart; only the
+    // load-specific bookkeeping fields are set here.
+    let d = Config::default();
     let mut cfg = LoadedConfig {
-        dpi: 600,
-        mode: "gray".into(),
-        langs: "deu+Latin".into(),
-        device: "auto".into(),
-        output: dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Documents/scans"),
-        cleanup: Cleanup::default(),
+        dpi: d.dpi,
+        mode: d.mode,
+        langs: d.langs,
+        device: d.device,
+        output: d.output,
+        cleanup: d.cleanup,
         cleanup_explicit: false,
         unpaper_legacy: None,
-        unpaper_extra_args: Vec::new(),
-        notify: true,
+        unpaper_extra_args: d.unpaper_extra_args,
+        notify: d.notify,
     };
     let Some(path) = find_config(explicit)? else {
         return Ok(migrate_unpaper(cfg));

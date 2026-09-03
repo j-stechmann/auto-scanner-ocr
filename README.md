@@ -155,7 +155,7 @@ notify = true
 settings) does the real work once at finish. unpaper's own default filter
 stack (`legacy`) is tuned for book scans: on flatbed scans its mask/border
 detection misfires and can erase page edges (measured: a whole table wiped).
-`conservative` disables every content-altering filter (a verified no-op
+`conservative` disables every content-altering filter (a verified pixel-identical
 passthrough, kept as a hook for `unpaper_extra_args`). Old configs with
 `unpaper = true` map to `conservative` (with a deprecation warning);
 `unpaper = false` maps to `off`.

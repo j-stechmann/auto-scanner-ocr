@@ -597,11 +597,9 @@ impl Session {
                     let result = scan::scan_page(&device, dpi, &mode, &path, &token).await;
                     match result {
                         Ok(scan::ScanOutcome { used_fallback }) => {
-                            if used_fallback {
-                                tracing::warn!(
-                                    "scanner rejected --resolution/--mode; fallback used (page dpi metadata may differ from request)"
-                                );
-                            }
+                            // The backend already warns on fallback scans
+                            // with the metadata caveat; the status line at
+                            // JobDone handling surfaces it to the UI.
                             let (image, unpaper_deskewed) =
                                 pdf::maybe_unpaper(&path, cleanup, &unpaper_extra_args, &mode)
                                     .await;

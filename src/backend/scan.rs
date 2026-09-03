@@ -150,7 +150,7 @@ pub async fn scan_page(
                         .with_context(|| format!("renaming into {}", out_path.display()))?;
                     if attempt_idx > 0 {
                         tracing::warn!(
-                            "scan attempt {}/{} succeeded; requested settings were rejected",
+                            "scanner rejected --resolution/--mode (fallback attempt {}/{}); page dpi metadata may differ from request",
                             attempt_idx + 1,
                             attempts.len()
                         );

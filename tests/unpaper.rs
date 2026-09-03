@@ -3,27 +3,8 @@
 
 use auto_scanner_ocr::backend::pdf::{maybe_unpaper, unpaper_args};
 
-/// True when the content bounding box (dark pixels below `thresh`) is the
-/// same in both images. Sampled for speed at 600dpi sizes.
-fn same_content_bbox(a: &[u8], b: &[u8], thresh: u8) -> bool {
-    let bbox = |px: &[u8]| -> (usize, usize, usize, usize) {
-        let w = 400;
-        let h = px.len() / w;
-        let (mut mnx, mut mxx, mut mny, mut mxy) = (w, 0, h, 0);
-        for y in (0..h).step_by(2) {
-            for x in (0..w).step_by(2) {
-                if px[y * w + x] < thresh {
-                    mnx = mnx.min(x);
-                    mxx = mxx.max(x);
-                    mny = mny.min(y);
-                    mxy = mxy.max(y);
-                }
-            }
-        }
-        (mnx, mny, mxx, mxy)
-    };
-    bbox(a) == bbox(b)
-}
+/// Fixture width of `write_flatbed_page`.
+const FIXTURE_W: usize = 400;
 
 fn gray_from_png(path: &std::path::Path) -> (u32, u32, Vec<u8>) {
     let img = image::ImageReader::open(path)
@@ -41,7 +22,7 @@ fn gray_from_png(path: &std::path::Path) -> (u32, u32, Vec<u8>) {
 /// background, with text lines near BOTH edges — the default unpaper mask
 /// scan erases exactly these on real flatbed scans (the missing-table bug).
 fn write_flatbed_page(path: &std::path::Path) {
-    let (w, h) = (400u32, 560u32);
+    let (w, h) = (FIXTURE_W as u32, 560u32);
     let mut img = image::GrayImage::from_pixel(w, h, image::Luma([40u8])); // dark lid
                                                                            // White page covering most of the sheet.
     for y in 20..540 {
@@ -84,7 +65,7 @@ async fn conservative_unpaper_preserves_page_content() {
     // Conservative is a passthrough: nothing claims deskew credit.
     assert!(!deskewed);
 
-    let (_, h1, px1) = gray_from_png(&cleaned);
+    let (_, _, px1) = gray_from_png(&cleaned);
     assert!(
         std::fs::metadata(&cleaned).unwrap().len() > 0,
         "output exists"
@@ -92,12 +73,11 @@ async fn conservative_unpaper_preserves_page_content() {
     // Dimensions preserved (no rescale/crop) — the varying-size bug class.
     let img1 = image::open(&cleaned).unwrap();
     assert_eq!((w0, h0), (img1.width(), img1.height()));
-    // Edge text survives (the missing-table bug class).
-    assert!(
-        same_content_bbox(&px0, &px1, 128),
-        "content bbox changed: edge content was destroyed"
-    );
-    let _ = h1;
+    // Byte-identical pixels: conservative disables every filter, so unpaper
+    // must not alter a single pixel (the missing-table AND de-speckle bug
+    // classes). This enforces the "pixel-identical passthrough" the docs
+    // advertise.
+    assert_eq!(px0, px1, "conservative altered pixel data");
 }
 
 #[tokio::test]

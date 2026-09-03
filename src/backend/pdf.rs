@@ -54,10 +54,10 @@ pub fn unpaper_args(cleanup: Cleanup, extra_args: &[String]) -> Vec<String> {
     match cleanup {
         Cleanup::Legacy => {}
         Cleanup::Conservative => {
-            // Disable every content-altering stage: measured no-op passthrough
-            // (content bbox + dimensions preserved 1:1; deskew never fires on
-            // flatbed scans, which lack the dark book-edge surroundings it
-            // expects). Kept as a hook for unpaper_extra_args experiments.
+            // Disable every content-altering stage: measured pixel-identical
+            // passthrough on flatbed scans (deskew never fires — it
+            // expects the dark book-edge surroundings it doesn't find here).
+            // Kept as a hook for unpaper_extra_args experiments.
             for flag in [
                 "--no-mask-scan",
                 "--no-border-scan",
@@ -65,6 +65,7 @@ pub fn unpaper_args(cleanup: Cleanup, extra_args: &[String]) -> Vec<String> {
                 "--no-blackfilter",
                 "--no-grayfilter",
                 "--no-blurfilter",
+                "--no-noisefilter",
                 "--no-deskew",
             ] {
                 args.push(flag.into());
@@ -135,7 +136,7 @@ pub async fn maybe_unpaper(
                 tracing::warn!("PNG re-encode of unpaper output failed ({e}); keeping raw file");
             }
             let _ = tokio::fs::remove_file(page_png).await;
-            (cleaned, cleanup == Cleanup::Legacy && mode != "color")
+            (cleaned, cleanup == Cleanup::Legacy)
         }
         Ok(_) => {
             tracing::warn!("unpaper failed; using raw scan");
@@ -231,7 +232,8 @@ pub async fn build_pdf(plan: &BuildPlan) -> Result<BuildOutcome> {
         if crate::backend::which("pdfunite").is_none() {
             anyhow::bail!(
                 "session mixes page DPIs ({} groups) and pdfunite is not installed \
-                 - install poppler-utils, or rescan all pages at one DPI",
+                 - install poppler (pacman) or poppler-utils (apt), or rescan \
+                 all pages at one DPI",
                 calls.len()
             );
         }
@@ -410,6 +412,7 @@ mod tests {
             "--no-blackfilter",
             "--no-grayfilter",
             "--no-blurfilter",
+            "--no-noisefilter",
             "--no-deskew",
         ] {
             assert!(cons.iter().any(|a| a == flag), "missing {flag}");
