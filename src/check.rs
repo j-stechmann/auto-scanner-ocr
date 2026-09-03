@@ -125,7 +125,9 @@ pub async fn run_checks(cfg: &Config) -> Report {
                     _ => Status::Warn,
                 };
                 let detail = match (cfg.cleanup, found) {
-                    (crate::config::Cleanup::Off, _) => "cleanup = off".to_string(),
+                    (crate::config::Cleanup::Off, _) => {
+                        format!("cleanup = {}", cfg.cleanup.as_str())
+                    }
                     (_, true) => String::new(),
                     (crate::config::Cleanup::Conservative, false) => {
                         "not installed; ocrmypdf deskews/cleans at finish".into()

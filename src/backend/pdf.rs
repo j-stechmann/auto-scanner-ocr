@@ -169,12 +169,12 @@ pub struct BuildPlan {
     pub pages: Vec<(PathBuf, u16)>,
     /// True when at least one page was NOT fully cleaned+deskewed by unpaper
     /// (cleanup off/conservative, unpaper failure, color pages in legacy
-    /// mode): ocrmypdf then deskews/cleans every page.
+    /// mode): ocrmypdf then --cleans every page at finish (--deskew runs
+    /// unconditionally).
     pub any_page_needing_cleanup: bool,
     /// True when any page was manually rotated: ocrmypdf --rotate-pages is
     /// then omitted entirely (it cannot be exempted per page).
     pub manually_rotated: bool,
-    pub cleanup: Cleanup,
     pub langs: String,
     pub out_pdf: PathBuf,
 }
@@ -253,10 +253,12 @@ pub async fn build_pdf(plan: &BuildPlan) -> Result<BuildOutcome> {
         run_pdf_step("PDF merge (pdfunite)", &unite, PDFUNITE_TIMEOUT).await?;
     }
 
-    // ocrmypdf deskew/clean: legacy unpaper already deskews pages it
-    // processed (gray/lineart only), so cleanup flags are needed only when
-    // at least one page missed that pass. --clean requires the unpaper
-    // binary (ocrmypdf hard-fails otherwise); --deskew does not.
+    // ocrmypdf deskew/clean. --deskew always runs: it is content-safe and
+    // idempotent on pages unpaper already deskewed, and unpaper's own deskew
+    // is a no-op on flatbed scans (conservative explicitly disables it), so
+    // legacy-mode pages still need it. --clean (not per-page) runs when any
+    // page missed unpaper's cleanup, and only when the unpaper binary is
+    // present (ocrmypdf hard-fails without it).
     let mut ocr_args: Vec<String> = vec![
         "ocrmypdf".into(),
         "--language".into(),
@@ -265,18 +267,15 @@ pub async fn build_pdf(plan: &BuildPlan) -> Result<BuildOutcome> {
         "pdfa".into(),
         "--optimize".into(),
         "0".into(),
+        "--deskew".into(),
     ];
     if !plan.manually_rotated {
         ocr_args.push("--rotate-pages".into());
         ocr_args.push("--rotate-pages-threshold".into());
         ocr_args.push("10".into());
     }
-    let unpaper_present = crate::backend::which("unpaper").is_some();
-    if plan.any_page_needing_cleanup || plan.cleanup != Cleanup::Legacy {
-        ocr_args.push("--deskew".into());
-        if unpaper_present {
-            ocr_args.push("--clean".into());
-        }
+    if crate::backend::which("unpaper").is_some() && plan.any_page_needing_cleanup {
+        ocr_args.push("--clean".into());
     }
     ocr_args.push(raw_pdf.to_string_lossy().into_owned());
     ocr_args.push(plan.out_pdf.to_string_lossy().into_owned());

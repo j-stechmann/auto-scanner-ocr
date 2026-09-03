@@ -150,7 +150,7 @@ pub async fn scan_page(
                         .with_context(|| format!("renaming into {}", out_path.display()))?;
                     if attempt_idx > 0 {
                         tracing::warn!(
-                            "scan attempt {}/3 succeeded ({}); requested settings were rejected",
+                            "scan attempt {}/{} succeeded; requested settings were rejected",
                             attempt_idx + 1,
                             attempts.len()
                         );

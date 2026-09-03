@@ -369,6 +369,9 @@ impl Session {
                 if self.busy == Busy::Scanning {
                     return Err("scanner busy - press Esc to cancel".into());
                 }
+                if self.busy == Busy::Finishing {
+                    return Err("building PDF - rescan once it finishes".into());
+                }
                 match self.pages.iter().find(|p| p.id == *id).map(|p| p.status) {
                     Some(PageStatus::Ready) | Some(PageStatus::Failed) => Ok(()),
                     Some(_) => Err("page busy - rescan after it finishes".into()),
@@ -376,6 +379,9 @@ impl Session {
                 }
             }
             Cmd::Rotate(id, _) => {
+                if self.busy == Busy::Finishing {
+                    return Err("building PDF - rotate once it finishes".into());
+                }
                 if self.jobs.contains_key(id) {
                     return Err("page busy - rotate after it finishes".into());
                 }
@@ -708,18 +714,15 @@ impl Session {
                     p.image_gen += 1;
                 }
                 self.notify_pages();
-                let note = match (used_fallback, unpaper_deskewed) {
-                    (true, _) => " - scanner rejected resolution/mode; page size may differ",
-                    (false, false)
-                        if self.cfg.cleanup == Cleanup::Legacy
-                            && self.cfg.unpaper_extra_args.is_empty() =>
-                    {
-                        // Normal for color pages in legacy mode (unpaper is
-                        // grayscale-only); ocrmypdf deskews at finish.
-                        ""
-                    }
-                    (false, false) => " - unpaper cleanup unavailable; ocrmypdf deskews at finish",
-                    (false, true) => "",
+                // Only the scanner fallback needs surfacing here: unpaper
+                // skips are per config (off/conservative by design, legacy
+                // color pages because unpaper is grayscale-only) or logged
+                // as warnings by the backend, and ocrmypdf always deskews
+                // at finish.
+                let note = if used_fallback {
+                    " - scanner rejected resolution/mode; page size may differ"
+                } else {
+                    ""
                 };
                 self.status(format!("page {id} ready{note}"));
             }
@@ -840,7 +843,6 @@ impl Session {
             pages,
             any_page_needing_cleanup,
             manually_rotated,
-            cleanup: self.cfg.cleanup,
             langs: self.cfg.langs.clone(),
             out_pdf: self.out_pdf.clone(),
         };
