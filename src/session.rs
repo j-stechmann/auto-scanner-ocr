@@ -394,13 +394,23 @@ impl Session {
         }
     }
 
+    /// True while quitting could still lose scan results: work in flight
+    /// or pages holding captured images. Mirrors the quit-confirm rule
+    /// (`App::needs_quit_confirm`): failed pages count as contentless
+    /// (quitting never deletes files, and the dialog ignores them too),
+    /// and a finished session holds only inert stubs of a built PDF.
     pub fn dirty(&self) -> bool {
+        if self.finished {
+            return false;
+        }
         self.busy != Busy::Idle
             || !self.jobs.is_empty()
-            || self
-                .pages
-                .iter()
-                .any(|p| p.status != PageStatus::DeletePending)
+            || self.pages.iter().any(|p| {
+                matches!(
+                    p.status,
+                    PageStatus::Scanning | PageStatus::Processing | PageStatus::Ready
+                )
+            })
     }
 
     pub fn output_path(&self) -> &std::path::Path {
@@ -1326,6 +1336,41 @@ fn state_dir() -> PathBuf {
         .join(crate::config::PROGRAM)
 }
 
+/// Session dirs older than this are swept at startup. Covers crashes and
+/// quits with un-built pages (quitting never deletes files), plus the empty
+/// dir every launch leaves when the app exits before/after a build. The
+/// threshold keeps an already-running instance's active session untouchable
+/// (its dir mtime is fresh); two concurrent instances are unsupported anyway.
+const STALE_SESSION_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Remove `sessions/` subdirectories not modified within `max_age`. Files
+/// directly in the root are left alone. Best effort: I/O errors are logged
+/// and skipped.
+fn sweep_stale_sessions(root: &std::path::Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+            .is_some_and(|age| age >= max_age);
+        if !stale {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => tracing::info!("swept stale session dir {}", path.display()),
+            Err(e) => tracing::warn!("could not sweep {}: {e}", path.display()),
+        }
+    }
+}
+
 /// Run the session actor loop: commands + job completions.
 async fn actor_loop(
     mut session: Session,
@@ -1352,6 +1397,10 @@ async fn actor_loop(
 
 /// Spawn the actor with its channels; returns (cmd sender, event receiver).
 pub fn spawn(cfg: Config, device: String) -> Result<(mpsc::Sender<Cmd>, mpsc::Receiver<Event>)> {
+    // Startup sweep: crash leftovers and quit-time session dirs (quitting
+    // never deletes files) accumulate under sessions/; anything older than
+    // the age threshold cannot belong to a live session.
+    sweep_stale_sessions(&state_dir().join("sessions"), STALE_SESSION_AGE);
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(64);
     let (event_tx, event_rx) = mpsc::channel::<Event>(256);
     let (job_tx, job_rx) = mpsc::unbounded_channel::<JobDone>();
@@ -1743,6 +1792,7 @@ mod tests {
         );
         assert!(s.jobs.is_empty());
         assert!(s.meta().finished, "flag surfaces in the TUI meta");
+        assert!(!s.meta().dirty, "finished session is not dirty");
         assert!(
             s.guard(&Cmd::ScanNext {
                 dpi: 300,
@@ -1785,6 +1835,50 @@ mod tests {
         assert!(!s.finished, "failed build does not set the flag");
         s.request_text(1);
         assert!(s.pages[0].text_pending, "lazy OCR still works");
+        // A failed build must keep the dirty flag on: the pages still hold
+        // real images and no PDF was produced.
+        assert!(s.meta().dirty);
+    }
+
+    #[tokio::test]
+    async fn dirty_tracks_finishability_and_failed_pages() {
+        // The dirty flag mirrors the quit-confirm rule: Ready/Scanning/
+        // Processing pages count (a PDF could still be built from them),
+        // Failed pages do not (the dialog ignores them too), and a finished
+        // session is clean no matter what the stubs look like.
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+
+        // Fresh session: clean.
+        assert!(!s.dirty(), "empty session is clean");
+
+        // Scanning page: dirty.
+        s.start_scan(300, "gray".into(), None);
+        assert!(s.dirty(), "scan in flight is dirty");
+
+        // Ready page with a captured image: still dirty.
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+        assert!(s.dirty(), "captured (un-built) page is dirty");
+
+        // All pages failed: quitting loses nothing the dialog cares about.
+        if let Some(p) = s.pages.iter_mut().find(|p| p.id == 1) {
+            p.status = PageStatus::Failed;
+            p.error = Some("boom".into());
+        }
+        assert!(!s.dirty(), "all-failed session counts as clean");
+
+        // Successful finish makes the session clean despite the stubs.
+        if let Some(p) = s.pages.iter_mut().find(|p| p.id == 1) {
+            p.status = PageStatus::Ready;
+            p.error = None;
+        }
+        s.handle_job_done(JobDone::Finish {
+            result: Ok(pdf::BuildOutcome::Searchable),
+        })
+        .await;
+        assert!(s.finished);
+        assert!(!s.dirty(), "finished session is clean despite stubs");
     }
 
     #[tokio::test]
@@ -1860,5 +1954,54 @@ mod tests {
         );
         s.request_text(1);
         assert!(s.pages[0].text_pending);
+    }
+
+    #[test]
+    fn sweep_removes_stale_but_keeps_fresh_session_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let old = sessions.join("2026-01-01_000000");
+        let fresh = sessions.join("2099-01-01_000000");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(old.join("page_001.png"), b"x").unwrap();
+        // A fresh tempdir's dirs have "now" mtimes; backdate one past the
+        // threshold (the sweep itself reads mtimes, never names).
+        let two_days_ago = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60),
+        );
+        filetime::set_file_mtime(&old, two_days_ago).unwrap();
+
+        sweep_stale_sessions(&sessions, std::time::Duration::from_secs(24 * 60 * 60));
+
+        assert!(!old.exists(), "stale dir removed");
+        assert!(fresh.exists(), "fresh dir kept");
+    }
+
+    #[test]
+    fn sweep_zero_age_clears_all_dirs_and_leaves_files() {
+        // max_age = ZERO: every dir goes, but stray files in the root are
+        // untouched (only subdirectories belong to sessions).
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let d1 = sessions.join("a");
+        let d2 = sessions.join("b");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(d2.join("nested")).unwrap();
+        let stray = sessions.join("stray.png");
+        std::fs::write(&stray, b"x").unwrap();
+
+        sweep_stale_sessions(&sessions, std::time::Duration::ZERO);
+
+        assert!(!d1.exists() && !d2.exists(), "all dirs removed");
+        assert!(stray.exists(), "root-level files untouched");
+        assert!(sessions.exists(), "sessions root itself survives");
+    }
+
+    #[test]
+    fn sweep_tolerates_missing_root() {
+        // First launch: sessions/ does not exist yet — must not panic.
+        let root = tempfile::tempdir().unwrap();
+        sweep_stale_sessions(&root.path().join("nope"), std::time::Duration::ZERO);
     }
 }

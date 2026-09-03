@@ -236,9 +236,11 @@ isolated child process.
   add `-v` to see them in the terminal.
 - Scanner not found? Check USB, power, and `scanimage -L`. For HP devices run
   `sudo hp-setup -i` once.
-- Scans left over from a crashed session live under
-  `~/.local/state/auto-scanner-ocr/sessions/` and are safe to delete when no
-  scan is running.
+- Session leftovers (from crashes, or quits with un-built pages) live under
+  `~/.local/state/auto-scanner-ocr/sessions/`. They are swept automatically:
+  on the next startup, any session dir untouched for over 24 h is deleted.
+  Don't relaunch the app while an older instance is still running — the new
+  instance's sweep can delete the old one's session files.
 
 ## The result
 
