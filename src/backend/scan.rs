@@ -178,32 +178,9 @@ pub async fn scan_page(
 }
 
 /// Extract text from a page image with tesseract (for the TUI text pane).
-/// Uses the same `langs` string as the final OCR pass.
-pub async fn ocr_text(image: &Path, langs: &str, workdir: &Path) -> Result<String> {
-    let base = workdir.join(format!(
-        "tess_{}_{}",
-        std::process::id(),
-        monotonically_naming_counter()
-    ));
-    let cmd = [
-        "tesseract",
-        image.to_str().expect("utf8 path"),
-        &base.to_string_lossy(),
-        "-l",
-        langs,
-        "txt",
-    ];
-    process::run_ok(&cmd, None).await?;
-    let txt_path = base.with_extension("txt");
-    let text = tokio::fs::read_to_string(&txt_path)
-        .await
-        .unwrap_or_default();
-    let _ = tokio::fs::remove_file(&txt_path).await;
-    Ok(text)
-}
-
-/// Like [`ocr_text`], but abortable: killing tesseract leaves no output file
-/// and the function reports "cancelled" (checked by callers via the message).
+/// Uses the same `langs` string as the final OCR pass. Abortable: killing
+/// tesseract leaves no output file and the function reports "cancelled"
+/// (checked by callers via the message).
 pub async fn ocr_text_cancellable(
     image: &Path,
     langs: &str,
