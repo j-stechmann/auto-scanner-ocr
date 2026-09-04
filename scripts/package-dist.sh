@@ -55,6 +55,7 @@ rm "$STAGE/$PKG" "$STAGE/README.md" "$STAGE/LICENSE" "$STAGE/config.toml"
 DEBROOT=$STAGE.deb-root
 install -Dm 0755 "$BIN" "$DEBROOT/usr/bin/$PKG"
 install -Dm 0644 config.toml "$DEBROOT/usr/share/doc/$PKG/examples/config.toml"
+mkdir -p "$DEBROOT/DEBIAN"
 cat > "$DEBROOT/DEBIAN/control" <<EOF
 Package: $PKG
 Version: $VERSION
