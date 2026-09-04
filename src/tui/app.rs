@@ -160,8 +160,9 @@ impl App {
     /// Quit needs a confirm only when real work could still be lost:
     /// any page holding a captured image while the session hasn't been
     /// built into a PDF. Failed captures count as contentless (quitting
-    /// never deletes their files, the dialog just can't promise a PDF for
-    /// them), and a finished session holds only inert post-build stubs.
+    /// deletes their files along with the session dir, the dialog just
+    /// can't promise a PDF for them), and a finished session holds only
+    /// inert post-build stubs.
     pub fn needs_quit_confirm(&self) -> bool {
         !self.meta.as_ref().is_some_and(|m| m.finished)
             && self.pages.iter().any(|p| {
@@ -358,8 +359,9 @@ pub async fn run_tui(
         }
     }
 
-    // Persisted cleanup never happens on exit: quitting with un-built
-    // pages leaves the session dir under the state directory on disk.
+    // Quitting deletes the session dir (via the session actor's Drop):
+    // un-built pages are gone unless a PDF build was in flight, in which
+    // case the dir survives for the next startup's sweep.
     Ok(())
 }
 

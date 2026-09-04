@@ -165,8 +165,8 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
- "filetime",
  "image",
+ "libc",
  "ratatui",
  "ratatui-image",
  "regex",
@@ -805,16 +805,6 @@ dependencies = [
  "libc",
  "thiserror 1.0.69",
  "winapi",
-]
-
-[[package]]
-name = "filetime"
-version = "0.2.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
-dependencies = [
- "cfg-if",
- "libc",
 ]
 
 [[package]]

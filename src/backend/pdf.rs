@@ -309,20 +309,42 @@ async fn run_pdf_step(what: &str, args: &[String], timeout: Duration) -> Result<
 }
 
 /// Timestamped unique output path: `YYYY-MM-DD_HHMMSS.pdf` with `_2`, `_3`...
-/// suffix on collision (parity with unique_path; resolved once at session
-/// creation).
-pub fn unique_path(dir: &Path, stamp: String) -> PathBuf {
-    let base = dir.join(format!("{stamp}.pdf"));
-    if !base.exists() {
-        return base;
-    }
+/// suffix on collision. The chosen path is RESERVED by creating the file
+/// (O_EXCL) — unlike an exists()-check, a reservation cannot be won twice by
+/// concurrent instances, so two same-stamp launches can never silently pick
+/// the same output and overwrite each other's PDF.
+///
+/// Callers delete the zero-byte placeholder via `release_reservation` when
+/// the session never builds (quit, new session). On a hard open error
+/// (unwritable output dir etc.) nothing is created and the error propagates,
+/// so a failed start cannot leave junk behind.
+pub fn reserve_output_path(dir: &Path, stamp: String) -> Result<PathBuf> {
+    let mut base = dir.join(format!("{stamp}.pdf"));
     let mut n = 2;
     loop {
-        let cand = dir.join(format!("{stamp}_{n}.pdf"));
-        if !cand.exists() {
-            return cand;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&base)
+        {
+            Ok(_) => return Ok(base),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                base = dir.join(format!("{stamp}_{n}.pdf"));
+                n += 1;
+            }
+            Err(e) => return Err(e.into()),
         }
-        n += 1;
+    }
+}
+
+/// Remove a reservation made by `reserve_output_path`. Only deletes the
+/// zero-byte placeholder, so a real PDF (written by a finished build) is
+/// never touched. Best effort.
+pub fn release_reservation(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_file() && meta.len() == 0 {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -351,18 +373,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unique_path_collisions() {
+    fn reserve_output_path_collisions_and_release() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let stamp = "2026-09-02_143005".to_string();
-        let p1 = unique_path(d, stamp.clone());
+        let p1 = reserve_output_path(d, stamp.clone()).unwrap();
         assert_eq!(p1, d.join("2026-09-02_143005.pdf"));
-        std::fs::write(&p1, b"x").unwrap();
-        let p2 = unique_path(d, stamp.clone());
+        assert!(p1.exists(), "reservation creates the placeholder");
+        // Second reserve for the same stamp must not reuse the live path.
+        let p2 = reserve_output_path(d, stamp.clone()).unwrap();
         assert_eq!(p2, d.join("2026-09-02_143005_2.pdf"));
-        std::fs::write(&p2, b"x").unwrap();
-        let p3 = unique_path(d, stamp);
+        let p3 = reserve_output_path(d, stamp).unwrap();
         assert_eq!(p3, d.join("2026-09-02_143005_3.pdf"));
+        // Release only deletes empty placeholders; a written PDF survives.
+        release_reservation(&p2);
+        assert!(!p2.exists());
+        release_reservation(&p1);
+        assert!(!p1.exists());
+        std::fs::write(&p3, b"pdf bytes").unwrap();
+        release_reservation(&p3);
+        assert!(p3.exists(), "built PDF is never released");
     }
 
     #[test]
