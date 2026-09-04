@@ -75,6 +75,11 @@ dpkg-deb --build --root-owner-group "$DEBROOT" \
     "$DIST/$PKG-$VERSION${SUFFIX:+-$SUFFIX}-$TRIPLE.deb"
 
 # -------------------------------------------------------------------- rpm ---
+# Absolute binary path: %install runs with cwd=rpmbuild/BUILD, so relative
+# paths from the repo root would not resolve.
+BIN_ABS=$(readlink -f "$BIN")
+# %_target_cpu must map to a platform rpm knows about; pass it via --target
+# and let BuildArch in the spec pin the package arch.
 cat > "$STAGE.spec" <<EOF
 Name:           $PKG
 Version:        $VERSION
@@ -90,11 +95,29 @@ Flatbed scan -> searchable OCR PDF, via SANE + ocrmypdf. Linux-only TUI.
 Config is read from ./config.toml (CWD) or ~/.config/auto-scanner-ocr/config.toml.
 
 %install
-install -Dm 0755 $BIN %{buildroot}/usr/bin/$PKG
+install -Dm 0755 $BIN_ABS %{buildroot}/usr/bin/$PKG
 
 %files
 /usr/bin/$PKG
 EOF
+# "No compatible architectures found for build": Debian's rpm has no
+# /usr/lib/rpm/platform/<arch>/macros for cross arches. Create a minimal
+# platform config so --target resolves.
+PLATFORM_DIR=/usr/lib/rpm/platform/$RPM_ARCH
+if [ ! -d "$PLATFORM_DIR" ] && [ "$RPM_ARCH" != "x86_64" ]; then
+    echo "creating minimal rpm platform config for $RPM_ARCH" >&2
+    sudo mkdir -p "$PLATFORM_DIR"
+    sudo tee "$PLATFORM_DIR/macros" > /dev/null <<'MACROS'
+%is_rpm_arch 1
+%_is_rpm_arch 1
+%optflags -O2
+%_arch @ARCH@
+%_target_cpu @ARCH@
+%_target_platform @PLATFORM@-linux-gnu
+MACROS
+    sudo sed -i "s|@ARCH@|$RPM_ARCH|g; s|@PLATFORM@|$RPM_ARCH|" "$PLATFORM_DIR/macros"
+    sudo sed -i "s|@PLATFORM@|$RPM_ARCH|" "$PLATFORM_DIR/macros"
+fi
 rpmbuild -bb --define "_topdir $PWD/rpmbuild" \
     --define "debug_package %{nil}" \
     --define "__os_install_post %{nil}" \
