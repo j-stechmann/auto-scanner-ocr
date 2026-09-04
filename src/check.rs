@@ -3,8 +3,8 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::backend::scan::{self};
 pub use crate::backend::scan::Device;
+use crate::backend::scan::{self};
 use crate::config::Config;
 
 /// Timeout for notify-send / unpaper presence checks is not needed (PATH only).

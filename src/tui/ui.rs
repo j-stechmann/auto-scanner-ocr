@@ -713,10 +713,7 @@ fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
                 "SKIP",
                 Style::default().fg(Color::Black).bg(Color::DarkGray),
             ),
-            Status::Pending => (
-                " ...",
-                Style::default().fg(Color::Black).bg(Color::Cyan),
-            ),
+            Status::Pending => (" ...", Style::default().fg(Color::Black).bg(Color::Cyan)),
         };
         if item.status == Status::Pending {
             lines.push(Line::from(vec![

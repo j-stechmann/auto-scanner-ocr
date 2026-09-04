@@ -220,11 +220,14 @@ missing.
 
 The preview auto-detects the terminal's graphics protocol via a short-lived
 probe process: kitty graphics and sixel render native images; everywhere
-else it falls back to unicode halfblocks. Inside tmux the probe queries
-raw (tmux swallows answers to its own passthrough-wrapped queries), so sixel
-works in tmux too when the outer terminal (e.g. foot) supports it.
-Detection never interferes with keyboard input — the probe runs in an
-isolated child process.
+else it falls back to unicode halfblocks. The probe's first response must
+arrive within ~600 ms — local terminals answer in a few ms, but a very
+slow SSH link (or a heavily loaded tmux passthrough) can fall back to
+halfblocks, degrading only the image preview, never scanning. Inside tmux
+the probe queries raw (tmux swallows answers to its own passthrough-wrapped
+queries), so sixel works in tmux too when the outer terminal (e.g. foot)
+supports it. Detection never interferes with keyboard input — the probe
+runs in an isolated child process.
 
 ## Troubleshooting
 

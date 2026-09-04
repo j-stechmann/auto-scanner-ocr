@@ -480,7 +480,14 @@ impl Session {
         match cmd {
             Cmd::ScanNext { .. } => {
                 if self.device.is_empty() {
-                    return Err("scanner detection still running".into());
+                    // finished + empty device is unreachable through real
+                    // state transitions (a build needs pages needs a
+                    // device); the branch is defensive so a future state
+                    // bug can't produce a misleading message.
+                    return Err(match self.finished {
+                        true => "no scanner detected".into(),
+                        false => "scanner detection still running".into(),
+                    });
                 }
                 if self.busy == Busy::Scanning {
                     return Err("scanner busy - press Esc to cancel".into());
@@ -502,7 +509,11 @@ impl Session {
             }
             Cmd::Rescan(id) => {
                 if self.device.is_empty() {
-                    return Err("scanner detection still running".into());
+                    // Defensive: see the ScanNext guard note.
+                    return Err(match self.finished {
+                        true => "no scanner detected".into(),
+                        false => "scanner detection still running".into(),
+                    });
                 }
                 if self.busy == Busy::Scanning {
                     return Err("scanner busy - press Esc to cancel".into());
@@ -1997,7 +2008,10 @@ mod tests {
         let (mut s, _dir) = test_session_undetected();
         // Empty device: guard rejects scanning before detection delivers.
         assert_eq!(
-            s.guard(&Cmd::ScanNext { dpi: 300, mode: "gray".into() }),
+            s.guard(&Cmd::ScanNext {
+                dpi: 300,
+                mode: "gray".into()
+            }),
             Err("scanner detection still running".into())
         );
         assert!(s.guard(&Cmd::Rescan(1)).is_err());
@@ -2005,7 +2019,30 @@ mod tests {
 
         s.handle(Cmd::SetDevice("hpaio:/usb/x".into())).await;
         assert_eq!(s.device, "hpaio:/usb/x");
-        assert!(s.guard(&Cmd::ScanNext { dpi: 300, mode: "gray".into() }).is_ok());
+        assert!(s
+            .guard(&Cmd::ScanNext {
+                dpi: 300,
+                mode: "gray".into()
+            })
+            .is_ok());
+    }
+
+    /// Post-build with no device ever delivered (startup + re-runs both
+    /// failed to find a scanner): the message must not claim detection is
+    /// still running.
+    #[tokio::test]
+    async fn device_message_reflects_finished_state() {
+        let (mut s, _dir) = test_session_undetected();
+        s.finished = true;
+        let expect = Err("no scanner detected".into());
+        assert_eq!(
+            s.guard(&Cmd::ScanNext {
+                dpi: 300,
+                mode: "gray".into()
+            }),
+            expect
+        );
+        assert_eq!(s.guard(&Cmd::Rescan(1)), expect);
     }
 
     #[tokio::test]

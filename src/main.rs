@@ -63,14 +63,16 @@ fn run(cli: Cli) -> Result<i32> {
 /// ratatui-image query itself.
 fn run_image_probe() -> Result<i32> {
     use ratatui_image::picker::cap_parser::QueryStdioOptions;
-    // 300ms silence window instead of the crate's 2s default: the crate
+    // 600ms silence window instead of the crate's 2s default: the crate
     // treats the timeout as an inactivity timer (it restarts on every
     // received chunk), so real terminals that answer in a burst are
-    // unaffected — only silent terminals fall back to halfblocks sooner.
+    // unaffected — but the FIRST response byte must still arrive within
+    // the window, which leaves headroom for SSH links and tmux
+    // passthroughs where a local terminal answers in single-digit ms.
     // Keep ..Default::default(): enabling the extra OSC-11 / text-sizing
     // queries would add more response bytes and make short windows risky.
     let opts = QueryStdioOptions {
-        timeout: std::time::Duration::from_millis(300),
+        timeout: std::time::Duration::from_millis(600),
         ..QueryStdioOptions::default()
     };
     let line = match ratatui_image::picker::Picker::from_query_stdio_with_options(opts) {
@@ -117,7 +119,7 @@ async fn async_tui(cfg: auto_scanner_ocr::config::Config) -> Result<i32> {
     // the query's orphaned stdin reader eats keystrokes when the terminal
     // never answers, then restores cooked termios mid-session. The child
     // isolates that failure mode (its orphan thread dies with the process).
-    // Budget ~300ms (+ spawn overhead); any failure falls back to
+    // Budget ~600ms (+ spawn overhead); any failure falls back to
     // halfblocks. Synchronous spawn is fine here: the multi-thread runtime
     // keeps the preflight task running on other workers.
     let (picker, picker_available) = image_probe_picker();
@@ -148,7 +150,7 @@ async fn async_tui(cfg: auto_scanner_ocr::config::Config) -> Result<i32> {
 }
 
 /// Probe the terminal via a short-lived child process (`--image-probe`).
-/// Returns (picker, native_protocol_available). Silence budget ~300ms plus
+/// Returns (picker, native_protocol_available). Silence budget ~600ms plus
 /// spawn overhead; any failure falls back to halfblocks.
 ///
 /// tmux caveat (measured): ratatui-image wraps its queries in a tmux DCS
