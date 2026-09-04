@@ -86,7 +86,7 @@ dpkg-deb --build --root-owner-group "$DEBROOT" \
 # the rpmbuild tree and %install copies it from there.
 RPMDIR=$PWD/rpmbuild
 STAGED_BIN=rpmtop-staged/usr/bin/$PKG
-mkdir -p "$RPMDIR/$STAGED_BIN"
+mkdir -p "$RPMDIR/$(dirname "$STAGED_BIN")"
 install -m 0755 "$BIN" "$RPMDIR/$STAGED_BIN"
 cat > "$STAGE.spec" <<EOF
 Name:           $PKG
