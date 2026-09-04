@@ -18,7 +18,7 @@ use crate::config::{Config, PreviewOcr};
 use crate::notify::{self, Urgency};
 use crate::session::{self, Busy, Event, PageStatus, PageView, SessionMeta};
 
-use super::overlays::{self, Confirm, Overlay};
+use super::overlays::{self, Confirm, ConfirmKind, Overlay};
 use super::preview::PreviewWorker;
 use super::ui;
 
@@ -157,6 +157,25 @@ impl App {
         self.meta.as_ref().map(|m| m.busy).unwrap_or(Busy::Idle)
     }
 
+    /// Quit needs a confirm only when real work could still be lost:
+    /// any page holding a captured image while the session hasn't been
+    /// built into a PDF. Failed captures count as contentless (quitting
+    /// deletes their files along with the session dir, the dialog just
+    /// can't promise a PDF for them), and a finished session holds only
+    /// inert post-build stubs.
+    pub fn needs_quit_confirm(&self) -> bool {
+        !self.meta.as_ref().is_some_and(|m| m.finished)
+            && self.pages.iter().any(|p| {
+                matches!(
+                    p.status,
+                    PageStatus::Ready
+                        | PageStatus::Processing
+                        | PageStatus::Scanning
+                        | PageStatus::DeletePending
+                )
+            })
+    }
+
     /// Guard feedback for the footer: is this key action currently allowed?
     pub fn action_allowed(&self, action: Action) -> bool {
         let busy = self.busy();
@@ -231,6 +250,7 @@ pub fn to_cmd(app: &App, action: CommandAction) -> Option<session::Cmd> {
         CommandAction::Move(from, to) => Some(session::Cmd::Move { from, to }),
         CommandAction::CancelScan => Some(session::Cmd::CancelScan),
         CommandAction::ListLangs => Some(session::Cmd::ListLangs),
+        CommandAction::NewSession => Some(session::Cmd::NewSession),
     }
 }
 
@@ -243,6 +263,7 @@ pub enum CommandAction {
     Move(usize, usize),
     CancelScan,
     ListLangs,
+    NewSession,
 }
 
 /// Run the TUI. Owns the terminal, event stream, preview worker, and the
@@ -338,7 +359,9 @@ pub async fn run_tui(
         }
     }
 
-    // Persisted cleanup happens in main via the session actor's Drop.
+    // Quitting deletes the session dir (via the session actor's Drop):
+    // un-built pages are gone unless a PDF build was in flight, in which
+    // case the dir survives for the next startup's sweep.
     Ok(())
 }
 
@@ -358,6 +381,20 @@ async fn handle_session_event(app: &mut App, ev: Event) {
                 }
             }
             app.sync_selection();
+            // A quit confirm opened while a build was in flight may now be
+            // stale (PDF finished meanwhile, pages became inert stubs):
+            // drop it instead of claiming pages "will be lost". The user
+            // presses q again to actually quit.
+            let stale_quit = matches!(
+                app.overlay,
+                Some(Overlay::Confirm(Confirm {
+                    kind: ConfirmKind::Quit,
+                    ..
+                }))
+            ) && !app.needs_quit_confirm();
+            if stale_quit {
+                app.overlay = None;
+            }
         }
         Event::Status(msg) => app.set_status(msg),
         Event::Finished {
@@ -439,7 +476,7 @@ async fn handle_event(
         CtEvent::Key(key) if key.kind == KeyEventKind::Press => {
             match handle_key(app, key, cmd_tx).await {
                 UiAction::Quit => {
-                    if app.pages.iter().any(|p| p.status != PageStatus::Failed) {
+                    if app.needs_quit_confirm() {
                         app.overlay = Some(Overlay::Confirm(Confirm::quit()));
                     } else {
                         app.quit_requested = true;
@@ -566,7 +603,13 @@ async fn handle_key(
             }
         }
         Char('n') => {
-            app.overlay = Some(Overlay::Confirm(Confirm::new_session()));
+            // Post-finish the pages are inert stubs of a built PDF: nothing
+            // to lose, so start the new session directly.
+            if app.meta.as_ref().is_some_and(|m| m.finished) {
+                send(app, cmd_tx, CommandAction::NewSession).await;
+            } else {
+                app.overlay = Some(Overlay::Confirm(Confirm::new_session()));
+            }
         }
 
         // ---------------- settings
@@ -762,5 +805,113 @@ mod tests {
         assert_eq!(Pane::Preview.next(), Pane::Text);
         assert_eq!(Pane::Text.next(), Pane::Sidebar);
         assert_eq!(Pane::Sidebar.prev(), Pane::Text);
+    }
+
+    /// App with throwaway channels; meta/pages are set per-test.
+    fn test_app() -> App {
+        let (diag_tx, _diag_rx) = mpsc::channel(4);
+        App::new(Config::default(), "fake scanner".into(), diag_tx)
+    }
+
+    fn ready_page(id: u32) -> PageView {
+        PageView {
+            id,
+            status: PageStatus::Ready,
+            stage: None,
+            stage_started: None,
+            image: Some(std::path::PathBuf::from(format!("/tmp/page_{id}.png"))),
+            image_gen: 1,
+            text: None,
+            text_pending: false,
+            ocr_failed_gen: None,
+            error: None,
+            dpi: 300,
+            mode: "gray".into(),
+            rotated: false,
+        }
+    }
+
+    fn meta(finished: bool) -> SessionMeta {
+        SessionMeta {
+            busy: Busy::Idle,
+            busy_since: None,
+            jobs_running: 0,
+            output_path: "/tmp/out.pdf".into(),
+            dirty: !finished,
+            finished,
+        }
+    }
+
+    #[test]
+    fn quit_confirm_rules() {
+        // No pages / no meta: never confirm.
+        let mut app = test_app();
+        assert!(!app.needs_quit_confirm(), "empty app quits silently");
+
+        // Ready page, session not finished: confirm.
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        assert!(app.needs_quit_confirm(), "un-built pages need confirm");
+
+        // Failed pages only: no confirm (nothing the dialog cares about).
+        let mut failed = ready_page(1);
+        failed.status = PageStatus::Failed;
+        app.pages = vec![failed];
+        assert!(!app.needs_quit_confirm(), "failed pages quit silently");
+
+        // Finished session: inert stubs, no confirm.
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(true));
+        assert!(!app.needs_quit_confirm(), "finished session quits silently");
+
+        // meta missing (before first snapshot) but pages present: fall
+        // back to the pages check.
+        app.meta = None;
+        assert!(app.needs_quit_confirm(), "missing meta defers to pages");
+    }
+
+    #[tokio::test]
+    async fn stale_quit_confirm_dismisses_after_finish() {
+        // The quit dialog opened while the build ran; the Pages snapshot
+        // after completion must dismiss it instead of claiming pages
+        // "will be lost".
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.overlay = Some(Overlay::Confirm(Confirm::quit()));
+        assert!(app.needs_quit_confirm());
+
+        handle_session_event(
+            &mut app,
+            Event::Pages {
+                pages: vec![ready_page(1)],
+                meta: meta(true),
+            },
+        )
+        .await;
+        assert!(app.overlay.is_none(), "stale quit dialog dismissed");
+    }
+
+    #[tokio::test]
+    async fn quit_confirm_survives_unrelated_page_events() {
+        // A confirm that is still valid must NOT be dismissed by Pages
+        // snapshots, and other overlay kinds stay untouched.
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.overlay = Some(Overlay::Confirm(Confirm::quit()));
+
+        handle_session_event(
+            &mut app,
+            Event::Pages {
+                pages: vec![ready_page(1)],
+                meta: meta(false),
+            },
+        )
+        .await;
+        assert!(
+            matches!(app.overlay, Some(Overlay::Confirm(_))),
+            "still-valid confirm survives"
+        );
     }
 }

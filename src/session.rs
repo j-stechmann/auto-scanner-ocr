@@ -21,6 +21,7 @@
 //!   `Instant`s — no actor round-trips for ticking.
 
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -297,6 +298,14 @@ pub struct Session {
     cfg: Config,
     device: String,
     dir: PathBuf,
+    /// Where `sessions/` lives; resolved once at construction so `new_session`
+    /// never re-reads the environment mid-session.
+    sessions_root: PathBuf,
+    /// flock on `<dir>/.lock`, held for the session's lifetime. The kernel
+    /// releases it on process death (crash, signal) without running any
+    /// code — that is the ownership marker the startup sweep tests. Closing
+    /// (dropping) the fd releases it on graceful paths.
+    lock: std::fs::File,
     out_pdf: PathBuf,
     pages: Vec<Page>,
     next_id: PageId,
@@ -325,13 +334,24 @@ impl Session {
         job_tx: mpsc::UnboundedSender<JobDone>,
     ) -> Result<Self> {
         std::fs::create_dir_all(&cfg.output)?;
-        let out_pdf = pdf::unique_path(&cfg.output, pdf::stamp_now());
-        let dir = state_dir().join("sessions").join(pdf::stamp_now());
-        std::fs::create_dir_all(&dir)?;
+        let out_pdf = pdf::reserve_output_path(&cfg.output, pdf::stamp_now())?;
+        let sessions_root = state_dir().join("sessions");
+        let (dir, lock) = match create_session_dir(&sessions_root) {
+            Ok(v) => v,
+            Err(e) => {
+                // No Drop runs when construction fails: release the output
+                // reservation by hand or every failed launch leaks a
+                // zero-byte placeholder into the output dir.
+                pdf::release_reservation(&out_pdf);
+                return Err(e);
+            }
+        };
         Ok(Self {
             cfg,
             device,
             dir,
+            sessions_root,
+            lock,
             out_pdf,
             pages: Vec::new(),
             next_id: 1,
@@ -343,9 +363,36 @@ impl Session {
             event_tx,
             job_tx,
         })
+        .inspect(Self::record_reservation)
     }
 
     // ------------------------------------------------------------- helpers
+
+    /// Record the output reservation in the session dir. The marker makes
+    /// the reservation recoverable by the startup sweep under EVERY death
+    /// mode (crash/SIGKILL/OOM included): owner dead => zero-byte
+    /// placeholder released, non-empty file (the built PDF) kept. Written
+    /// at reservation time, not at quit time — a hard kill runs no code.
+    /// Removed with the dir on a successful finish / normal teardown.
+    fn record_reservation(&self) {
+        let path = self
+            .out_pdf
+            .canonicalize()
+            .unwrap_or_else(|_| self.out_pdf.clone());
+        if let Err(e) = std::fs::write(
+            self.dir.join(".pending_out"),
+            path.to_string_lossy().as_bytes(),
+        ) {
+            // Best effort by design, but a failed marker means a hard kill
+            // later will leak the zero-byte placeholder (the sweep has
+            // nothing to read): make that diagnosable.
+            tracing::warn!(
+                "could not record output reservation in {}: {e} \
+                 (a hard kill would leak the placeholder)",
+                self.dir.display()
+            );
+        }
+    }
 
     fn push(&self, ev: Event) {
         let _ = self.event_tx.try_send(ev);
@@ -394,13 +441,24 @@ impl Session {
         }
     }
 
+    /// True while quitting could still lose scan results: work in flight
+    /// or pages holding captured images. Mirrors the quit-confirm rule
+    /// (`App::needs_quit_confirm`): failed pages count as contentless
+    /// (quitting deletes their files along with the session dir, and the
+    /// dialog ignores them too), and a finished session holds only inert
+    /// stubs of a built PDF.
     pub fn dirty(&self) -> bool {
+        if self.finished {
+            return false;
+        }
         self.busy != Busy::Idle
             || !self.jobs.is_empty()
-            || self
-                .pages
-                .iter()
-                .any(|p| p.status != PageStatus::DeletePending)
+            || self.pages.iter().any(|p| {
+                matches!(
+                    p.status,
+                    PageStatus::Scanning | PageStatus::Processing | PageStatus::Ready
+                )
+            })
     }
 
     pub fn output_path(&self) -> &std::path::Path {
@@ -1280,9 +1338,53 @@ impl Session {
     }
 
     fn new_session(&mut self) {
-        for p in &self.pages {
-            remove_page_files(p);
+        // Acquire the new (dir, lock) and reserve the new output path FIRST,
+        // BEFORE touching the old session: on any I/O failure the old session
+        // stays fully intact (pages, dir, lock, reservation) and the error is
+        // surfaced in the status line instead of unwinding (a panic here would
+        // kill the actor task and leave the TUI running against a dead
+        // channel — and the old dir would be deleted by the unwinding Drop).
+        let (new_dir, new_lock) = match create_session_dir(&self.sessions_root) {
+            Ok(v) => v,
+            Err(e) => {
+                self.status(format!("new session failed: {e:#}"));
+                return;
+            }
+        };
+        let new_out = match pdf::reserve_output_path(&self.cfg.output, pdf::stamp_now()) {
+            Ok(v) => v,
+            Err(e) => {
+                // Roll the staged dir back: a created-but-unowned dir would
+                // linger as a live-looking lock holder otherwise.
+                let _ = std::fs::remove_dir_all(&new_dir);
+                drop(new_lock);
+                self.status(format!("new session failed: {e:#}"));
+                return;
+            }
+        };
+        // All fallible steps done: tear the old session down. The guard
+        // guarantees no scan job is writing into the old dir (NewSession
+        // requires Idle + no jobs).
+        // Release the OLD reservation first: the old dir carries its
+        // `.pending_out` marker, so a hard kill between a placeholder
+        // release and the dir removal must not find a live placeholder
+        // behind a marker — releasing first leaves marker + missing file
+        // (the sweep's release is a no-op there). A built PDF (non-empty)
+        // is never touched.
+        pdf::release_reservation(&self.out_pdf);
+        let old_dir = std::mem::replace(&mut self.dir, new_dir);
+        let old_lock = std::mem::replace(&mut self.lock, new_lock);
+        // Delete the old dir while holding its lock so a concurrent sweep
+        // cannot claim it; dropping the fd releases the (unlinked) lock.
+        // Same-stamp repeat (new session pressed within the second of a
+        // successful finish — `on_finish_done` already deleted the dir and
+        // the old lock fd refers to an unlinked inode): skip the removal,
+        // or it would delete the dir we JUST created. The general
+        // post-finish case is also covered: the stale dir is already gone.
+        if old_dir != self.dir {
+            let _ = std::fs::remove_dir_all(&old_dir);
         }
+        drop(old_lock);
         self.pages.clear();
         // Guard requires an empty jobs map; drain-and-cancel is defense in
         // depth (kills any straggler instead of orphaning its token).
@@ -1292,9 +1394,9 @@ impl Session {
         self.busy = Busy::Idle;
         self.busy_since = None;
         self.finished = false;
-        self.out_pdf = pdf::unique_path(&self.cfg.output, pdf::stamp_now());
-        self.dir = state_dir().join("sessions").join(pdf::stamp_now());
-        let _ = std::fs::create_dir_all(&self.dir);
+        self.out_pdf = new_out;
+        // Re-record the marker for the new reservation in the new dir.
+        self.record_reservation();
         self.notify_pages();
         self.status("new session started");
     }
@@ -1326,6 +1428,156 @@ fn state_dir() -> PathBuf {
         .join(crate::config::PROGRAM)
 }
 
+/// Create a session dir under `root` and flock it. The lock file is the
+/// ownership marker: it stays flocked (LOCK_EX|LOCK_NB) while this process
+/// lives, so the startup sweep of another instance sees the dir as taken —
+/// even when this instance is suspended (suspended time never made a dir
+/// look stale; mtime used to). On process death the kernel releases the
+/// flock, so crash/signal leftovers are sweepable immediately, with no age
+/// threshold anywhere.
+///
+/// `stamp_now()` has 1-second resolution, so candidates are claimed via
+/// create_dir, not adopted: EEXIST means the name has a prior occupant —
+/// a live same-second instance (whose held lock would surface as
+/// WouldBlock one call later anyway) or one that launched and died. A
+/// dead owner's dir must never be adopted: this instance's
+/// `record_reservation` would overwrite its `.pending_out` marker,
+/// orphaning the zero-byte placeholder that marker is the only cleanup
+/// path for, and its stray page images would ride along. Ladder past
+/// taken names with `_2`, `_3`... suffixes (mirroring the output-path
+/// ladder) and leave the corpse for the next startup sweep.
+pub fn create_session_dir(root: &std::path::Path) -> Result<(PathBuf, std::fs::File)> {
+    std::fs::create_dir_all(root)?;
+    let base = pdf::stamp_now();
+    let mut candidate = base.clone();
+    let mut n = 2;
+    loop {
+        let dir = root.join(&candidate);
+        match std::fs::create_dir(&dir).and_then(|()| lock_dir(&dir)) {
+            Ok(lock) => return Ok((dir, lock)),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AlreadyExists
+                    || err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        // Taken (EEXIST: prior occupant, live or dead), contested (WouldBlock:
+        // a concurrent sweep holds the fresh dir's lock just before deleting
+        // it), or vanished mid-flight (ENOENT: sweep removed it between our
+        // create and lock open). All mean: try the next suffix.
+        candidate = format!("{base}_{n}");
+        n += 1;
+    }
+}
+
+/// Open (or create) `<dir>/.lock` and take an exclusive non-blocking flock.
+/// An existing lock held by another process surfaces as `WouldBlock`.
+fn lock_dir(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let lock_path = dir.join(".lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Cancel any in-flight scan/per-page jobs (their tokens; the tasks
+        // themselves die with the runtime). The Finish job has no token: a
+        // build in flight is STILL READING the session dir, so deleting it
+        // here would turn a quit into hard page loss. Leave the dir; the
+        // flock is freed at process death and the next launch's sweep
+        // removes it (or the build wins the teardown race and writes the
+        // PDF after all).
+        if self.busy == Busy::Finishing {
+            // The reservation must also survive for now: ocrmypdf may be
+            // mid-write into the placeholder, so releasing it here could
+            // delete a real PDF. The .pending_out marker (written at
+            // reservation time) already covers this; leave the dir for the
+            // next startup's sweep, which releases the placeholder once the
+            // dir's lock is freed (see sweep_stale_sessions).
+            tracing::info!("quit during PDF build; session dir left for the next sweep");
+            return;
+        }
+        for (_, token) in self.jobs.drain() {
+            token.cancel();
+        }
+        if let Some(t) = self.scan_token.take() {
+            t.cancel();
+        }
+        // Idle/Scanning path. Under Scanning a capture may still be writing
+        // into the dir being removed: harmless at process exit (open writes
+        // continue on the unlinked inode; reopened writes fail into the
+        // job's error path, which a dead channel discards). Deleting under
+        // the held lock keeps a concurrent sweep out; the fd drops right
+        // after. A successful finish already removed the dir (ENOENT
+        // ignored).
+        // Release the reservation BEFORE deleting the dir: the dir holds the
+        // `.pending_out` marker, so a hard kill between the two statements
+        // would otherwise orphan a zero-byte placeholder with no marker for
+        // the sweep. The other order leaks nothing — a crash here leaves
+        // dir+marker intact around an already-released placeholder (the
+        // sweep's release is a no-op on the missing file).
+        pdf::release_reservation(&self.out_pdf);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Sweep session dirs left behind by crashes/signals at startup. For each
+/// directory under `root`, test its `.lock` with a non-blocking flock:
+/// acquired => the owning process is dead => delete the dir; EWOULDBLOCK =>
+/// a live instance (this one or another) still holds it => keep; the lock
+/// file missing => legacy (pre-flock) leftover => delete. Files directly in
+/// the root are left alone. Best effort: I/O errors are logged and skipped.
+fn sweep_stale_sessions(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // Bind the acquired lock BEFORE deleting: the guard must stay held
+        // through remove_dir_all, or a simultaneously-sweeping second
+        // instance could flock the same dir and race us. Only two outcomes
+        // authorize deletion: the flock succeeded (either the dead owner's
+        // freed lock, or a `.lock` marker we just created for a legacy
+        // lockless dir — both prove no live owner), or a live instance
+        // holds it (skip). Any other lock error (EACCES, EISDIR, EMFILE,
+        // ...) is NOT proof of a dead owner — skip rather than risk
+        // sweeping a live instance's dir.
+        let guard = match lock_dir(&path) {
+            // Live instance holds the lock.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            // Unreadable/invalid lock file: cannot prove a dead owner.
+            Err(_) => continue,
+            // Dead owner (free pre-existing lock) or legacy dir (we just
+            // created the marker): both sweepable, and the guard blocks a
+            // racing second sweeper meanwhile.
+            Ok(file) => file,
+        };
+        // A quit during a PDF build defers its output reservation here
+        // (see Drop): release the zero-byte placeholder now that the owner
+        // is confirmed dead. Missing file / non-empty file => no-op.
+        if let Ok(pending) = std::fs::read_to_string(path.join(".pending_out")) {
+            pdf::release_reservation(std::path::Path::new(pending.trim()));
+            let _ = std::fs::remove_file(path.join(".pending_out"));
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => tracing::info!("swept dead-owner session dir {}", path.display()),
+            Err(e) => tracing::warn!("could not sweep {}: {e}", path.display()),
+        }
+        drop(guard);
+    }
+}
+
 /// Run the session actor loop: commands + job completions.
 async fn actor_loop(
     mut session: Session,
@@ -1352,6 +1604,12 @@ async fn actor_loop(
 
 /// Spawn the actor with its channels; returns (cmd sender, event receiver).
 pub fn spawn(cfg: Config, device: String) -> Result<(mpsc::Sender<Cmd>, mpsc::Receiver<Event>)> {
+    // Startup sweep: crash/signal leftovers and legacy pre-flock dirs.
+    // Quit deletes its own dir (except during a build), so anything with a
+    // dead owner here is crash debris. Live instances' locks block the
+    // sweep, so a second launch can no longer delete a running one's
+    // session files.
+    sweep_stale_sessions(&state_dir().join("sessions"));
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(64);
     let (event_tx, event_rx) = mpsc::channel::<Event>(256);
     let (job_tx, job_rx) = mpsc::unbounded_channel::<JobDone>();
@@ -1364,16 +1622,18 @@ pub fn spawn(cfg: Config, device: String) -> Result<(mpsc::Sender<Cmd>, mpsc::Re
 mod tests {
     use super::*;
 
+    /// Serializes every XDG_STATE_HOME set -> build -> restore sequence.
+    /// Cargo runs #[tokio::test]s on parallel threads and env is
+    /// process-global, so unguarded tests would race (same-second stamps
+    /// would even share one directory).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Build a Session wired to throwaway channels. XDG_STATE_HOME is
     /// pointed at a per-test tempdir before `with_channels` so sessions
     /// never collide in (or pollute) the real `~/.local/state` —
     /// `stamp_now()` has 1-second resolution, so same-second tests would
     /// otherwise share one directory.
     fn test_session(preview_ocr: PreviewOcr) -> (Session, tempfile::TempDir) {
-        // Cargo runs #[tokio::test]s on parallel threads; env is
-        // process-global, so the set -> build -> restore sequence is
-        // serialized (the built session's paths are already fixed).
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("XDG_STATE_HOME");
@@ -1743,6 +2003,7 @@ mod tests {
         );
         assert!(s.jobs.is_empty());
         assert!(s.meta().finished, "flag surfaces in the TUI meta");
+        assert!(!s.meta().dirty, "finished session is not dirty");
         assert!(
             s.guard(&Cmd::ScanNext {
                 dpi: 300,
@@ -1770,6 +2031,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_session_after_finish_keeps_recreated_dir() {
+        // Regression: a new session within the same second as a successful
+        // finish reproduces the SAME dir name (1s stamp resolution; the old
+        // lock fd refers to an unlinked inode, so no WouldBlock). Teardown
+        // must not delete the dir it just created — otherwise .pending_out
+        // is silently lost (leaking the placeholder on a later hard kill)
+        // and every subsequent scan fails until restart. If a second
+        // boundary falls between the finish and the new session the stamp
+        // differs and a fresh dir is created instead — equally correct, so
+        // only the weaker invariants (live dir + lock + marker) are asserted.
+        let (mut s, _guard) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        // Finish + new session within the same wall-clock second.
+        s.handle_job_done(JobDone::Finish {
+            result: Ok(pdf::BuildOutcome::Searchable),
+        })
+        .await;
+        s.new_session();
+        assert!(
+            s.dir.exists(),
+            "teardown must not delete the recreated dir (same stamp)"
+        );
+        assert!(s.dir.join(".lock").exists(), "new dir carries a lock");
+        assert!(
+            s.dir.join(".pending_out").exists(),
+            "reservation marker recorded in the live dir"
+        );
+        // Scanning into the session works again (new session cleared the
+        // stubs; ids never reuse, so this new page gets id 2).
+        s.start_scan(300, "gray".into(), None);
+        let img2 = s.dir.join("page_002.png");
+        std::fs::write(&img2, b"x").unwrap();
+        s.handle_job_done(scan_ok(2, img2)).await;
+        assert_eq!(s.pages[0].status, PageStatus::Ready);
+        let final_dir = s.dir.clone();
+        drop(s);
+        assert!(!final_dir.exists(), "Drop cleans the live dir");
+    }
+
+    #[tokio::test]
     async fn failed_finish_keeps_lazy_requests_alive() {
         // A failed build does not delete the session dir, so preview OCR
         // must keep working afterwards.
@@ -1785,6 +2089,50 @@ mod tests {
         assert!(!s.finished, "failed build does not set the flag");
         s.request_text(1);
         assert!(s.pages[0].text_pending, "lazy OCR still works");
+        // A failed build must keep the dirty flag on: the pages still hold
+        // real images and no PDF was produced.
+        assert!(s.meta().dirty);
+    }
+
+    #[tokio::test]
+    async fn dirty_tracks_finishability_and_failed_pages() {
+        // The dirty flag mirrors the quit-confirm rule: Ready/Scanning/
+        // Processing pages count (a PDF could still be built from them),
+        // Failed pages do not (the dialog ignores them too), and a finished
+        // session is clean no matter what the stubs look like.
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+
+        // Fresh session: clean.
+        assert!(!s.dirty(), "empty session is clean");
+
+        // Scanning page: dirty.
+        s.start_scan(300, "gray".into(), None);
+        assert!(s.dirty(), "scan in flight is dirty");
+
+        // Ready page with a captured image: still dirty.
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+        assert!(s.dirty(), "captured (un-built) page is dirty");
+
+        // All pages failed: quitting loses nothing the dialog cares about.
+        if let Some(p) = s.pages.iter_mut().find(|p| p.id == 1) {
+            p.status = PageStatus::Failed;
+            p.error = Some("boom".into());
+        }
+        assert!(!s.dirty(), "all-failed session counts as clean");
+
+        // Successful finish makes the session clean despite the stubs.
+        if let Some(p) = s.pages.iter_mut().find(|p| p.id == 1) {
+            p.status = PageStatus::Ready;
+            p.error = None;
+        }
+        s.handle_job_done(JobDone::Finish {
+            result: Ok(pdf::BuildOutcome::Searchable),
+        })
+        .await;
+        assert!(s.finished);
+        assert!(!s.dirty(), "finished session is clean despite stubs");
     }
 
     #[tokio::test]
@@ -1860,5 +2208,384 @@ mod tests {
         );
         s.request_text(1);
         assert!(s.pages[0].text_pending);
+    }
+
+    #[test]
+    fn sweep_keeps_live_locks_and_deletes_dead_or_legacy_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let dead = sessions.join("2026-01-01_000000");
+        let legacy = sessions.join("2026-01-02_000000");
+        let live = sessions.join("2026-01-03_000000");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(dead.join("page_001.png"), b"x").unwrap();
+        std::fs::write(live.join("page_001.png"), b"x").unwrap();
+
+        // `dead` gets a lock file that nobody holds (crash leftover: the
+        // kernel released the flock when the owner died).
+        lock_dir(&dead).unwrap();
+        // `legacy` has no lock file at all (pre-flock leftover).
+        // `live` is flocked by THIS process — the same condition another
+        // live instance's session presents to the sweep.
+        let live_lock = lock_dir(&live).unwrap();
+
+        sweep_stale_sessions(&sessions);
+
+        assert!(!dead.exists(), "dead-owner dir removed");
+        assert!(!legacy.exists(), "legacy (lockless) dir removed");
+        assert!(live.exists(), "live (held-lock) dir kept");
+
+        // The live dir is sweepable once its owner dies (lock released).
+        drop(live_lock);
+        sweep_stale_sessions(&sessions);
+        assert!(!live.exists(), "dir sweepable after lock release");
+    }
+
+    #[test]
+    fn sweep_deletes_fresh_lockless_dir_created_then_abandoned() {
+        // A dir created but never locked (crash between create and flock —
+        // or legacy) is deleted regardless of age: no time threshold.
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let d = sessions.join("2099-01-01_000000");
+        std::fs::create_dir_all(d.join("nested")).unwrap();
+
+        sweep_stale_sessions(&sessions);
+
+        assert!(!d.exists(), "lockless dir removed without age check");
+    }
+
+    #[test]
+    fn sweep_leaves_root_files_and_missing_root_alone() {
+        // Stray files in the sessions root don't belong to sessions; a
+        // missing root (first launch) must not panic.
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let stray = sessions.join("stray.png");
+        std::fs::write(&stray, b"x").unwrap();
+
+        sweep_stale_sessions(&sessions);
+        assert!(stray.exists(), "root-level files untouched");
+        assert!(sessions.exists(), "sessions root itself survives");
+
+        sweep_stale_sessions(&root.path().join("nope"));
+    }
+
+    #[tokio::test]
+    async fn drop_deletes_session_dir_and_lock_with_pages() {
+        let (mut s, _guard) = test_session(PreviewOcr::Lazy);
+        let dir = s.dir.clone();
+        let out_pdf = s.out_pdf.clone();
+        s.start_scan(300, "gray".into(), None);
+        let img = dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        assert!(dir.exists());
+        assert!(out_pdf.exists(), "output placeholder reserved");
+
+        drop(s);
+
+        assert!(!dir.exists(), "quit deletes the session dir");
+        assert!(!out_pdf.exists(), "dangling reservation released");
+    }
+
+    #[tokio::test]
+    async fn drop_after_finish_ignores_missing_dir() {
+        // on_finish_done already removed the dir; Drop must not error on
+        // the ENOENT and must not touch the built PDF.
+        let (mut s, _guard) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+        s.handle_job_done(JobDone::Finish {
+            result: Ok(pdf::BuildOutcome::Searchable),
+        })
+        .await;
+        let out_pdf = s.out_pdf.clone();
+        std::fs::write(&out_pdf, b"pdf bytes").unwrap();
+        assert!(!s.dir.exists());
+        let dir = s.dir.clone();
+
+        drop(s);
+
+        assert!(!dir.exists(), "still gone (no resurrection)");
+        assert!(out_pdf.exists(), "built PDF never released");
+    }
+
+    #[tokio::test]
+    async fn drop_during_finish_leaves_dir_for_next_sweep() {
+        // Quit while a build runs: the dir must survive (ocrmypdf is still
+        // reading it); the freed lock makes it sweepable on next launch.
+        // The reservation marker (written at reservation time) lets the
+        // sweep release the placeholder.
+        let (mut s, _guard) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        s.busy = Busy::Finishing; // simulate the in-flight build window
+        let dir = s.dir.clone();
+        let out_pdf = s.out_pdf.clone();
+
+        drop(s);
+
+        assert!(dir.exists(), "build in flight: dir left intact");
+        assert!(
+            dir.join(".pending_out").exists(),
+            "reservation marker present for the sweep"
+        );
+        assert!(out_pdf.exists(), "placeholder not released by Drop");
+        // Owner dead => the next launch sweeps it and releases the placeholder.
+        sweep_stale_sessions(dir.parent().unwrap());
+        assert!(!dir.exists(), "freed-lock dir swept on next launch");
+        assert!(!out_pdf.exists(), "sweep releases the deferred placeholder");
+    }
+
+    #[tokio::test]
+    async fn hard_kill_placeholder_recovered_by_sweep() {
+        // A hard kill (SIGKILL/OOM) runs no Drop code at all, but the
+        // kernel still closes every fd — the lock is freed while the
+        // session dir survives with its marker. Regression for the leak
+        // the marker at reservation time closes: the sweep must release
+        // the placeholder the dead session left behind.
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let d = sessions.join("2026-01-05_000000");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("page_001.png"), b"x").unwrap();
+        std::fs::write(
+            d.join(".pending_out"),
+            d.parent()
+                .unwrap()
+                .join("placeholder.pdf")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+        let out_pdf = d.parent().unwrap().join("placeholder.pdf");
+        std::fs::write(&out_pdf, b"").unwrap(); // zero-byte placeholder
+                                                // Dead owner: a .lock file whose flock nobody holds (the kernel
+                                                // released it when the process died).
+        lock_dir(&d).unwrap();
+
+        sweep_stale_sessions(&sessions);
+        assert!(!d.exists(), "dead-owner dir swept");
+        assert!(
+            !out_pdf.exists(),
+            "marker lets the sweep release the leaked placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_kill_built_pdf_kept_by_sweep() {
+        // Same death mode, but the build completed first: the sweep must
+        // keep the non-empty PDF.
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let d = sessions.join("2026-01-06_000000");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join(".pending_out"),
+            d.parent()
+                .unwrap()
+                .join("built.pdf")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+        let out_pdf = d.parent().unwrap().join("built.pdf");
+        std::fs::write(&out_pdf, b"pdf bytes").unwrap();
+        lock_dir(&d).unwrap();
+
+        sweep_stale_sessions(&sessions);
+        assert!(!d.exists(), "dead-owner dir swept");
+        assert!(out_pdf.exists(), "built PDF kept");
+    }
+
+    #[tokio::test]
+    async fn drop_during_finish_keeps_built_pdf_from_sweep_release() {
+        // If the build actually finished between Drop and the sweep, the
+        // placeholder is a real PDF: the sweep must leave it alone.
+        let (mut s, _guard) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        s.busy = Busy::Finishing;
+        let dir = s.dir.clone();
+        let out_pdf = s.out_pdf.clone();
+
+        drop(s);
+
+        // The build won the race: the placeholder now holds real content.
+        std::fs::write(&out_pdf, b"pdf bytes").unwrap();
+        sweep_stale_sessions(dir.parent().unwrap());
+        assert!(
+            out_pdf.exists(),
+            "sweep release never deletes a non-empty PDF"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_io_failure_keeps_old_session_intact() {
+        // Regression: a failing output reservation used to panic AFTER the
+        // old dir (and its pages) were already destroyed. It must instead
+        // report the error and keep everything.
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        let old_dir = s.dir.clone();
+        let old_out = s.out_pdf.clone();
+
+        // Sabotage the output dir: a file where the directory should be
+        // makes create_new fail with NotADirectory. This also removes the
+        // old placeholder (it lives inside), which is fine: the invariant
+        // under test is that the session's state is untouched.
+        std::fs::remove_dir_all(&s.cfg.output).unwrap();
+        std::fs::write(&s.cfg.output, b"not a dir").unwrap();
+
+        s.new_session();
+
+        assert_eq!(s.dir, old_dir, "session dir unchanged on failure");
+        assert_eq!(s.out_pdf, old_out, "reservation path unchanged");
+        assert_eq!(s.pages.len(), 1, "pages intact");
+        assert!(old_dir.exists(), "old session dir survives");
+        assert_eq!(s.pages[0].status, PageStatus::Ready);
+        drop(s);
+        // Drop still cleans the old dir on quit.
+        assert!(!old_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn new_session_session_dir_failure_keeps_old_session_intact() {
+        // Same guarantee when the sessions root becomes unwritable. The old
+        // dir lives INSIDE the sessions root, so sabotaging the root also
+        // removes the old dir — the invariant under test is that the
+        // session's in-memory state (pages, dir path, reservation) stays
+        // untouched and no new dir was created.
+        let (mut s, dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        let old_dir = s.dir.clone();
+        let old_out = s.out_pdf.clone();
+
+        // Sabotage the sessions root: a file where the directory should be
+        // makes create_dir_all fail.
+        std::fs::remove_dir_all(&s.sessions_root).unwrap();
+        std::fs::write(&s.sessions_root, b"not a dir").unwrap();
+
+        s.new_session();
+
+        assert_eq!(s.dir, old_dir, "session dir path unchanged on failure");
+        assert_eq!(s.out_pdf, old_out, "reservation unchanged on failure");
+        assert_eq!(s.pages.len(), 1, "pages intact");
+        assert_eq!(s.pages[0].status, PageStatus::Ready);
+        assert!(!s.finished, "finished flag untouched");
+        drop(s);
+        // Drop cleans up against the (now missing) dir: ENOENT is ignored.
+        // The tempdir guard (dir) must outlive the session on purpose.
+        drop(dir);
+    }
+
+    #[test]
+    fn sweep_skips_dirs_with_unopenable_lock_files() {
+        // An unopenable .lock is NOT proof of a dead owner (could be a live
+        // instance behind restrictive perms): the sweep must skip, not
+        // delete. A DIRECTORY named .lock makes open(2) fail with EISDIR
+        // (works under root too, where mode 000 wouldn't). The dir stays
+        // writable so deletion WOULD succeed if the sweep tried.
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let d = sessions.join("2026-01-04_000000");
+        std::fs::create_dir_all(d.join(".lock")).unwrap();
+        std::fs::write(d.join("page_001.png"), b"x").unwrap();
+
+        sweep_stale_sessions(&sessions);
+
+        assert!(d.exists(), "EISDIR on the lock file: dir kept");
+        assert!(d.join("page_001.png").exists());
+    }
+
+    #[tokio::test]
+    async fn new_session_removes_old_dir_and_holds_new_lock() {
+        let (mut s, _guard) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        let old_dir = s.dir.clone();
+
+        s.new_session();
+
+        assert!(!old_dir.exists(), "old session dir deleted");
+        assert!(s.dir.exists() && s.dir != old_dir);
+        assert!(s.dir.join(".lock").exists(), "new dir carries a lock");
+        // The new lock is held: another sweep must leave the new dir alone.
+        sweep_stale_sessions(s.dir.parent().unwrap());
+        assert!(s.dir.exists(), "held lock protects the new dir");
+        // Dropping the session cleans the new dir too.
+        let new_dir = s.dir.clone();
+        drop(s);
+        assert!(!new_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn create_session_dir_ladders_past_taken_names() {
+        // Same-second second instance: the first stamp candidate already
+        // exists (its claim via create_dir hits EEXIST), so creation must
+        // fall through to _2.
+        let root = tempfile::tempdir().unwrap();
+        let (d1, lock1) = create_session_dir(root.path()).expect("first dir");
+        let (d2, lock2) = create_session_dir(root.path()).expect("second dir");
+        assert_ne!(d1, d2, "existing dir forces a distinct dir");
+        assert!(
+            d2.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_2")),
+            "suffix ladder engaged"
+        );
+        assert!(d1.exists() && d2.exists(), "both live dirs survive");
+        assert!(d1.join(".lock").exists() && d2.join(".lock").exists());
+        drop(lock2);
+        drop(lock1);
+    }
+
+    #[tokio::test]
+    async fn create_session_dir_never_adopts_dead_owners_dir() {
+        // Same-second instance that launched and died: its dir still holds a
+        // `.pending_out` marker (releasing the placeholder it points at is
+        // the startup sweep's job). Adopting the dir would overwrite that
+        // marker and orphan the zero-byte placeholder, so creation must
+        // ladder past it to _2.
+        let root = tempfile::tempdir().unwrap();
+        let corpse = root.path().join(pdf::stamp_now());
+        std::fs::create_dir_all(&corpse).unwrap();
+        std::fs::write(corpse.join(".pending_out"), "/out/2026-01-01_000000.pdf").unwrap();
+        std::fs::write(corpse.join("page_001.png"), b"x").unwrap();
+
+        let (d, _lock) = create_session_dir(root.path()).expect("fresh dir");
+        assert_ne!(d, corpse, "dead owner's dir must not be adopted");
+        assert!(
+            d.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_2")),
+            "suffix ladder engaged past the corpse"
+        );
+        assert!(
+            corpse.join(".pending_out").exists(),
+            "corpse left for the sweep"
+        );
+        assert!(
+            corpse.join("page_001.png").exists(),
+            "corpse contents untouched"
+        );
     }
 }

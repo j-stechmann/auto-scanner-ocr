@@ -279,20 +279,31 @@ pub async fn build_pdf(plan: &BuildPlan) -> Result<BuildOutcome> {
     if crate::backend::which("unpaper").is_some() && plan.any_page_needing_cleanup {
         ocr_args.push("--clean".into());
     }
+    // Final delivery is atomic: ocrmypdf and the fallback copy write to a
+    // `.part` sibling that is renamed into place only on success. A build
+    // killed mid-write therefore leaves the zero-byte reservation untouched
+    // (plus a garbage `.part` that release/sweep discard) instead of a
+    // truncated file the sweep would mistake for a finished PDF.
+    let mut part_os = plan.out_pdf.as_os_str().to_os_string();
+    part_os.push(".part");
+    let part = PathBuf::from(part_os);
+
     ocr_args.push(raw_pdf.to_string_lossy().into_owned());
-    ocr_args.push(plan.out_pdf.to_string_lossy().into_owned());
+    ocr_args.push(part.to_string_lossy().into_owned());
 
     let refs: Vec<&str> = ocr_args.iter().map(String::as_str).collect();
     let out = process::run(&refs, Some(OCRYPDF_TIMEOUT))
         .await
         .map_err(|e| process::fail_with_log_err("OCR (ocrmypdf)", &refs, e))?;
     if out.success {
+        tokio::fs::rename(&part, &plan.out_pdf).await?;
         return Ok(BuildOutcome::Searchable);
     }
 
     // Non-fatal fallback (parity): save the raw PDF without a text layer.
     tracing::error!("ocrmypdf failed; saving PDF without text layer");
-    tokio::fs::copy(&raw_pdf, &plan.out_pdf).await?;
+    tokio::fs::copy(&raw_pdf, &part).await?;
+    tokio::fs::rename(&part, &plan.out_pdf).await?;
     Ok(BuildOutcome::WithoutTextLayer)
 }
 
@@ -309,21 +320,49 @@ async fn run_pdf_step(what: &str, args: &[String], timeout: Duration) -> Result<
 }
 
 /// Timestamped unique output path: `YYYY-MM-DD_HHMMSS.pdf` with `_2`, `_3`...
-/// suffix on collision (parity with unique_path; resolved once at session
-/// creation).
-pub fn unique_path(dir: &Path, stamp: String) -> PathBuf {
-    let base = dir.join(format!("{stamp}.pdf"));
-    if !base.exists() {
-        return base;
-    }
+/// suffix on collision. The chosen path is RESERVED by creating the file
+/// (O_EXCL) — unlike an exists()-check, a reservation cannot be won twice by
+/// concurrent instances, so two same-stamp launches can never silently pick
+/// the same output and overwrite each other's PDF.
+///
+/// Callers delete the zero-byte placeholder via `release_reservation` when
+/// the session never builds (quit, new session). On a hard open error
+/// (unwritable output dir etc.) nothing is created and the error propagates,
+/// so a failed start cannot leave junk behind.
+pub fn reserve_output_path(dir: &Path, stamp: String) -> Result<PathBuf> {
+    let mut base = dir.join(format!("{stamp}.pdf"));
     let mut n = 2;
     loop {
-        let cand = dir.join(format!("{stamp}_{n}.pdf"));
-        if !cand.exists() {
-            return cand;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&base)
+        {
+            Ok(_) => return Ok(base),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                base = dir.join(format!("{stamp}_{n}.pdf"));
+                n += 1;
+            }
+            Err(e) => return Err(e.into()),
         }
-        n += 1;
     }
+}
+
+/// Remove a reservation made by `reserve_output_path`. Only deletes the
+/// zero-byte placeholder, so a real PDF (written by a finished build) is
+/// never touched. Also discards a leftover `<path>.part` (an interrupted
+/// build's partial output): a non-empty placeholder can only mean a race
+/// between a live build and the release, in which case the `.part` garbage
+/// is dead weight anyway. Best effort.
+pub fn release_reservation(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_file() && meta.len() == 0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    let mut part_os = path.as_os_str().to_os_string();
+    part_os.push(".part");
+    let _ = std::fs::remove_file(PathBuf::from(part_os));
 }
 
 /// Local timestamp string `YYYY-MM-DD_HHMMSS` (parity with Python format).
@@ -351,18 +390,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unique_path_collisions() {
+    fn reserve_output_path_collisions_and_release() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let stamp = "2026-09-02_143005".to_string();
-        let p1 = unique_path(d, stamp.clone());
+        let p1 = reserve_output_path(d, stamp.clone()).unwrap();
         assert_eq!(p1, d.join("2026-09-02_143005.pdf"));
-        std::fs::write(&p1, b"x").unwrap();
-        let p2 = unique_path(d, stamp.clone());
+        assert!(p1.exists(), "reservation creates the placeholder");
+        // Second reserve for the same stamp must not reuse the live path.
+        let p2 = reserve_output_path(d, stamp.clone()).unwrap();
         assert_eq!(p2, d.join("2026-09-02_143005_2.pdf"));
-        std::fs::write(&p2, b"x").unwrap();
-        let p3 = unique_path(d, stamp);
+        let p3 = reserve_output_path(d, stamp.clone()).unwrap();
         assert_eq!(p3, d.join("2026-09-02_143005_3.pdf"));
+        // Release only deletes empty placeholders; a written PDF survives.
+        // A leftover `.part` from an interrupted build is discarded either
+        // way.
+        let p3_part = d.join("2026-09-02_143005_3.pdf.part");
+        std::fs::write(&p3_part, b"half written").unwrap();
+        release_reservation(&p2);
+        assert!(!p2.exists());
+        release_reservation(&p1);
+        assert!(!p1.exists());
+        std::fs::write(&p3, b"pdf bytes").unwrap();
+        release_reservation(&p3);
+        assert!(p3.exists(), "built PDF is never released");
+        assert!(!p3_part.exists(), "partial output discarded");
+        // Zero-byte placeholder: both the placeholder and its .part go.
+        // (p2 was released above, so the same-stamp ladder reuses `_2`.)
+        let p4 = reserve_output_path(d, stamp).unwrap();
+        let p4_part = p4.with_extension("pdf.part");
+        std::fs::write(&p4_part, b"garbage").unwrap();
+        release_reservation(&p4);
+        assert!(!p4.exists());
+        assert!(!p4_part.exists());
     }
 
     #[test]

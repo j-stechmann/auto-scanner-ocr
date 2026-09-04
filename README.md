@@ -236,9 +236,15 @@ isolated child process.
   add `-v` to see them in the terminal.
 - Scanner not found? Check USB, power, and `scanimage -L`. For HP devices run
   `sudo hp-setup -i` once.
-- Scans left over from a crashed session live under
-  `~/.local/state/auto-scanner-ocr/sessions/` and are safe to delete when no
-  scan is running.
+- Quitting with un-built pages deletes them (the confirm dialog means it),
+  unless a PDF build was in flight — its session dir is then swept on the
+  next startup. Crash or signal leftovers under
+  `~/.local/state/auto-scanner-ocr/sessions/` are swept automatically on
+  startup too: each session dir carries a lock file whose flock the kernel
+  releases when the process dies, so dead owners are deleted immediately
+  while a live instance's dir is never touched (even when suspended). This
+  applies to instances of the same version; a session of the older
+  (pre-lock) binary still running during an upgrade is not protected.
 
 ## The result
 
