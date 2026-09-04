@@ -274,7 +274,8 @@ layer) and the TUI tells you so.
 
 ## License
 
-GPL-2.0-or-later — see [LICENSE](LICENSE).
+GPL-2.0-or-later — see [LICENSE](LICENSE). Changes are tracked in
+[CHANGELOG.md](CHANGELOG.md).
 
 [OCRmyPDF]: https://github.com/ocrmypdf/OCRmyPDF
 [Tesseract]: https://github.com/tesseract-ocr/tesseract
