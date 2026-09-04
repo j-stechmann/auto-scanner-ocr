@@ -82,9 +82,13 @@ dpkg-deb --build --root-owner-group "$DEBROOT" \
 # so cross-arch rpmbuild is impossible by design. For foreign targets we
 # run rpmbuild natively inside a QEMU-emulated Fedora container of that
 # arch (docker + binfmt on the runner); x86_64 stays on the host.
-BIN_ABS=$(readlink -f "$BIN")
-SPEC=$STAGE.spec
-cat > "$SPEC" <<EOF
+# The spec never references the host path: the binary is pre-staged inside
+# the rpmbuild tree and %install copies it from there.
+RPMDIR=$PWD/rpmbuild
+STAGED_BIN=rpmtop-staged/usr/bin/$PKG
+mkdir -p "$RPMDIR/$STAGED_BIN"
+install -m 0755 "$BIN" "$RPMDIR/$STAGED_BIN"
+cat > "$STAGE.spec" <<EOF
 Name:           $PKG
 Version:        $VERSION
 Release:        1%{?dist}
@@ -99,31 +103,32 @@ Flatbed scan -> searchable OCR PDF, via SANE + ocrmypdf. Linux-only TUI.
 Config is read from ./config.toml (CWD) or ~/.config/auto-scanner-ocr/config.toml.
 
 %install
-install -Dm 0755 $BIN_ABS %{buildroot}/usr/bin/$PKG
+install -Dm 0755 %{_stagedbin} %{buildroot}/usr/bin/$PKG
 
 %files
 /usr/bin/$PKG
 EOF
-
-RPMDIR=$PWD/rpmbuild
 if [ "$RPM_ARCH" = "x86_64" ]; then
-    rpmbuild -bb --define "_topdir $RPMDIR" \
+    rpmbuild -bb \
+        --define "_topdir $RPMDIR" \
+        --define "_stagedbin $RPMDIR/$STAGED_BIN" \
         --define "debug_package %{nil}" \
         --define "__os_install_post %{nil}" \
         --define "source_date_epoch_from_changelog %{nil}" \
-        "$SPEC"
+        "$PWD/$STAGE.spec"
 else
-    # The spec embeds an absolute $BIN_ABS; the container sees the whole repo.
     docker run --rm --platform "$RPM_MACHINE" \
-        -v "$PWD":/io -w /io fedora:41 bash -lc '
-        dnf install -y rpm-build >/dev/null &&
-        rpmbuild -bb --define "_topdir /io/rpmbuild" \
-            --define "debug_package %{nil}" \
-            --define "__os_install_post %{nil}" \
-            --define "source_date_epoch_from_changelog %{nil}" \
-            /io/'"$SPEC"
+        -v "$RPMDIR":/rpmtop \
+        fedora:41 bash -lc 'dnf install -y rpm-build >/dev/null && rpmbuild -bb \
+        --define "_topdir /rpmtop" \
+        --define "_stagedbin /rpmtop/'"$STAGED_BIN"'" \
+        --define "debug_package %{nil}" \
+        --define "__os_install_post %{nil}" \
+        --define "source_date_epoch_from_changelog %{nil}" \
+        /rpmtop/'"$STAGE.spec"
 fi
-mv "rpmbuild/RPMS/$RPM_ARCH/$PKG-$VERSION-1.$RPM_ARCH.rpm" \
+rm -rf "$RPMDIR/$STAGED_BIN"
+mv "rpmbuild"/RPMS/"$RPM_ARCH"/"$PKG-$VERSION"-1*.rpm \
     "$DIST/$PKG-$VERSION${SUFFIX:+-$SUFFIX}-$TRIPLE.rpm"
 
 # ----------------------------------------------------------------- report ---
