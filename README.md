@@ -33,7 +33,7 @@ No daemons, no web servers: you run it in a terminal when you want to scan.
 
 ## Requirements
 
-- Rust 1.88+ (to build; a prebuilt binary just needs the tools below)
+- Rust 1.90+ (to build; a prebuilt binary just needs the tools below)
 - Linux with SANE (`sane`), HPLIP for HP devices (`hplip`)
 - `ocrmypdf`, `tesseract` (+ language data), `img2pdf`
 - `poppler-utils` for `pdfunite` (only needed when one session mixes DPIs)
@@ -151,7 +151,7 @@ startup checks finished with failures or no scanner found.
 
 ### Configuration
 
-Defaults live in `config.toml` (keep it next to the binary, or at
+Defaults live in `config.toml` (keep it in the current working directory, or at
 `~/.config/auto-scanner-ocr/config.toml`); every value can be overridden on
 the command line. Same format as before:
 

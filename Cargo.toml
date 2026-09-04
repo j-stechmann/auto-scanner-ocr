@@ -2,7 +2,7 @@
 name = "auto-scanner-ocr"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "Flatbed scan -> searchable OCR PDF, in a terminal UI"
 license = "GPL-2.0-or-later"
 

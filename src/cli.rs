@@ -68,7 +68,7 @@ pub struct Cli {
     pub verbose: bool,
 
     /// Hidden: probe terminal image protocol (kitty/sixel) in isolation.
-    /// Prints "protocol=<type> font=<w>x<h>" and exits. Used by the TUI
+    /// Prints ``protocol=<type> font=<w>x<h>`` and exits. Used by the TUI
     /// because ratatui-image's in-process stdio query can leave an orphaned
     /// stdin reader that eats keystrokes when the terminal never answers.
     #[arg(long, hide = true)]

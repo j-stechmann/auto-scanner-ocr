@@ -1,0 +1,119 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            glibc: 2.31
+            deb-arch: amd64
+            rpm-arch: x86_64
+          - target: x86_64-unknown-linux-musl
+            deb-arch: amd64
+            rpm-arch: x86_64
+            suffix: musl
+          - target: aarch64-unknown-linux-gnu
+            glibc: 2.31
+            deb-arch: arm64
+            rpm-arch: aarch64
+          - target: aarch64-unknown-linux-musl
+            deb-arch: arm64
+            rpm-arch: aarch64
+            suffix: musl
+          - target: armv7-unknown-linux-gnueabihf
+            glibc: 2.31
+            deb-arch: armhf
+            rpm-arch: armv7hl
+          - target: riscv64gc-unknown-linux-gnu
+            glibc: 2.31
+            deb-arch: riscv64
+            rpm-arch: riscv64
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Guard - tag matches Cargo.toml version
+        # CARGO_PKG_VERSION is compiled into the binary (clap --version,
+        # --doctor); a tag over an unbumped Cargo.toml would ship binaries
+        # reporting the wrong version.
+        run: |
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          tag_version="${VERSION#v}"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag $VERSION but Cargo.toml says $cargo_version — bump the version first"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # pip wheel bundles the ziglang package; current cargo-zigbuild handles
+      # the armv7 target zig cc doesn't recognize natively.
+      - name: Install cargo-zigbuild
+        run: pip3 install cargo-zigbuild
+
+      - name: Build
+        run: |
+          triple="${{ matrix.target }}"
+          [ -n "${{ matrix.glibc }}" ] && triple="$triple.${{ matrix.glibc }}"
+          cargo zigbuild --release --locked --target "$triple"
+
+      - name: Package (tar.gz + deb + rpm)
+        run: |
+          sudo apt-get update && sudo apt-get install -y rpm
+          scripts/package-dist.sh \
+            target/${{ matrix.target }}/release \
+            ${{ matrix.target }} \
+            "${VERSION#v}" \
+            --deb-arch "${{ matrix.deb-arch }}" \
+            --rpm-arch "${{ matrix.rpm-arch }}" \
+            --suffix "${{ matrix.suffix }}"
+        env:
+          VERSION: ${{ github.ref_name }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -b $(ls | grep -v '^SHA256SUMS$' | sort) > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
