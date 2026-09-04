@@ -3,7 +3,8 @@
 //! the reserved output path only on success, so a build killed mid-write
 //! leaves the zero-byte reservation untouched instead of a truncated file
 //! the startup sweep would mistake for a finished PDF. Skips gracefully
-//! when `ocrmypdf`/`img2pdf` are not installed (CI / minimal systems).
+//! when `ocrmypdf`/`img2pdf`/tesseract language data are not installed
+//! (CI / minimal systems).
 
 use auto_scanner_ocr::backend::pdf::{build_pdf, release_reservation, BuildOutcome, BuildPlan};
 use std::path::PathBuf;
@@ -32,12 +33,33 @@ fn plan_for(dir: &std::path::Path, out_pdf: PathBuf) -> BuildPlan {
     }
 }
 
+/// ocrmypdf shells out to tesseract for the text layer; without the `eng`
+/// traineddata it fails and the build falls back, breaking the searchable-
+/// outcome assertion (a system can have the binary but no language data).
+fn tesseract_has_eng() -> bool {
+    auto_scanner_ocr::backend::which("tesseract").is_some_and(|tesseract| {
+        std::process::Command::new(tesseract)
+            .arg("--list-langs")
+            .output()
+            .is_ok_and(|out| {
+                // Old tesseract prints the language list to stderr, new
+                // ones to stdout — accept either.
+                [out.stdout, out.stderr].iter().any(|stream| {
+                    String::from_utf8_lossy(stream)
+                        .lines()
+                        .any(|l| l.trim() == "eng")
+                })
+            })
+    })
+}
+
 #[tokio::test]
 async fn successful_build_renames_part_into_reserved_path() {
     if auto_scanner_ocr::backend::which("ocrmypdf").is_none()
         || auto_scanner_ocr::backend::which("img2pdf").is_none()
+        || !tesseract_has_eng()
     {
-        eprintln!("skipping: ocrmypdf/img2pdf not installed");
+        eprintln!("skipping: ocrmypdf/img2pdf/tesseract(eng) not installed");
         return;
     }
     let dir = tempfile::tempdir().unwrap();

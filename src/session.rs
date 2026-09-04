@@ -1436,9 +1436,16 @@ fn state_dir() -> PathBuf {
 /// flock, so crash/signal leftovers are sweepable immediately, with no age
 /// threshold anywhere.
 ///
-/// `stamp_now()` has 1-second resolution: a same-second second instance
-/// (scripted or double-launch) hits the first candidate's held lock and
-/// retries with `_2`, `_3`... suffixes, mirroring the output-path ladder.
+/// `stamp_now()` has 1-second resolution, so candidates are claimed via
+/// create_dir, not adopted: EEXIST means the name has a prior occupant —
+/// a live same-second instance (whose held lock would surface as
+/// WouldBlock one call later anyway) or one that launched and died. A
+/// dead owner's dir must never be adopted: this instance's
+/// `record_reservation` would overwrite its `.pending_out` marker,
+/// orphaning the zero-byte placeholder that marker is the only cleanup
+/// path for, and its stray page images would ride along. Ladder past
+/// taken names with `_2`, `_3`... suffixes (mirroring the output-path
+/// ladder) and leave the corpse for the next startup sweep.
 pub fn create_session_dir(root: &std::path::Path) -> Result<(PathBuf, std::fs::File)> {
     std::fs::create_dir_all(root)?;
     let base = pdf::stamp_now();
@@ -1446,21 +1453,20 @@ pub fn create_session_dir(root: &std::path::Path) -> Result<(PathBuf, std::fs::F
     let mut n = 2;
     loop {
         let dir = root.join(&candidate);
-        match std::fs::create_dir_all(&dir).and_then(|()| lock_dir(&dir)) {
+        match std::fs::create_dir(&dir).and_then(|()| lock_dir(&dir)) {
             Ok(lock) => return Ok((dir, lock)),
-            // Lock held by a live instance: this dir name is taken, try the
-            // next suffix. ENOENT means a concurrent sweep deleted the dir
-            // between our create and flock (or removed the dir we just
-            // made) — also a taken/contested name, fresh attempt.
             Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::NotFound =>
-            {
-                candidate = format!("{base}_{n}");
-                n += 1;
-            }
+                if err.kind() == std::io::ErrorKind::AlreadyExists
+                    || err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
+        // Taken (EEXIST: prior occupant, live or dead), contested (WouldBlock:
+        // a concurrent sweep holds the fresh dir's lock just before deleting
+        // it), or vanished mid-flight (ENOENT: sweep removed it between our
+        // create and lock open). All mean: try the next suffix.
+        candidate = format!("{base}_{n}");
+        n += 1;
     }
 }
 
@@ -2031,7 +2037,10 @@ mod tests {
         // lock fd refers to an unlinked inode, so no WouldBlock). Teardown
         // must not delete the dir it just created — otherwise .pending_out
         // is silently lost (leaking the placeholder on a later hard kill)
-        // and every subsequent scan fails until restart.
+        // and every subsequent scan fails until restart. If a second
+        // boundary falls between the finish and the new session the stamp
+        // differs and a fresh dir is created instead — equally correct, so
+        // only the weaker invariants (live dir + lock + marker) are asserted.
         let (mut s, _guard) = test_session(PreviewOcr::Lazy);
         s.start_scan(300, "gray".into(), None);
         let img = s.dir.join("page_001.png");
@@ -2042,13 +2051,11 @@ mod tests {
             result: Ok(pdf::BuildOutcome::Searchable),
         })
         .await;
-        let recreated = s.dir.clone();
         s.new_session();
         assert!(
             s.dir.exists(),
             "teardown must not delete the recreated dir (same stamp)"
         );
-        assert_eq!(s.dir, recreated, "same stamp reused");
         assert!(s.dir.join(".lock").exists(), "new dir carries a lock");
         assert!(
             s.dir.join(".pending_out").exists(),
@@ -2531,13 +2538,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_dir_retries_on_held_lock() {
-        // Same-second second instance: the first stamp candidate's lock is
-        // held by another process, so creation must fall through to _2.
+    async fn create_session_dir_ladders_past_taken_names() {
+        // Same-second second instance: the first stamp candidate already
+        // exists (its claim via create_dir hits EEXIST), so creation must
+        // fall through to _2.
         let root = tempfile::tempdir().unwrap();
         let (d1, lock1) = create_session_dir(root.path()).expect("first dir");
         let (d2, lock2) = create_session_dir(root.path()).expect("second dir");
-        assert_ne!(d1, d2, "held lock forces a distinct dir");
+        assert_ne!(d1, d2, "existing dir forces a distinct dir");
         assert!(
             d2.file_name()
                 .and_then(|n| n.to_str())
@@ -2548,5 +2556,36 @@ mod tests {
         assert!(d1.join(".lock").exists() && d2.join(".lock").exists());
         drop(lock2);
         drop(lock1);
+    }
+
+    #[tokio::test]
+    async fn create_session_dir_never_adopts_dead_owners_dir() {
+        // Same-second instance that launched and died: its dir still holds a
+        // `.pending_out` marker (releasing the placeholder it points at is
+        // the startup sweep's job). Adopting the dir would overwrite that
+        // marker and orphan the zero-byte placeholder, so creation must
+        // ladder past it to _2.
+        let root = tempfile::tempdir().unwrap();
+        let corpse = root.path().join(pdf::stamp_now());
+        std::fs::create_dir_all(&corpse).unwrap();
+        std::fs::write(corpse.join(".pending_out"), "/out/2026-01-01_000000.pdf").unwrap();
+        std::fs::write(corpse.join("page_001.png"), b"x").unwrap();
+
+        let (d, _lock) = create_session_dir(root.path()).expect("fresh dir");
+        assert_ne!(d, corpse, "dead owner's dir must not be adopted");
+        assert!(
+            d.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_2")),
+            "suffix ladder engaged past the corpse"
+        );
+        assert!(
+            corpse.join(".pending_out").exists(),
+            "corpse left for the sweep"
+        );
+        assert!(
+            corpse.join("page_001.png").exists(),
+            "corpse contents untouched"
+        );
     }
 }
