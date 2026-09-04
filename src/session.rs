@@ -1365,6 +1365,13 @@ impl Session {
         // All fallible steps done: tear the old session down. The guard
         // guarantees no scan job is writing into the old dir (NewSession
         // requires Idle + no jobs).
+        // Release the OLD reservation first: the old dir carries its
+        // `.pending_out` marker, so a hard kill between a placeholder
+        // release and the dir removal must not find a live placeholder
+        // behind a marker — releasing first leaves marker + missing file
+        // (the sweep's release is a no-op there). A built PDF (non-empty)
+        // is never touched.
+        pdf::release_reservation(&self.out_pdf);
         let old_dir = std::mem::replace(&mut self.dir, new_dir);
         let old_lock = std::mem::replace(&mut self.lock, new_lock);
         // Delete the old dir while holding its lock so a concurrent sweep
@@ -1387,10 +1394,6 @@ impl Session {
         self.busy = Busy::Idle;
         self.busy_since = None;
         self.finished = false;
-        // A dangling reservation (session never built) is a zero-byte
-        // placeholder: release it before swapping to the next stamp. A built
-        // PDF (non-empty) is never touched.
-        pdf::release_reservation(&self.out_pdf);
         self.out_pdf = new_out;
         // Re-record the marker for the new reservation in the new dir.
         self.record_reservation();
@@ -1509,9 +1512,14 @@ impl Drop for Session {
         // the held lock keeps a concurrent sweep out; the fd drops right
         // after. A successful finish already removed the dir (ENOENT
         // ignored).
-        let _ = std::fs::remove_dir_all(&self.dir);
-        // Dangling output reservation (never built): drop the placeholder.
+        // Release the reservation BEFORE deleting the dir: the dir holds the
+        // `.pending_out` marker, so a hard kill between the two statements
+        // would otherwise orphan a zero-byte placeholder with no marker for
+        // the sweep. The other order leaks nothing — a crash here leaves
+        // dir+marker intact around an already-released placeholder (the
+        // sweep's release is a no-op on the missing file).
         pdf::release_reservation(&self.out_pdf);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

@@ -279,20 +279,31 @@ pub async fn build_pdf(plan: &BuildPlan) -> Result<BuildOutcome> {
     if crate::backend::which("unpaper").is_some() && plan.any_page_needing_cleanup {
         ocr_args.push("--clean".into());
     }
+    // Final delivery is atomic: ocrmypdf and the fallback copy write to a
+    // `.part` sibling that is renamed into place only on success. A build
+    // killed mid-write therefore leaves the zero-byte reservation untouched
+    // (plus a garbage `.part` that release/sweep discard) instead of a
+    // truncated file the sweep would mistake for a finished PDF.
+    let mut part_os = plan.out_pdf.as_os_str().to_os_string();
+    part_os.push(".part");
+    let part = PathBuf::from(part_os);
+
     ocr_args.push(raw_pdf.to_string_lossy().into_owned());
-    ocr_args.push(plan.out_pdf.to_string_lossy().into_owned());
+    ocr_args.push(part.to_string_lossy().into_owned());
 
     let refs: Vec<&str> = ocr_args.iter().map(String::as_str).collect();
     let out = process::run(&refs, Some(OCRYPDF_TIMEOUT))
         .await
         .map_err(|e| process::fail_with_log_err("OCR (ocrmypdf)", &refs, e))?;
     if out.success {
+        tokio::fs::rename(&part, &plan.out_pdf).await?;
         return Ok(BuildOutcome::Searchable);
     }
 
     // Non-fatal fallback (parity): save the raw PDF without a text layer.
     tracing::error!("ocrmypdf failed; saving PDF without text layer");
-    tokio::fs::copy(&raw_pdf, &plan.out_pdf).await?;
+    tokio::fs::copy(&raw_pdf, &part).await?;
+    tokio::fs::rename(&part, &plan.out_pdf).await?;
     Ok(BuildOutcome::WithoutTextLayer)
 }
 
@@ -339,13 +350,19 @@ pub fn reserve_output_path(dir: &Path, stamp: String) -> Result<PathBuf> {
 
 /// Remove a reservation made by `reserve_output_path`. Only deletes the
 /// zero-byte placeholder, so a real PDF (written by a finished build) is
-/// never touched. Best effort.
+/// never touched. Also discards a leftover `<path>.part` (an interrupted
+/// build's partial output): a non-empty placeholder can only mean a race
+/// between a live build and the release, in which case the `.part` garbage
+/// is dead weight anyway. Best effort.
 pub fn release_reservation(path: &Path) {
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.is_file() && meta.len() == 0 {
             let _ = std::fs::remove_file(path);
         }
     }
+    let mut part_os = path.as_os_str().to_os_string();
+    part_os.push(".part");
+    let _ = std::fs::remove_file(PathBuf::from(part_os));
 }
 
 /// Local timestamp string `YYYY-MM-DD_HHMMSS` (parity with Python format).
@@ -383,9 +400,13 @@ mod tests {
         // Second reserve for the same stamp must not reuse the live path.
         let p2 = reserve_output_path(d, stamp.clone()).unwrap();
         assert_eq!(p2, d.join("2026-09-02_143005_2.pdf"));
-        let p3 = reserve_output_path(d, stamp).unwrap();
+        let p3 = reserve_output_path(d, stamp.clone()).unwrap();
         assert_eq!(p3, d.join("2026-09-02_143005_3.pdf"));
         // Release only deletes empty placeholders; a written PDF survives.
+        // A leftover `.part` from an interrupted build is discarded either
+        // way.
+        let p3_part = d.join("2026-09-02_143005_3.pdf.part");
+        std::fs::write(&p3_part, b"half written").unwrap();
         release_reservation(&p2);
         assert!(!p2.exists());
         release_reservation(&p1);
@@ -393,6 +414,15 @@ mod tests {
         std::fs::write(&p3, b"pdf bytes").unwrap();
         release_reservation(&p3);
         assert!(p3.exists(), "built PDF is never released");
+        assert!(!p3_part.exists(), "partial output discarded");
+        // Zero-byte placeholder: both the placeholder and its .part go.
+        // (p2 was released above, so the same-stamp ladder reuses `_2`.)
+        let p4 = reserve_output_path(d, stamp).unwrap();
+        let p4_part = p4.with_extension("pdf.part");
+        std::fs::write(&p4_part, b"garbage").unwrap();
+        release_reservation(&p4);
+        assert!(!p4.exists());
+        assert!(!p4_part.exists());
     }
 
     #[test]

@@ -29,6 +29,7 @@ shellexpand = "3"
 
 [dev-dependencies]
 tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 lto = true
