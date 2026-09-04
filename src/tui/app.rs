@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 use crate::backend::pdf::BuildOutcome;
-use crate::check::Report;
+use crate::check::{self, Report};
 use crate::config::{Config, PreviewOcr};
 use crate::notify::{self, Urgency};
 use crate::session::{self, Busy, Event, PageStatus, PageView, SessionMeta};
@@ -68,12 +68,35 @@ pub struct App {
     pub status_scroll: usize,
     pub text_scroll: usize,
     pub meta: Option<SessionMeta>,
+    /// Header label; "detecting..." until background scanner detection
+    /// resolves, then the device label (or "no scanner" on failure).
     pub device_label: String,
     pub overlay: Option<Overlay>,
     pub quit_requested: bool,
     pub last_result: Option<(PathBuf, u64, bool)>, // path, kb, searchable
     pub report: Option<Report>,
-    pub diagnostics_request_tx: mpsc::Sender<mpsc::Sender<Report>>,
+    /// Request channel for non-blocking check runs (diagnostics re-run):
+    /// the overlay queues a token; the run_tui select loop consumes it,
+    /// arms the in-flight guard and spawns the suite.
+    pub diagnostics_request_tx: mpsc::Sender<()>,
+    /// Startup exit-code verdict: None = quit while detection was still
+    /// running (neutral exit 0), Some(true) = usable device and no failed
+    /// checks, Some(false) = failed checks or no scanner. Set ONLY by the
+    /// startup final delivery (never by fast reports or manual re-runs).
+    pub startup_report_ok: Option<bool>,
+    /// True while the actor's device is still unknown (detection running).
+    /// Gates scanning; `s` presses buffer instead of firing.
+    pub device_known: bool,
+    /// A scan intent buffered while detection was still running; fired by
+    /// the tick once the device is known (never re-fired afterwards).
+    pub pending_scan: bool,
+    /// True while an async check run is in flight (guards double-`r`).
+    pub checks_in_flight: bool,
+    /// True once a manual diagnostics re-run's report has been applied.
+    /// Startup reports arriving after that are out-of-order — the re-run's
+    /// data is strictly newer — and are ignored wholesale (see
+    /// `apply_report`).
+    pub rerun_seen: bool,
     pub langs_cache: Vec<String>,
     pub picker_available: bool,
     /// Pane geometry from the last frame (hit-testing + preview sync).
@@ -86,16 +109,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        cfg: Config,
-        device_label: String,
-        diagnostics_request_tx: mpsc::Sender<mpsc::Sender<Report>>,
-    ) -> Self {
+    pub fn new(cfg: Config, diagnostics_request_tx: mpsc::Sender<()>) -> Self {
         let settings = Settings {
             dpi: cfg.dpi,
             mode: cfg.mode.clone(),
         };
-        let mut status_lines = vec!["ready - press s to scan, ? for help".into()];
+        let mut status_lines = vec!["detecting scanner - press ? for help".into()];
         // Only real language mixes (e.g. eng+deu) garble umlauts; a script
         // model like Latin alongside one language is safe (and fixes §).
         let lang_count = cfg
@@ -118,18 +137,36 @@ impl App {
             status_scroll: 0,
             text_scroll: 0,
             meta: None,
-            device_label,
+            device_label: "detecting...".to_string(),
             overlay: None,
             quit_requested: false,
             last_result: None,
             report: None,
             diagnostics_request_tx,
+            startup_report_ok: None,
+            device_known: false,
+            pending_scan: false,
+            checks_in_flight: false,
+            rerun_seen: false,
             langs_cache: Vec::new(),
             picker_available: false,
             pane_rects: None,
             preview_cells: Vec::new(),
             tick: 0,
         }
+    }
+
+    /// Whether scanning may start: the actor's device must be known and
+    /// all other preconditions met. Mirrors the actor-side guard,
+    /// including the deferred-delete block.
+    fn scan_allowed(&self) -> bool {
+        self.device_known
+            && matches!(self.busy(), Busy::Idle)
+            && !self.meta.as_ref().is_some_and(|m| m.finished)
+            && !self
+                .pages
+                .iter()
+                .any(|p| p.status == PageStatus::DeletePending)
     }
 
     pub fn selected_page(&self) -> Option<&PageView> {
@@ -184,13 +221,15 @@ impl App {
         let finished = self.meta.as_ref().is_some_and(|m| m.finished);
         match action {
             // Scanning overlaps with per-page processing (scanner is the
-            // exclusive resource; jobs run in the background).
-            Action::Scan => matches!(busy, Busy::Idle) && !finished,
+            // exclusive resource; jobs run in the background). Requires a
+            // known device (background detection must have delivered one).
+            Action::Scan => self.scan_allowed(),
             // Mirrors the actor guard: a live per-page job (preview OCR or
             // rotate, visible as text_pending or a non-Ready status) blocks
             // rescan/rotate of that page.
             Action::Rescan => {
-                matches!(busy, Busy::Idle)
+                self.device_known
+                    && matches!(busy, Busy::Idle)
                     && !finished
                     && self.selected_page().is_some_and(|p| {
                         matches!(p.status, PageStatus::Ready | PageStatus::Failed)
@@ -267,13 +306,19 @@ pub enum CommandAction {
 }
 
 /// Run the TUI. Owns the terminal, event stream, preview worker, and the
-/// session actor's event channel.
+/// session actor's event channel. Returns whether the startup environment
+/// finished OK (device found, no failed checks); None (quit while
+/// detection was still running) maps to a neutral success. The caller maps
+/// this to the process exit code.
 pub struct TuiInit {
     pub cfg: Config,
-    pub device_label: String,
-    pub report: Option<Report>,
     pub picker: ratatui_image::picker::Picker,
     pub picker_available: bool,
+    /// Report inbox ends: the startup preflight task sends the fast report
+    /// first, then the final report; diagnostics re-runs send theirs here
+    /// too. One consumer branch keeps the ordering rules in one place.
+    pub report_tx: mpsc::Sender<Report>,
+    pub report_rx: mpsc::Receiver<Report>,
 }
 
 pub async fn run_tui(
@@ -281,26 +326,23 @@ pub async fn run_tui(
     init: TuiInit,
     mut event_rx: mpsc::Receiver<Event>,
     cmd_tx: mpsc::Sender<session::Cmd>,
-) -> Result<()> {
+) -> Result<bool> {
     let TuiInit {
         cfg,
-        device_label,
-        report: initial_report,
         picker,
         picker_available,
+        report_tx,
+        report_rx,
     } = init;
-    let (diag_tx, mut diag_rx) = mpsc::channel::<mpsc::Sender<Report>>(4);
-    let mut app = App::new(cfg.clone(), device_label, diag_tx);
+    let mut report_rx = report_rx;
+    let (diag_tx, mut diag_rx) = mpsc::channel::<()>(4);
+    let mut app = App::new(cfg.clone(), diag_tx);
     app.picker_available = picker_available;
-    app.report = initial_report.clone();
-    if initial_report.is_some_and(|r| !r.ok()) {
-        app.overlay = Some(Overlay::Diagnostics);
-    }
 
     let mut preview = PreviewWorker::new(picker);
     tracing::info!(
         "image preview protocol: {}",
-        if picker_available {
+        if app.picker_available {
             "native (sixel/kitty)"
         } else {
             "halfblocks"
@@ -333,23 +375,39 @@ pub async fn run_tui(
                         handle_event(&mut app, &cmd_tx, ev).await?;
                     }
                     Some(Err(e)) => return Err(anyhow::anyhow!("terminal event error: {e}")),
-                    None => return Ok(()),
+                    None => return Ok(app.startup_report_ok.unwrap_or(true)),
                 }
             }
             // Session actor events.
             Some(ev) = event_rx.recv() => {
                 handle_session_event(&mut app, ev).await;
             }
-            // Diagnostics results.
-            Some(tx) = diag_rx.recv() => {
-                let report = crate::check::run_checks(&app.cfg).await;
-                app.report = Some(report.clone());
-                let _ = tx.send(report).await;
+            // Preflight/diagnostics reports (startup fast+final, manual
+            // re-runs). One inbox keeps the ordering rules in one place.
+            Some(report) = report_rx.recv() => {
+                apply_report(&mut app, report, &cmd_tx).await;
+            }
+            // Diagnostics re-run requests (r in the overlay): run the full
+            // check suite in a background task so the UI never freezes.
+            // The guard is armed only here — the overlay just queues a
+            // token; if one is stale (guard already set) it's dropped.
+            Some(()) = diag_rx.recv() => {
+                if !app.checks_in_flight {
+                    app.checks_in_flight = true;
+                    app.set_status("re-running checks...");
+                    let cfg = app.cfg.clone();
+                    let report_tx = report_tx.clone();
+                    tokio::spawn(async move {
+                        let report = check::run_checks(&cfg).await;
+                        let _ = report_tx.send(report).await;
+                    });
+                }
             }
             // Periodic tick: elapsed timers, spinner frames, and the lazy
             // preview-OCR request for the selected page.
             _ = tick.tick() => {
                 app.tick = app.tick.wrapping_add(1);
+                fire_pending_scan(&mut app, &cmd_tx).await;
                 request_text_if_needed(&app, &cmd_tx).await;
             }
         }
@@ -362,7 +420,9 @@ pub async fn run_tui(
     // Quitting deletes the session dir (via the session actor's Drop):
     // un-built pages are gone unless a PDF build was in flight, in which
     // case the dir survives for the next startup's sweep.
-    Ok(())
+    // Exit verdict: None means quit during detection (neutral success);
+    // Some(false) is the only failing verdict (failed checks / no scanner).
+    Ok(app.startup_report_ok.unwrap_or(true))
 }
 
 async fn handle_session_event(app: &mut App, ev: Event) {
@@ -446,6 +506,107 @@ async fn handle_session_event(app: &mut App, ev: Event) {
     }
 }
 
+/// A report arrived (startup fast/final or a manual diagnostics re-run).
+/// Ordering matters: store -> header label -> actor device -> exit-code
+/// flag -> auto-open overlay -> fire a buffered scan.
+///
+/// Staleness rule: a manual re-run is strictly newer than anything the
+/// startup preflight produced (it re-checks the same environment later).
+/// So once a re-run report has been applied, a later-arriving startup
+/// report (e.g. a slow startup `scanimage -L` final landing after the
+/// re-run delivered its device) is out-of-order and ignored wholesale —
+/// otherwise it could clobber `device_known`, re-lock scanning and drop
+/// a buffered scan on a healthy machine. Re-run reports never arrive out
+/// of order among themselves: `checks_in_flight` serializes them.
+///
+/// Exit-code exception: if the verdict is still undecided and a stale
+/// StartupFinal is dropped, the re-run's data decides it instead — the
+/// machine state it measured IS the startup outcome by then. Without
+/// this, a quit after both startup detection and re-run failed would
+/// exit 0 (neutral) instead of 1.
+async fn apply_report(app: &mut App, report: Report, cmd_tx: &mpsc::Sender<session::Cmd>) {
+    let settled = report.settled();
+    let device = report.device.clone();
+    let source = report.source;
+    if source == check::ReportSource::ReRun {
+        app.checks_in_flight = false;
+        app.rerun_seen = true;
+    } else if app.rerun_seen {
+        // Stale startup report after a re-run applied: drop it entirely.
+        // If the exit verdict is still undecided, the re-run's (newer)
+        // stored data decides it — its device + check results, never the
+        // stale report's — see the doc above.
+        if app.startup_report_ok.is_none() && settled {
+            app.startup_report_ok = app.report.as_ref().map(|r| r.device.is_some() && r.ok());
+        }
+        return;
+    }
+    app.report = Some(report);
+
+    if !settled {
+        // Fast (still-detecting) report. Real failures in it (missing
+        // binaries etc.) are worth surfacing immediately, but never steal
+        // focus from a dialog the user opened meanwhile.
+        if !app.report.as_ref().is_some_and(|r| r.ok()) && app.overlay.is_none() {
+            app.overlay = Some(Overlay::Diagnostics);
+        }
+        return;
+    }
+
+    // Final/settled report: the scanner question is answered.
+    if let Some(d) = &device {
+        app.device_label = check::device_label(Some(d));
+        app.device_known = true;
+        // Delivery to the actor (it ignores empty/duplicate names).
+        let _ = cmd_tx.send(session::Cmd::SetDevice(d.name.clone())).await;
+    } else {
+        app.device_label = "no scanner".to_string();
+        app.device_known = false;
+    }
+
+    // Startup exit-code semantics: the verdict starts as None (quit while
+    // still detecting -> neutral exit 0) and is decided exactly once, by
+    // the startup final report: ok (device + no failures) -> Some(true),
+    // else Some(false). Manual re-runs and fast reports never touch it.
+    if app.startup_report_ok.is_none() && source == check::ReportSource::StartupFinal {
+        app.startup_report_ok =
+            Some(device.is_some() && app.report.as_ref().is_some_and(|r| r.ok()));
+    }
+
+    // Auto-open diagnostics on failure (final reports AND fast reports
+    // with real fails), guarded so a user-opened overlay is preserved.
+    if !app.report.as_ref().is_some_and(|r| r.ok()) && app.overlay.is_none() {
+        app.overlay = Some(Overlay::Diagnostics);
+        if device.is_none() {
+            app.set_status("no scanner found - see diagnostics (press ! to reopen)");
+        }
+    }
+
+    // A scan intent buffered during detection: fire it now that the device
+    // is known, or drop it with a hint when detection found nothing.
+    if app.pending_scan {
+        if device.is_some() {
+            app.set_status("scanner ready - starting buffered scan");
+            // The tick fires it (re-checks guards); keep the buffer set.
+        } else {
+            app.pending_scan = false;
+            app.set_status("no scanner found - buffered scan dropped");
+        }
+    }
+}
+
+/// Tick-driven buffered-scan fire: self-healing (unlike an event-triggered
+/// fire, a tick can't be lost). Re-checks all scan guards at fire time.
+async fn fire_pending_scan(app: &mut App, cmd_tx: &mpsc::Sender<session::Cmd>) {
+    if !app.pending_scan || !app.scan_allowed() {
+        return;
+    }
+    app.pending_scan = false;
+    let dpi = app.settings.dpi;
+    let mode = app.settings.mode.clone();
+    let _ = cmd_tx.send(session::Cmd::ScanNext { dpi, mode }).await;
+}
+
 #[derive(Debug)]
 enum UiAction {
     None,
@@ -523,7 +684,30 @@ async fn handle_key(
 
         // ---------------- scanning
         Char('s') => {
-            send(app, cmd_tx, CommandAction::ScanNext).await;
+            if app.scan_allowed() {
+                send(app, cmd_tx, CommandAction::ScanNext).await;
+            } else if !app.device_known {
+                // Detection still running: buffer the intent (fired by the
+                // tick once the device arrives) instead of a doomed scan.
+                if !app.pending_scan {
+                    app.pending_scan = true;
+                    app.set_status("waiting for scanner - scan will start when detected");
+                }
+            } else if app.busy() == Busy::Finishing {
+                app.set_status("blocked: building PDF - scan once it finishes");
+            } else if app.meta.as_ref().is_some_and(|m| m.finished) {
+                app.set_status("blocked: PDF already built - press n for a new session");
+            } else if app.busy() == Busy::Scanning {
+                // Parity with the actor guard; previously this fell through
+                // silently (footer greying only).
+                app.set_status("blocked: scanner busy - press Esc to cancel");
+            } else if app
+                .pages
+                .iter()
+                .any(|p| p.status == PageStatus::DeletePending)
+            {
+                app.set_status("blocked: waiting for deferred delete");
+            }
         }
         Esc | Char('c') if app.action_allowed(Action::Cancel) => {
             send(app, cmd_tx, CommandAction::CancelScan).await;
@@ -810,7 +994,7 @@ mod tests {
     /// App with throwaway channels; meta/pages are set per-test.
     fn test_app() -> App {
         let (diag_tx, _diag_rx) = mpsc::channel(4);
-        App::new(Config::default(), "fake scanner".into(), diag_tx)
+        App::new(Config::default(), diag_tx)
     }
 
     fn ready_page(id: u32) -> PageView {
@@ -913,5 +1097,439 @@ mod tests {
             matches!(app.overlay, Some(Overlay::Confirm(_))),
             "still-valid confirm survives"
         );
+    }
+
+    fn device(name: &str) -> crate::check::Device {
+        crate::check::Device {
+            name: name.into(),
+            label: "Test Scanner".into(),
+        }
+    }
+
+    /// A report whose scanner item carries the given status. `source`
+    /// defaults to the startup final report (the exit-flag path).
+    fn report_with(device: Option<crate::check::Device>, status: crate::check::Status) -> Report {
+        report_with_source(device, status, crate::check::ReportSource::StartupFinal)
+    }
+
+    fn report_with_source(
+        device: Option<crate::check::Device>,
+        status: crate::check::Status,
+        source: crate::check::ReportSource,
+    ) -> Report {
+        let mut r = Report::default();
+        r.items.push(crate::check::CheckItem {
+            what: "scanner".into(),
+            status,
+            detail: String::new(),
+            hint: None,
+            pending_detail: None,
+        });
+        r.device = device;
+        r.source = source;
+        r
+    }
+
+    #[tokio::test]
+    async fn report_arrival_sets_device_and_exit_flag() {
+        let mut app = test_app();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+
+        // Fast (pending) report: device stays unknown, no SetDevice, no
+        // verdict.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Pending),
+            &cmd_tx,
+        )
+        .await;
+        assert!(!app.device_known);
+        assert_eq!(app.device_label, "detecting...");
+        assert!(app.startup_report_ok.is_none());
+        assert!(cmd_rx.try_recv().is_err(), "no SetDevice on fast report");
+
+        // Final report with device: label, device_known, SetDevice, flag.
+        apply_report(
+            &mut app,
+            report_with(Some(device("hpaio:/usb/x")), crate::check::Status::Ok),
+            &cmd_tx,
+        )
+        .await;
+        assert_eq!(app.device_label, "Test Scanner");
+        assert!(app.device_known);
+        assert_eq!(app.startup_report_ok, Some(true));
+        match cmd_rx.try_recv() {
+            Ok(session::Cmd::SetDevice(name)) => assert_eq!(name, "hpaio:/usb/x"),
+            other => panic!("expected SetDevice, got {other:?}"),
+        }
+    }
+
+    /// A failing startup report (e.g. no scanner) decides the verdict as
+    /// Some(false) -> exit 1; quit-during-detection (None) stays neutral.
+    #[tokio::test]
+    async fn failed_startup_report_sets_failing_verdict() {
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert_eq!(app.startup_report_ok, Some(false));
+
+        // A later report must not flip the decided verdict; in reality a
+        // late plug-in arrives via a ReRun report, which never touches the
+        // flag. (The is_none() guard holds for any source.)
+        apply_report(
+            &mut app,
+            report_with(Some(device("hpaio:/usb/x")), crate::check::Status::Ok),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert_eq!(app.startup_report_ok, Some(false));
+    }
+
+    #[tokio::test]
+    async fn report_failure_opens_diagnostics_only_when_unobstructed() {
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(app.overlay.is_some(), "failure auto-opens diagnostics");
+        assert_eq!(app.device_label, "no scanner");
+        assert_eq!(app.startup_report_ok, Some(false));
+
+        // A user-opened overlay is never clobbered by auto-open.
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Help);
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            matches!(app.overlay, Some(Overlay::Help)),
+            "auto-open must not clobber a user dialog"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_scan_fires_on_tick_after_device_arrives() {
+        let mut app = test_app();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        app.pending_scan = true;
+        assert!(!app.scan_allowed(), "no device yet");
+
+        apply_report(
+            &mut app,
+            report_with(Some(device("hpaio:/x")), crate::check::Status::Ok),
+            &cmd_tx,
+        )
+        .await;
+        assert!(app.device_known);
+        assert!(app.pending_scan, "still buffered until the tick fires");
+
+        fire_pending_scan(&mut app, &cmd_tx).await;
+        assert!(!app.pending_scan);
+        // First message is the SetDevice from apply_report, second the scan.
+        let _ = cmd_rx.recv().await;
+        match cmd_rx.recv().await {
+            Some(session::Cmd::ScanNext { dpi, mode }) => {
+                assert_eq!(dpi, Config::default().dpi);
+                assert_eq!(mode, "gray");
+            }
+            other => panic!("expected ScanNext, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_scan_dropped_when_detection_fails() {
+        let mut app = test_app();
+        app.pending_scan = true;
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(!app.pending_scan, "no device -> buffered intent dropped");
+        assert!(!app.device_known);
+    }
+
+    #[tokio::test]
+    async fn scan_not_allowed_while_device_unknown() {
+        let app = test_app();
+        assert!(!app.scan_allowed());
+        assert!(!app.action_allowed(Action::Scan));
+    }
+
+    /// Regression: a manual re-run (r in diagnostics) must re-deliver the
+    /// device instead of wiping it. Previously run_checks returned
+    /// device: None, so apply_report flipped device_known off on a healthy
+    /// machine and scan_allowed stayed false forever (scan locked out
+    /// until restart).
+    #[tokio::test]
+    async fn rerun_report_keeps_device_known() {
+        let mut app = test_app();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+
+        apply_report(
+            &mut app,
+            report_with(Some(device("hpaio:/usb/x")), crate::check::Status::Ok),
+            &cmd_tx,
+        )
+        .await;
+        assert!(app.device_known);
+
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Ok,
+                crate::check::ReportSource::ReRun,
+            ),
+            &cmd_tx,
+        )
+        .await;
+        assert!(app.device_known, "re-run must not wipe the known device");
+        assert_eq!(app.device_label, "Test Scanner");
+        assert!(app.scan_allowed());
+        assert_eq!(
+            app.startup_report_ok,
+            Some(true),
+            "verdict unchanged by re-run"
+        );
+        // Second SetDevice (duplicate names are an actor no-op).
+        let _ = cmd_rx.recv().await;
+        match cmd_rx.try_recv() {
+            Ok(session::Cmd::SetDevice(name)) => assert_eq!(name, "hpaio:/usb/x"),
+            other => panic!("expected SetDevice from re-run, got {other:?}"),
+        }
+    }
+
+    /// The exit-code flag is set only by the startup final report; a
+    /// successful manual re-run while still detecting must not set it.
+    #[tokio::test]
+    async fn rerun_report_does_not_set_startup_exit_flag() {
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Ok,
+                crate::check::ReportSource::ReRun,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(app.device_known);
+        assert_eq!(
+            app.startup_report_ok, None,
+            "re-run must not set the startup flag"
+        );
+    }
+
+    /// A startup report landing mid-re-run must not clear the re-run
+    /// guard (otherwise a second r could start a concurrent re-run whose
+    /// older report could arrive last and win).
+    #[tokio::test]
+    async fn startup_report_does_not_clear_rerun_guard() {
+        let mut app = test_app();
+        app.checks_in_flight = true;
+        apply_report(
+            &mut app,
+            report_with(Some(device("hpaio:/x")), crate::check::Status::Ok),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            app.checks_in_flight,
+            "startup report must not unlock re-runs"
+        );
+
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::ReRun,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(!app.checks_in_flight, "re-run arrival clears the guard");
+    }
+
+    /// Regression: a slow startup final report (e.g. flaky scanimage -L
+    /// with device: None) landing AFTER a manual re-run already delivered
+    /// a device must not clobber it (device_known flipped off, header
+    /// "no scanner", scanning re-locked, buffered scan dropped). The
+    /// re-run's data is strictly newer — the stale startup report is
+    /// ignored wholesale.
+    #[tokio::test]
+    async fn stale_startup_final_after_rerun_is_ignored() {
+        let mut app = test_app();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+
+        // Startup fast report applied normally.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Pending),
+            &cmd_tx,
+        )
+        .await;
+        assert!(!app.device_known);
+
+        // User presses r: re-run finds the scanner and delivers it.
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Ok,
+                crate::check::ReportSource::ReRun,
+            ),
+            &cmd_tx,
+        )
+        .await;
+        assert!(app.device_known);
+        let _ = cmd_rx.recv().await; // SetDevice
+
+        // The slow startup final report lands last with no device.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &cmd_tx,
+        )
+        .await;
+        assert!(
+            app.device_known,
+            "stale startup final must not wipe the re-run device"
+        );
+        assert_eq!(app.device_label, "Test Scanner");
+        assert!(app.scan_allowed(), "scanning stays unlocked");
+        // The stale report must not clobber the stored report either.
+        assert_eq!(
+            app.report.as_ref().map(|r| r.source),
+            Some(crate::check::ReportSource::ReRun)
+        );
+        // And no second SetDevice/no actor downgrade was sent.
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "stale report must not touch the actor"
+        );
+    }
+
+    /// A startup fast report landing after a re-run is equally stale and
+    /// must be dropped (its only effect would be a spurious diagnostics
+    /// auto-open).
+    #[tokio::test]
+    async fn stale_startup_fast_after_rerun_is_ignored() {
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Ok,
+                crate::check::ReportSource::ReRun,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(app.device_known);
+        app.overlay = None;
+
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Pending),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            app.overlay.is_none(),
+            "stale fast report must not auto-open diagnostics"
+        );
+        assert!(app.device_known);
+    }
+
+    /// When a stale StartupFinal is dropped while the exit verdict is
+    /// still undecided, the re-run's (newer) data decides it: a failed
+    /// re-run -> Some(false) so a quit afterwards doesn't exit 0.
+    #[tokio::test]
+    async fn stale_startup_final_lets_rerun_decide_verdict() {
+        let mut app = test_app();
+
+        // Failed re-run applied (no scanner anywhere); verdict undecided.
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::ReRun,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert_eq!(app.startup_report_ok, None);
+
+        // Stale startup final (also failed) lands last: dropped, but the
+        // verdict must now be decided from the re-run's data.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert_eq!(
+            app.startup_report_ok,
+            Some(false),
+            "dropped stale final must not leave the verdict undecided on a failed machine"
+        );
+    }
+
+    /// The verdict fallback never overrides an already-decided verdict.
+    #[tokio::test]
+    async fn stale_startup_final_does_not_override_decided_verdict() {
+        let mut app = test_app();
+
+        // Re-run found a scanner (healthy machine); verdict undecided.
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Ok,
+                crate::check::ReportSource::ReRun,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert_eq!(app.startup_report_ok, None);
+
+        // Stale failing startup final: dropped; the re-run data decides
+        // -> Some(true).
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert_eq!(app.startup_report_ok, Some(true));
+    }
+
+    /// Mirrors the actor guard: a deferred delete (delete requested while
+    /// scanning) blocks a new scan.
+    #[test]
+    fn scan_blocked_while_delete_pending() {
+        let mut app = test_app();
+        app.device_known = true;
+        app.meta = Some(meta(false));
+        let mut p = ready_page(1);
+        p.status = PageStatus::DeletePending;
+        app.pages = vec![p];
+        assert!(!app.scan_allowed());
+        assert!(!app.action_allowed(Action::Scan));
     }
 }

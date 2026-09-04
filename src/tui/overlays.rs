@@ -155,15 +155,15 @@ pub async fn handle_key(
             match key.code {
                 Esc | Char('!') | Char('q') => false,
                 Char('r') | Char('R') => {
-                    // Re-run checks inline; update the app's report copy.
-                    let report = crate::check::run_checks(&app.cfg).await;
-                    let ok = report.ok();
-                    app.report = Some(report);
-                    app.set_status(if ok {
-                        "all checks passed"
-                    } else {
-                        "problems found"
-                    });
+                    // Non-blocking re-run: queue a request token; the
+                    // run_tui select loop picks it up, arms the in-flight
+                    // guard and runs the full suite as a background task.
+                    // Never await anything here — this handler runs inside
+                    // the select loop, so awaiting a response that only
+                    // that loop can produce would deadlock the whole UI.
+                    if !app.checks_in_flight {
+                        let _ = app.diagnostics_request_tx.send(()).await;
+                    }
                     true
                 }
                 _ => true,

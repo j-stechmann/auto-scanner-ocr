@@ -62,7 +62,20 @@ fn run(cli: Cli) -> Result<i32> {
 /// Runs before any crossterm usage; raw mode is entered/restored by the
 /// ratatui-image query itself.
 fn run_image_probe() -> Result<i32> {
-    let line = match ratatui_image::picker::Picker::from_query_stdio() {
+    use ratatui_image::picker::cap_parser::QueryStdioOptions;
+    // 600ms silence window instead of the crate's 2s default: the crate
+    // treats the timeout as an inactivity timer (it restarts on every
+    // received chunk), so real terminals that answer in a burst are
+    // unaffected — but the FIRST response byte must still arrive within
+    // the window, which leaves headroom for SSH links and tmux
+    // passthroughs where a local terminal answers in single-digit ms.
+    // Keep ..Default::default(): enabling the extra OSC-11 / text-sizing
+    // queries would add more response bytes and make short windows risky.
+    let opts = QueryStdioOptions {
+        timeout: std::time::Duration::from_millis(600),
+        ..QueryStdioOptions::default()
+    };
+    let line = match ratatui_image::picker::Picker::from_query_stdio_with_options(opts) {
         Ok(picker) => {
             let proto = match picker.protocol_type() {
                 ratatui_image::picker::ProtocolType::Kitty => "kitty",
@@ -80,25 +93,35 @@ fn run_image_probe() -> Result<i32> {
 }
 
 async fn async_tui(cfg: auto_scanner_ocr::config::Config) -> Result<i32> {
-    // Preflight (diagnostics screen opens automatically on failure).
-    let (report, device) = check::preflight(&cfg).await;
-
-    let device_label = match &device {
-        Some(d) => {
-            if d.label.is_empty() {
-                d.name.clone()
-            } else {
-                d.label.clone()
-            }
-        }
-        None => "no scanner".to_string(),
-    };
+    // Background preflight FIRST (before the probe child below): the slow
+    // scanner detection (scanimage -L, up to ~30s worst case) must overlap
+    // with the probe and with TUI drawing. It streams results into the
+    // report inbox: the fast report (PATH lookups, ms-scale) lands first,
+    // the full report once scanimage -L resolves. The TUI is painted
+    // meanwhile; scanning stays gated until the device is known.
+    let (report_tx, report_rx) = tokio::sync::mpsc::channel(4);
+    {
+        let cfg = cfg.clone();
+        let report_tx = report_tx.clone();
+        tokio::spawn(async move {
+            // Fast half immediately (ms-scale; sets the Pending scanner row).
+            let fast = check::run_checks_fast(&cfg);
+            let _ = report_tx.send(fast.clone()).await;
+            // Slow half (langs + scanimage -L, concurrently) once, then
+            // merge the fast rows into it for the final report.
+            let slow = check::run_checks_slow(&cfg).await;
+            let _ = report_tx.send(check::merge_fast_slow(&fast, slow)).await;
+        });
+    }
 
     // Probe the terminal image protocol in a short-lived child process.
     // Doing the ratatui-image stdio query in-process breaks crossterm input:
     // the query's orphaned stdin reader eats keystrokes when the terminal
     // never answers, then restores cooked termios mid-session. The child
     // isolates that failure mode (its orphan thread dies with the process).
+    // Budget ~600ms (+ spawn overhead); any failure falls back to
+    // halfblocks. Synchronous spawn is fine here: the multi-thread runtime
+    // keeps the preflight task running on other workers.
     let (picker, picker_available) = image_probe_picker();
 
     let terminal = ratatui::try_init().context("initializing terminal")?;
@@ -106,33 +129,20 @@ async fn async_tui(cfg: auto_scanner_ocr::config::Config) -> Result<i32> {
 
     let init = tui::TuiInit {
         cfg: cfg.clone(),
-        device_label,
-        report: Some(report),
         picker,
         picker_available,
-    };
-    let (report_ok, device_name) = match &init.report {
-        Some(r) => (r.ok(), device.clone().map(|d| d.name)),
-        None => (false, None),
+        report_tx,
+        report_rx,
     };
 
-    let result = match device_name {
-        Some(device_name) if report_ok => {
-            // Spawn the session actor and run the UI loop.
-            let (cmd_tx, event_rx) = session::spawn(cfg.clone(), device_name)?;
-            tui::run_tui(terminal, init, event_rx, cmd_tx)
-                .await
-                .map(|_| 0)
-        }
-        _ => {
-            // Show the UI anyway: diagnostics overlay is open and the user can
-            // retry (r) or quit.
-            let (cmd_tx, event_rx) = session::spawn(cfg.clone(), String::new())?;
-            tui::run_tui(terminal, init, event_rx, cmd_tx)
-                .await
-                .map(|_| 1)
-        }
-    };
+    // One session actor, always spawned up front with an empty device; the
+    // background detection delivers the resolved device via Cmd::SetDevice
+    // once scanimage -L resolves (its dir setup/flock/output reservation
+    // are device-independent and stay at launch).
+    let (cmd_tx, event_rx) = session::spawn(cfg.clone(), String::new())?;
+    let result = tui::run_tui(terminal, init, event_rx, cmd_tx)
+        .await
+        .map(|startup_ok| if startup_ok { 0 } else { 1 });
 
     execute!(std::io::stdout(), DisableMouseCapture)?;
     ratatui::restore();
@@ -140,8 +150,8 @@ async fn async_tui(cfg: auto_scanner_ocr::config::Config) -> Result<i32> {
 }
 
 /// Probe the terminal via a short-lived child process (`--image-probe`).
-/// Returns (picker, native_protocol_available). Total budget ~3s; any
-/// failure falls back to halfblocks.
+/// Returns (picker, native_protocol_available). Silence budget ~600ms plus
+/// spawn overhead; any failure falls back to halfblocks.
 ///
 /// tmux caveat (measured): ratatui-image wraps its queries in a tmux DCS
 /// passthrough (`\ePtmux;…\e\\`) when TERM starts with "tmux", and tmux then

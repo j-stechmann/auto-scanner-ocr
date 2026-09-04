@@ -86,6 +86,13 @@ auto-scanner-ocr --doctor     # check dependencies and scanner, then exit
 auto-scanner-ocr --help       # all options
 ```
 
+Startup is near-instant: the TUI paints in well under a second while the
+scanner detection (`scanimage -L`, the slow part) and dependency checks run
+in the background — the header shows `detecting...` and scanning unlocks
+(`s`) the moment your device is found, typically within a few seconds.
+Pressing `s` early buffers the scan intent; it fires automatically as soon
+as the scanner is detected.
+
 Inside the TUI:
 
 | Key | Action |
@@ -137,6 +144,10 @@ mid-pass.
 | `--config FILE` | use a specific config file | ./config.toml or ~/.config/auto-scanner-ocr/config.toml |
 | `--doctor` | check dependencies and scanner, then exit | — |
 | `-v, --verbose` | also print log output to the terminal | — |
+
+Exit code: `0` on a healthy session and also when quitting while the
+background scanner detection was still running (neutral); `1` only when the
+startup checks finished with failures or no scanner found.
 
 ### Configuration
 
@@ -209,11 +220,14 @@ missing.
 
 The preview auto-detects the terminal's graphics protocol via a short-lived
 probe process: kitty graphics and sixel render native images; everywhere
-else it falls back to unicode halfblocks. Inside tmux the probe queries
-raw (tmux swallows answers to its own passthrough-wrapped queries), so sixel
-works in tmux too when the outer terminal (e.g. foot) supports it.
-Detection never interferes with keyboard input — the probe runs in an
-isolated child process.
+else it falls back to unicode halfblocks. The probe's first response must
+arrive within ~600 ms — local terminals answer in a few ms, but a very
+slow SSH link (or a heavily loaded tmux passthrough) can fall back to
+halfblocks, degrading only the image preview, never scanning. Inside tmux
+the probe queries raw (tmux swallows answers to its own passthrough-wrapped
+queries), so sixel works in tmux too when the outer terminal (e.g. foot)
+supports it. Detection never interferes with keyboard input — the probe
+runs in an isolated child process.
 
 ## Troubleshooting
 
@@ -221,8 +235,10 @@ isolated child process.
   language data, scanner detection and the output directory, and prints
   install hints for anything missing. Inside the TUI, `!` shows the same
   checks with `r` to re-run them.
-- The TUI runs the same checks at startup; if something is missing you'll see
-  the diagnostics screen immediately instead of a mid-scan failure.
+- The TUI runs the same checks at startup (in the background); if something
+  is missing you'll see the diagnostics screen automatically instead of a
+  mid-scan failure. The `r` re-run inside diagnostics is non-blocking — the
+  UI stays responsive while checks execute.
 - **Wrong umlauts in the OCR text (`fiir` instead of `für`)?** Your `langs`
   mixes two language models — pick the document's language alone with `L`
   (or set `langs = "deu"` in the config). Mixed-language OCR reliably garbles
