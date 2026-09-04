@@ -145,6 +145,10 @@ mid-pass.
 | `--doctor` | check dependencies and scanner, then exit | — |
 | `-v, --verbose` | also print log output to the terminal | — |
 
+Exit code: `0` on a healthy session and also when quitting while the
+background scanner detection was still running (neutral); `1` only when the
+startup checks finished with failures or no scanner found.
+
 ### Configuration
 
 Defaults live in `config.toml` (keep it next to the binary, or at

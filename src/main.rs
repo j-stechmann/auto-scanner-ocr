@@ -103,9 +103,12 @@ async fn async_tui(cfg: auto_scanner_ocr::config::Config) -> Result<i32> {
         let report_tx = report_tx.clone();
         tokio::spawn(async move {
             // Fast half immediately (ms-scale; sets the Pending scanner row).
-            let _ = report_tx.send(check::run_checks_fast(&cfg)).await;
-            // Slow half (langs + scanimage -L, concurrently) once, merged.
-            let _ = report_tx.send(check::run_checks_slow(&cfg).await).await;
+            let fast = check::run_checks_fast(&cfg);
+            let _ = report_tx.send(fast.clone()).await;
+            // Slow half (langs + scanimage -L, concurrently) once, then
+            // merge the fast rows into it for the final report.
+            let slow = check::run_checks_slow(&cfg).await;
+            let _ = report_tx.send(check::merge_fast_slow(&fast, slow)).await;
         });
     }
 

@@ -155,20 +155,14 @@ pub async fn handle_key(
             match key.code {
                 Esc | Char('!') | Char('q') => false,
                 Char('r') | Char('R') => {
-                    // Non-blocking re-run: request a fresh report through
-                    // the app's diagnostics channel; the run_tui select
-                    // loop executes it as a background task and the report
-                    // inbox delivers the result. Never await checks here —
-                    // that would freeze the whole UI for seconds.
+                    // Non-blocking re-run: queue a request token; the
+                    // run_tui select loop picks it up, arms the in-flight
+                    // guard and runs the full suite as a background task.
+                    // Never await anything here — this handler runs inside
+                    // the select loop, so awaiting a response that only
+                    // that loop can produce would deadlock the whole UI.
                     if !app.checks_in_flight {
-                        let (tx, mut rx) = mpsc::channel::<crate::check::Report>(1);
-                        if app.diagnostics_request_tx.send(tx).await.is_ok() {
-                            app.checks_in_flight = true;
-                            // Await the tiny ack (not the report) so the
-                            // request is queued before we return; status
-                            // updates arrive via apply_report.
-                            let _ = rx.recv().await;
-                        }
+                        let _ = app.diagnostics_request_tx.send(()).await;
                     }
                     true
                 }

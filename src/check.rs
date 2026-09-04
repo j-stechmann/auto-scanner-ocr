@@ -44,10 +44,25 @@ pub struct CheckItem {
     pub pending_detail: Option<String>,
 }
 
+/// Where a report came from. The TUI branches on this: only a manual
+/// re-run clears `checks_in_flight`, and only the startup final report
+/// may set the exit-code flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReportSource {
+    /// TUI startup: fast preflight half (scanner item still Pending).
+    #[default]
+    StartupFast,
+    /// TUI startup: final preflight report (scanner question answered).
+    StartupFinal,
+    /// Manual diagnostics re-run from the overlay.
+    ReRun,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Report {
     pub items: Vec<CheckItem>,
     pub device: Option<Device>,
+    pub source: ReportSource,
 }
 
 impl Report {
@@ -127,10 +142,13 @@ fn hint_for(bin: &str) -> Option<&'static str> {
     HINTS.iter().find(|(n, _, _)| *n == bin).map(|(_, _, h)| *h)
 }
 
-/// Run all checks. `check_scanner` and tesseract langs are the slow parts
+/// Run all checks. Scanner detection and tesseract langs are the slow parts
 /// (scanimage -L, tesseract --list-langs); everything else is a PATH lookup.
 /// Fully blocking (doctor + manual re-runs); the TUI startup uses
-/// [`run_checks_background`] instead so the UI can paint immediately.
+/// [`run_checks_fast`] + [`run_checks_slow`] instead so the UI can paint
+/// immediately. The report carries the resolved device (None when no
+/// scanner matched): manual re-runs rely on it to re-deliver the device
+/// to the actor.
 pub async fn run_checks(cfg: &Config) -> Report {
     let mut items = Vec::new();
 
@@ -141,13 +159,17 @@ pub async fn run_checks(cfg: &Config) -> Report {
     items.extend(lang_checks(cfg).await);
 
     // --- scanner detection (single scanimage -L call)
-    let (dev_items, _device) = detect_device(cfg).await;
+    let (dev_items, device) = detect_device(cfg).await;
     items.extend(dev_items);
 
     // --- output directory (create-if-missing, parity)
     push_output_check(cfg, &mut items);
 
-    Report { items, device: None }
+    Report {
+        items,
+        device,
+        source: ReportSource::ReRun,
+    }
 }
 
 /// Fast half of the checks: PATH lookups + output directory only (all
@@ -161,10 +183,14 @@ pub fn run_checks_fast(cfg: &Config) -> Report {
         pending_detail: Some("detecting...".into()),
         ..item("scanner", Status::Pending)
     });
-    Report { items, device: None }
+    Report {
+        items,
+        device: None,
+        source: ReportSource::StartupFast,
+    }
 }
 
-/// Slow half: tesseract langs + scanner detection, merged into a fast report.
+/// Slow half: tesseract langs + scanner detection, run concurrently.
 /// Runs as the background preflight task; `run_checks` = fast + this.
 pub async fn run_checks_slow(cfg: &Config) -> Report {
     let mut items = Vec::new();
@@ -176,6 +202,29 @@ pub async fn run_checks_slow(cfg: &Config) -> Report {
     Report {
         items,
         device: dev_res.1,
+        source: ReportSource::StartupFinal,
+    }
+}
+
+/// Startup final report = the fast half's items (PATH lookups, output dir)
+/// merged in front of the slow half's (langs + resolved scanner), with the
+/// fast report's pending scanner placeholder dropped in favor of the
+/// resolved one. The merge matters: without it the final report would
+/// consist of the slow half only, so fast-half failures (missing binary,
+/// unwritable output dir) would vanish from the stored report, the
+/// diagnostics overlay and the exit verdict once detection completes.
+pub fn merge_fast_slow(fast: &Report, slow: Report) -> Report {
+    let mut items: Vec<CheckItem> = fast
+        .items
+        .iter()
+        .filter(|i| i.status != Status::Pending)
+        .cloned()
+        .collect();
+    items.extend(slow.items);
+    Report {
+        items,
+        device: slow.device,
+        source: slow.source,
     }
 }
 
@@ -370,22 +419,6 @@ fn dir_writable(dir: &std::path::Path) -> bool {
     }
 }
 
-/// Preflight for the TUI: subset of checks that must pass before scanning.
-/// Returns (report, device); device is None when no scanner was found.
-pub async fn preflight(cfg: &Config) -> (Report, Option<Device>) {
-    let report = run_checks(cfg).await;
-    let device = report.device.clone();
-    (report, device)
-}
-
-/// Resolve the scanner device in the background (lean path: no full check
-/// suite, just `scanimage -L` + selection). Returns None when no scanner
-/// was found or the config device substring matched nothing.
-pub async fn detect_scanner(cfg: &Config) -> Option<Device> {
-    let devices = scan::list_devices().await.unwrap_or_default();
-    scan::select_device(&devices, &cfg.device).cloned()
-}
-
 /// Human-readable label for a device (parity with the old main.rs logic:
 /// label if set, else the SANE name, else "no scanner").
 pub fn device_label(d: Option<&Device>) -> String {
@@ -491,5 +524,48 @@ mod tests {
         assert_eq!(r.errors().len(), 1);
         assert_eq!(r.warnings().len(), 1);
         assert!(!r.ok());
+    }
+
+    #[test]
+    fn merge_fast_slow_drops_placeholder_keeps_failures() {
+        // Fast half: a failed PATH check + the Pending scanner placeholder.
+        let fast = Report {
+            items: vec![
+                CheckItem {
+                    what: "ocrmypdf (OCRmyPDF (searchable PDFs))".into(),
+                    status: Status::Fail,
+                    detail: String::new(),
+                    hint: None,
+                    pending_detail: None,
+                },
+                item("scanner", Status::Pending),
+            ],
+            device: None,
+            source: ReportSource::StartupFast,
+        };
+        // Slow half: the resolved scanner row replaces the placeholder.
+        let slow = Report {
+            items: vec![CheckItem {
+                what: "scanner".into(),
+                status: Status::Ok,
+                detail: "hpaio:/usb/x".into(),
+                hint: None,
+                pending_detail: None,
+            }],
+            device: Some(Device {
+                name: "hpaio:/usb/x".into(),
+                label: String::new(),
+            }),
+            source: ReportSource::StartupFinal,
+        };
+
+        let merged = merge_fast_slow(&fast, slow);
+        assert_eq!(merged.items.len(), 2, "placeholder dropped, fail kept");
+        assert_eq!(merged.items[0].status, Status::Fail, "fast fail survives");
+        assert_eq!(merged.items[1].what, "scanner");
+        assert!(merged.device.is_some());
+        assert_eq!(merged.source, ReportSource::StartupFinal);
+        // The verdict-relevant property: fast-half failures make !ok().
+        assert!(!merged.ok());
     }
 }
