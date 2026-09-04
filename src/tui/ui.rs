@@ -691,7 +691,13 @@ fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
     let Some(report) = &app.report else {
         let a = centered_rect(60, 8, area);
         f.render_widget(Clear, a);
-        f.render_widget(overlay_block("Diagnostics"), a);
+        let block = overlay_block("Diagnostics");
+        let inner = block.inner(a);
+        f.render_widget(block, a);
+        f.render_widget(
+            Paragraph::new("running checks...").wrap(Wrap { trim: false }),
+            inner,
+        );
         return;
     };
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
@@ -707,7 +713,25 @@ fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
                 "SKIP",
                 Style::default().fg(Color::Black).bg(Color::DarkGray),
             ),
+            Status::Pending => (
+                " ...",
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ),
         };
+        if item.status == Status::Pending {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" [{mark}] "), style),
+                Span::raw(item.what.clone()),
+                Span::styled(
+                    format!(
+                        " {}",
+                        item.pending_detail.as_deref().unwrap_or("running...")
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            continue;
+        }
         lines.push(Line::from(vec![
             Span::styled(format!(" [{mark}] "), style),
             Span::raw(item.what.clone()),

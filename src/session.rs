@@ -164,6 +164,11 @@ pub enum Cmd {
     RequestText(PageId),
     /// Query installed tesseract languages (reply via event).
     ListLangs,
+    /// Deliver the SANE device resolved by background detection. Accepted
+    /// silently and idempotently (re-application with the same name is a
+    /// no-op; a different name replaces it with a status note; empty names
+    /// are ignored so a failed re-detection can't downgrade a live device).
+    SetDevice(String),
 }
 
 /// Session-level facts sent with every page snapshot so the UI's header and
@@ -474,6 +479,9 @@ impl Session {
     pub fn guard(&self, cmd: &Cmd) -> Result<(), String> {
         match cmd {
             Cmd::ScanNext { .. } => {
+                if self.device.is_empty() {
+                    return Err("scanner detection still running".into());
+                }
                 if self.busy == Busy::Scanning {
                     return Err("scanner busy - press Esc to cancel".into());
                 }
@@ -493,6 +501,9 @@ impl Session {
                 Ok(())
             }
             Cmd::Rescan(id) => {
+                if self.device.is_empty() {
+                    return Err("scanner detection still running".into());
+                }
                 if self.busy == Busy::Scanning {
                     return Err("scanner busy - press Esc to cancel".into());
                 }
@@ -590,6 +601,8 @@ impl Session {
             // tick re-sends until the request applies.
             Cmd::RequestText(_) => Ok(()),
             Cmd::ListLangs => Ok(()),
+            // Applied silently in the handler (idempotent); never "blocked".
+            Cmd::SetDevice(_) => Ok(()),
         }
     }
 
@@ -618,7 +631,28 @@ impl Session {
                 let langs = scan::available_langs().await.unwrap_or_default();
                 self.push(Event::Langs(langs));
             }
+            Cmd::SetDevice(name) => self.set_device(name),
         }
+    }
+
+    /// Apply a resolved device (background detection). Silent + idempotent:
+    /// same name = no-op; a different name replaces it (user re-ran
+    /// diagnostics after swapping scanners) with a status note; empty is
+    /// ignored so a failed detection can never clear a working device.
+    /// Also pushes a Pages snapshot so the UI observes readiness via meta.
+    fn set_device(&mut self, name: String) {
+        if name.is_empty() || name == self.device {
+            return;
+        }
+        let replaced = !self.device.is_empty();
+        self.device = name;
+        tracing::info!("session device set: {}", self.device);
+        if replaced {
+            self.status(format!("scanner changed: {}", self.device));
+        } else {
+            self.status(format!("scanner ready: {}", self.device));
+        }
+        self.notify_pages();
     }
 
     /// A job finished; update state and chain the next stage.
@@ -1935,6 +1969,58 @@ mod tests {
         s.handle_job_done(ocr_ok(1, img, 1, "ghost")).await;
         assert!(s.jobs.is_empty(), "orphaned entry removed");
         assert!(s.guard(&Cmd::NewSession).is_ok());
+    }
+
+    /// Session with no device yet (fresh startup state, pre-SetDevice).
+    fn test_session_undetected() -> (Session, tempfile::TempDir) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        let cfg = Config {
+            output: dir.path().join("out"),
+            ..Config::default()
+        };
+        let (event_tx, _event_rx) = mpsc::channel(256);
+        let (job_tx, _job_rx) = mpsc::unbounded_channel();
+        let session = Session::with_channels(cfg, String::new(), event_tx, job_tx)
+            .expect("session with temp state dir");
+        match prev {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        (session, dir)
+    }
+
+    #[tokio::test]
+    async fn scan_blocked_until_device_is_set() {
+        let (mut s, _dir) = test_session_undetected();
+        // Empty device: guard rejects scanning before detection delivers.
+        assert_eq!(
+            s.guard(&Cmd::ScanNext { dpi: 300, mode: "gray".into() }),
+            Err("scanner detection still running".into())
+        );
+        assert!(s.guard(&Cmd::Rescan(1)).is_err());
+        assert!(s.device.is_empty());
+
+        s.handle(Cmd::SetDevice("hpaio:/usb/x".into())).await;
+        assert_eq!(s.device, "hpaio:/usb/x");
+        assert!(s.guard(&Cmd::ScanNext { dpi: 300, mode: "gray".into() }).is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_device_is_idempotent_and_never_empties() {
+        let (mut s, _dir) = test_session_undetected();
+        s.handle(Cmd::SetDevice("hpaio:/usb/x".into())).await;
+        // Same name again: silent no-op.
+        s.handle(Cmd::SetDevice("hpaio:/usb/x".into())).await;
+        assert_eq!(s.device, "hpaio:/usb/x");
+        // Empty name (failed re-detection) never clears a working device.
+        s.handle(Cmd::SetDevice(String::new())).await;
+        assert_eq!(s.device, "hpaio:/usb/x");
+        // A different name replaces it (scanner swapped mid-session).
+        s.handle(Cmd::SetDevice("escl:http://y".into())).await;
+        assert_eq!(s.device, "escl:http://y");
     }
 
     #[tokio::test]

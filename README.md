@@ -86,6 +86,13 @@ auto-scanner-ocr --doctor     # check dependencies and scanner, then exit
 auto-scanner-ocr --help       # all options
 ```
 
+Startup is near-instant: the TUI paints in well under a second while the
+scanner detection (`scanimage -L`, the slow part) and dependency checks run
+in the background — the header shows `detecting...` and scanning unlocks
+(`s`) the moment your device is found, typically within a few seconds.
+Pressing `s` early buffers the scan intent; it fires automatically as soon
+as the scanner is detected.
+
 Inside the TUI:
 
 | Key | Action |
@@ -221,8 +228,10 @@ isolated child process.
   language data, scanner detection and the output directory, and prints
   install hints for anything missing. Inside the TUI, `!` shows the same
   checks with `r` to re-run them.
-- The TUI runs the same checks at startup; if something is missing you'll see
-  the diagnostics screen immediately instead of a mid-scan failure.
+- The TUI runs the same checks at startup (in the background); if something
+  is missing you'll see the diagnostics screen automatically instead of a
+  mid-scan failure. The `r` re-run inside diagnostics is non-blocking — the
+  UI stays responsive while checks execute.
 - **Wrong umlauts in the OCR text (`fiir` instead of `für`)?** Your `langs`
   mixes two language models — pick the document's language alone with `L`
   (or set `langs = "deu"` in the config). Mixed-language OCR reliably garbles

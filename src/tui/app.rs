@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 use crate::backend::pdf::BuildOutcome;
-use crate::check::Report;
+use crate::check::{self, Report};
 use crate::config::{Config, PreviewOcr};
 use crate::notify::{self, Urgency};
 use crate::session::{self, Busy, Event, PageStatus, PageView, SessionMeta};
@@ -68,12 +68,27 @@ pub struct App {
     pub status_scroll: usize,
     pub text_scroll: usize,
     pub meta: Option<SessionMeta>,
+    /// Header label; "detecting..." until background scanner detection
+    /// resolves, then the device label (or "no scanner" on failure).
     pub device_label: String,
     pub overlay: Option<Overlay>,
     pub quit_requested: bool,
     pub last_result: Option<(PathBuf, u64, bool)>, // path, kb, searchable
     pub report: Option<Report>,
+    /// Request channel for non-blocking check runs (diagnostics re-run).
     pub diagnostics_request_tx: mpsc::Sender<mpsc::Sender<Report>>,
+    /// True once the final startup report has arrived with a usable device
+    /// and no errors. Drives the exit code; set ONLY by the startup
+    /// delivery (never by fast reports or manual re-runs).
+    pub startup_report_ok: Option<bool>,
+    /// True while the actor's device is still unknown (detection running).
+    /// Gates scanning; `s` presses buffer instead of firing.
+    pub device_known: bool,
+    /// A scan intent buffered while detection was still running; fired by
+    /// the tick once the device is known (never re-fired afterwards).
+    pub pending_scan: bool,
+    /// True while an async check run is in flight (guards double-`r`).
+    pub checks_in_flight: bool,
     pub langs_cache: Vec<String>,
     pub picker_available: bool,
     /// Pane geometry from the last frame (hit-testing + preview sync).
@@ -88,14 +103,13 @@ pub struct App {
 impl App {
     pub fn new(
         cfg: Config,
-        device_label: String,
         diagnostics_request_tx: mpsc::Sender<mpsc::Sender<Report>>,
     ) -> Self {
         let settings = Settings {
             dpi: cfg.dpi,
             mode: cfg.mode.clone(),
         };
-        let mut status_lines = vec!["ready - press s to scan, ? for help".into()];
+        let mut status_lines = vec!["detecting scanner - press ? for help".into()];
         // Only real language mixes (e.g. eng+deu) garble umlauts; a script
         // model like Latin alongside one language is safe (and fixes §).
         let lang_count = cfg
@@ -118,18 +132,30 @@ impl App {
             status_scroll: 0,
             text_scroll: 0,
             meta: None,
-            device_label,
+            device_label: "detecting...".to_string(),
             overlay: None,
             quit_requested: false,
             last_result: None,
             report: None,
             diagnostics_request_tx,
+            startup_report_ok: None,
+            device_known: false,
+            pending_scan: false,
+            checks_in_flight: false,
             langs_cache: Vec::new(),
             picker_available: false,
             pane_rects: None,
             preview_cells: Vec::new(),
             tick: 0,
         }
+    }
+
+    /// Whether scanning may start: the actor's device must be known and
+    /// all other preconditions met. Mirrors the actor-side guard.
+    fn scan_allowed(&self) -> bool {
+        self.device_known
+            && matches!(self.busy(), Busy::Idle)
+            && !self.meta.as_ref().is_some_and(|m| m.finished)
     }
 
     pub fn selected_page(&self) -> Option<&PageView> {
@@ -184,8 +210,9 @@ impl App {
         let finished = self.meta.as_ref().is_some_and(|m| m.finished);
         match action {
             // Scanning overlaps with per-page processing (scanner is the
-            // exclusive resource; jobs run in the background).
-            Action::Scan => matches!(busy, Busy::Idle) && !finished,
+            // exclusive resource; jobs run in the background). Requires a
+            // known device (background detection must have delivered one).
+            Action::Scan => self.scan_allowed(),
             // Mirrors the actor guard: a live per-page job (preview OCR or
             // rotate, visible as text_pending or a non-Ready status) blocks
             // rescan/rotate of that page.
@@ -267,13 +294,18 @@ pub enum CommandAction {
 }
 
 /// Run the TUI. Owns the terminal, event stream, preview worker, and the
-/// session actor's event channel.
+/// session actor's event channel. Returns true when the startup environment
+/// report finished OK (device found, no failed checks); the caller maps
+/// this to the process exit code.
 pub struct TuiInit {
     pub cfg: Config,
-    pub device_label: String,
-    pub report: Option<Report>,
     pub picker: ratatui_image::picker::Picker,
     pub picker_available: bool,
+    /// Report inbox ends: the startup preflight task sends the fast report
+    /// first, then the final report; diagnostics re-runs send theirs here
+    /// too. One consumer branch keeps the ordering rules in one place.
+    pub report_tx: mpsc::Sender<Report>,
+    pub report_rx: mpsc::Receiver<Report>,
 }
 
 pub async fn run_tui(
@@ -281,26 +313,23 @@ pub async fn run_tui(
     init: TuiInit,
     mut event_rx: mpsc::Receiver<Event>,
     cmd_tx: mpsc::Sender<session::Cmd>,
-) -> Result<()> {
+) -> Result<bool> {
     let TuiInit {
         cfg,
-        device_label,
-        report: initial_report,
         picker,
         picker_available,
+        report_tx,
+        report_rx,
     } = init;
+    let mut report_rx = report_rx;
     let (diag_tx, mut diag_rx) = mpsc::channel::<mpsc::Sender<Report>>(4);
-    let mut app = App::new(cfg.clone(), device_label, diag_tx);
+    let mut app = App::new(cfg.clone(), diag_tx);
     app.picker_available = picker_available;
-    app.report = initial_report.clone();
-    if initial_report.is_some_and(|r| !r.ok()) {
-        app.overlay = Some(Overlay::Diagnostics);
-    }
 
     let mut preview = PreviewWorker::new(picker);
     tracing::info!(
         "image preview protocol: {}",
-        if picker_available {
+        if app.picker_available {
             "native (sixel/kitty)"
         } else {
             "halfblocks"
@@ -333,23 +362,41 @@ pub async fn run_tui(
                         handle_event(&mut app, &cmd_tx, ev).await?;
                     }
                     Some(Err(e)) => return Err(anyhow::anyhow!("terminal event error: {e}")),
-                    None => return Ok(()),
+                    None => return Ok(false),
                 }
             }
             // Session actor events.
             Some(ev) = event_rx.recv() => {
                 handle_session_event(&mut app, ev).await;
             }
-            // Diagnostics results.
+            // Preflight/diagnostics reports (startup fast+final, manual
+            // re-runs). One inbox keeps the ordering rules in one place.
+            Some(report) = report_rx.recv() => {
+                apply_report(&mut app, report, &cmd_tx).await;
+            }
+            // Diagnostics re-run requests (r in the overlay): run the full
+            // check suite in a background task so the UI never freezes.
+            // The requester holds the receiving end; dropping it without
+            // a send acknowledges "request ignored".
             Some(tx) = diag_rx.recv() => {
-                let report = crate::check::run_checks(&app.cfg).await;
-                app.report = Some(report.clone());
-                let _ = tx.send(report).await;
+                if !app.checks_in_flight {
+                    app.checks_in_flight = true;
+                    app.set_status("re-running checks...");
+                    let cfg = app.cfg.clone();
+                    let report_tx = report_tx.clone();
+                    tokio::spawn(async move {
+                        let report = check::run_checks(&cfg).await;
+                        let _ = report_tx.send(report).await;
+                        drop(tx); // ack: request accepted
+                    });
+                }
+                // else: tx dropped without send -> requester's recv() ends.
             }
             // Periodic tick: elapsed timers, spinner frames, and the lazy
             // preview-OCR request for the selected page.
             _ = tick.tick() => {
                 app.tick = app.tick.wrapping_add(1);
+                fire_pending_scan(&mut app, &cmd_tx).await;
                 request_text_if_needed(&app, &cmd_tx).await;
             }
         }
@@ -362,7 +409,7 @@ pub async fn run_tui(
     // Quitting deletes the session dir (via the session actor's Drop):
     // un-built pages are gone unless a PDF build was in flight, in which
     // case the dir survives for the next startup's sweep.
-    Ok(())
+    Ok(app.startup_report_ok.unwrap_or(false))
 }
 
 async fn handle_session_event(app: &mut App, ev: Event) {
@@ -446,6 +493,83 @@ async fn handle_session_event(app: &mut App, ev: Event) {
     }
 }
 
+/// A report arrived (startup fast/final or a manual diagnostics re-run).
+/// Ordering matters: store -> header label -> actor device -> exit-code
+/// flag -> auto-open overlay -> fire a buffered scan.
+async fn apply_report(app: &mut App, report: Report, cmd_tx: &mpsc::Sender<session::Cmd>) {
+    let settled = report.settled();
+    let device = report.device.clone();
+    app.report = Some(report);
+    app.checks_in_flight = false;
+
+    if !settled {
+        // Fast (still-detecting) report. Real failures in it (missing
+        // binaries etc.) are worth surfacing immediately, but never steal
+        // focus from a dialog the user opened meanwhile.
+        if !app.report.as_ref().is_some_and(|r| r.ok())
+            && app.overlay.is_none()
+        {
+            app.overlay = Some(Overlay::Diagnostics);
+        }
+        return;
+    }
+
+    // Final/settled report: the scanner question is answered.
+    if let Some(d) = &device {
+        app.device_label = check::device_label(Some(d));
+        app.device_known = true;
+        // Delivery to the actor (it ignores empty/duplicate names).
+        let _ = cmd_tx.send(session::Cmd::SetDevice(d.name.clone())).await;
+    } else {
+        app.device_label = "no scanner".to_string();
+        app.device_known = false;
+    }
+
+    // Startup exit-code semantics: upgrade-only (None -> Some(true)).
+    // Never downgraded by later re-runs; never set by a failed/pending
+    // report. A quit while still detecting stays None -> exit 1 (parity
+    // with the old no-report path).
+    if app.startup_report_ok.is_none()
+        && device.is_some()
+        && app.report.as_ref().is_some_and(|r| r.ok())
+    {
+        app.startup_report_ok = Some(true);
+    }
+
+    // Auto-open diagnostics on failure (final reports AND fast reports
+    // with real fails), guarded so a user-opened overlay is preserved.
+    if !app.report.as_ref().is_some_and(|r| r.ok()) && app.overlay.is_none() {
+        app.overlay = Some(Overlay::Diagnostics);
+        if device.is_none() {
+            app.set_status("no scanner found - see diagnostics (press ! to reopen)");
+        }
+    }
+
+    // A scan intent buffered during detection: fire it now that the device
+    // is known, or drop it with a hint when detection found nothing.
+    if app.pending_scan {
+        if device.is_some() {
+            app.set_status("scanner ready - starting buffered scan");
+            // The tick fires it (re-checks guards); keep the buffer set.
+        } else {
+            app.pending_scan = false;
+            app.set_status("no scanner found - buffered scan dropped");
+        }
+    }
+}
+
+/// Tick-driven buffered-scan fire: self-healing (unlike an event-triggered
+/// fire, a tick can't be lost). Re-checks all scan guards at fire time.
+async fn fire_pending_scan(app: &mut App, cmd_tx: &mpsc::Sender<session::Cmd>) {
+    if !app.pending_scan || !app.scan_allowed() {
+        return;
+    }
+    app.pending_scan = false;
+    let dpi = app.settings.dpi;
+    let mode = app.settings.mode.clone();
+    let _ = cmd_tx.send(session::Cmd::ScanNext { dpi, mode }).await;
+}
+
 #[derive(Debug)]
 enum UiAction {
     None,
@@ -523,7 +647,20 @@ async fn handle_key(
 
         // ---------------- scanning
         Char('s') => {
-            send(app, cmd_tx, CommandAction::ScanNext).await;
+            if app.scan_allowed() {
+                send(app, cmd_tx, CommandAction::ScanNext).await;
+            } else if !app.device_known {
+                // Detection still running: buffer the intent (fired by the
+                // tick once the device arrives) instead of a doomed scan.
+                if !app.pending_scan {
+                    app.pending_scan = true;
+                    app.set_status("waiting for scanner - scan will start when detected");
+                }
+            } else if app.busy() == Busy::Finishing {
+                app.set_status("blocked: building PDF - scan once it finishes");
+            } else if app.meta.as_ref().is_some_and(|m| m.finished) {
+                app.set_status("blocked: PDF already built - press n for a new session");
+            }
         }
         Esc | Char('c') if app.action_allowed(Action::Cancel) => {
             send(app, cmd_tx, CommandAction::CancelScan).await;
@@ -810,7 +947,7 @@ mod tests {
     /// App with throwaway channels; meta/pages are set per-test.
     fn test_app() -> App {
         let (diag_tx, _diag_rx) = mpsc::channel(4);
-        App::new(Config::default(), "fake scanner".into(), diag_tx)
+        App::new(Config::default(), diag_tx)
     }
 
     fn ready_page(id: u32) -> PageView {
@@ -913,5 +1050,141 @@ mod tests {
             matches!(app.overlay, Some(Overlay::Confirm(_))),
             "still-valid confirm survives"
         );
+    }
+
+    fn device(name: &str) -> crate::check::Device {
+        crate::check::Device {
+            name: name.into(),
+            label: "Test Scanner".into(),
+        }
+    }
+
+    /// A report whose scanner item carries the given status.
+    fn report_with(device: Option<crate::check::Device>, status: crate::check::Status) -> Report {
+        let mut r = Report::default();
+        r.items.push(crate::check::CheckItem {
+            what: "scanner".into(),
+            status,
+            detail: String::new(),
+            hint: None,
+            pending_detail: None,
+        });
+        r.device = device;
+        r
+    }
+
+    #[tokio::test]
+    async fn report_arrival_sets_device_and_exit_flag() {
+        let mut app = test_app();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+
+        // Fast (pending) report: device stays unknown, no SetDevice, no
+        // exit flag.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Pending),
+            &cmd_tx,
+        )
+        .await;
+        assert!(!app.device_known);
+        assert_eq!(app.device_label, "detecting...");
+        assert!(app.startup_report_ok.is_none());
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no SetDevice on fast report"
+        );
+
+        // Final report with device: label, device_known, SetDevice, flag.
+        apply_report(
+            &mut app,
+            report_with(Some(device("hpaio:/usb/x")), crate::check::Status::Ok),
+            &cmd_tx,
+        )
+        .await;
+        assert_eq!(app.device_label, "Test Scanner");
+        assert!(app.device_known);
+        assert_eq!(app.startup_report_ok, Some(true));
+        match cmd_rx.try_recv() {
+            Ok(session::Cmd::SetDevice(name)) => assert_eq!(name, "hpaio:/usb/x"),
+            other => panic!("expected SetDevice, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn report_failure_opens_diagnostics_only_when_unobstructed() {
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(app.overlay.is_some(), "failure auto-opens diagnostics");
+        assert_eq!(app.device_label, "no scanner");
+        assert_eq!(app.startup_report_ok, None);
+
+        // A user-opened overlay is never clobbered by auto-open.
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Help);
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            matches!(app.overlay, Some(Overlay::Help)),
+            "auto-open must not clobber a user dialog"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_scan_fires_on_tick_after_device_arrives() {
+        let mut app = test_app();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        app.pending_scan = true;
+        assert!(!app.scan_allowed(), "no device yet");
+
+        apply_report(
+            &mut app,
+            report_with(Some(device("hpaio:/x")), crate::check::Status::Ok),
+            &cmd_tx,
+        )
+        .await;
+        assert!(app.device_known);
+        assert!(app.pending_scan, "still buffered until the tick fires");
+
+        fire_pending_scan(&mut app, &cmd_tx).await;
+        assert!(!app.pending_scan);
+        // First message is the SetDevice from apply_report, second the scan.
+        let _ = cmd_rx.recv().await;
+        match cmd_rx.recv().await {
+            Some(session::Cmd::ScanNext { dpi, mode }) => {
+                assert_eq!(dpi, Config::default().dpi);
+                assert_eq!(mode, "gray");
+            }
+            other => panic!("expected ScanNext, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_scan_dropped_when_detection_fails() {
+        let mut app = test_app();
+        app.pending_scan = true;
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(!app.pending_scan, "no device -> buffered intent dropped");
+        assert!(!app.device_known);
+    }
+
+    #[tokio::test]
+    async fn scan_not_allowed_while_device_unknown() {
+        let app = test_app();
+        assert!(!app.scan_allowed());
+        assert!(!app.action_allowed(Action::Scan));
     }
 }
