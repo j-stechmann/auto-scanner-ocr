@@ -129,7 +129,8 @@ else
         /rpmtop/'"$STAGE.spec"
 fi
 rm -rf "$RPMDIR/$STAGED_BIN"
-mv "rpmbuild"/RPMS/"$RPM_ARCH"/"$PKG-$VERSION"-1*.rpm \
+# The (emulated) container runs as root, so the rpm file is root-owned.
+sudo mv "rpmbuild"/RPMS/"$RPM_ARCH"/"$PKG-$VERSION"-1*.rpm \
     "$DIST/$PKG-$VERSION${SUFFIX:+-$SUFFIX}-$TRIPLE.rpm"
 
 # ----------------------------------------------------------------- report ---
