@@ -2,7 +2,7 @@
 # Package a cross-compiled auto-scanner-ocr binary into release artifacts:
 # a tarball, a .deb and an .rpm, named auto-scanner-ocr-<version>[-<suffix>]-<triple>.
 #
-# Usage: package-dist.sh <target-dir> <triple> <version> [--deb-arch A] [--rpm-arch A] [--suffix S]
+# Usage: package-dist.sh <target-dir> <triple> <version> [--deb-arch A] [--rpm-arch A] [--rpm-machine M] [--suffix S]
 set -euo pipefail
 
 TARGET_DIR=$1
@@ -12,13 +12,15 @@ shift 3
 
 DEB_ARCH=any
 RPM_ARCH=noarch
+RPM_MACHINE=      # docker --platform for QEMU-emulated native rpm builds
 SUFFIX=
 
 while [ $# -gt 0 ]; do
     case $1 in
-        --deb-arch) DEB_ARCH=$2; shift 2 ;;
-        --rpm-arch) RPM_ARCH=$2; shift 2 ;;
-        --suffix)   SUFFIX=$2; shift 2 ;;
+        --deb-arch)    DEB_ARCH=$2; shift 2 ;;
+        --rpm-arch)    RPM_ARCH=$2; shift 2 ;;
+        --rpm-machine) RPM_MACHINE=$2; shift 2 ;;
+        --suffix)      SUFFIX=$2; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -75,14 +77,14 @@ dpkg-deb --build --root-owner-group "$DEBROOT" \
     "$DIST/$PKG-$VERSION${SUFFIX:+-$SUFFIX}-$TRIPLE.deb"
 
 # -------------------------------------------------------------------- rpm ---
-# Absolute binary path: %install runs with cwd=rpmbuild/BUILD, so relative
-# paths from the repo root would not resolve.
+# rpmbuild's arch check ("No compatible architectures found for build")
+# is keyed on the *host* machine in every rpm (Ubuntu and Fedora alike),
+# so cross-arch rpmbuild is impossible by design. For foreign targets we
+# run rpmbuild natively inside a QEMU-emulated Fedora container of that
+# arch (docker + binfmt on the runner); x86_64 stays on the host.
 BIN_ABS=$(readlink -f "$BIN")
-# The package arch comes from BuildArch in the spec; no --target is passed.
-# ("No compatible architectures found for build" is what Debian's rpm says
-# for cross targets it has no platform config for — BuildArch avoids that
-# machinery entirely; %install is arch-agnostic, it just copies a binary.)
-cat > "$STAGE.spec" <<EOF
+SPEC=$STAGE.spec
+cat > "$SPEC" <<EOF
 Name:           $PKG
 Version:        $VERSION
 Release:        1%{?dist}
@@ -102,18 +104,25 @@ install -Dm 0755 $BIN_ABS %{buildroot}/usr/bin/$PKG
 %files
 /usr/bin/$PKG
 EOF
-rpmbuild -bb --define "_topdir $PWD/rpmbuild" \
-    --define "debug_package %{nil}" \
-    --define "__os_install_post %{nil}" \
-    --define "_target_cpu $RPM_ARCH" \
-    --define "_target_platform ${RPM_ARCH}-linux-gnu" \
-    --target "$RPM_ARCH" "$STAGE.spec" 2>/dev/null || \
-rpmbuild -bb --define "_topdir $PWD/rpmbuild" \
-    --define "debug_package %{nil}" \
-    --define "__os_install_post %{nil}" \
-    --define "_target_cpu $RPM_ARCH" \
-    --define "_target_platform ${RPM_ARCH}-linux-gnu" \
-    "$STAGE.spec"
+
+RPMDIR=$PWD/rpmbuild
+if [ "$RPM_ARCH" = "x86_64" ]; then
+    rpmbuild -bb --define "_topdir $RPMDIR" \
+        --define "debug_package %{nil}" \
+        --define "__os_install_post %{nil}" \
+        --define "source_date_epoch_from_changelog %{nil}" \
+        "$SPEC"
+else
+    # The spec embeds an absolute $BIN_ABS; the container sees the whole repo.
+    docker run --rm --platform "$RPM_MACHINE" \
+        -v "$PWD":/io -w /io fedora:41 bash -lc '
+        dnf install -y rpm-build >/dev/null &&
+        rpmbuild -bb --define "_topdir /io/rpmbuild" \
+            --define "debug_package %{nil}" \
+            --define "__os_install_post %{nil}" \
+            --define "source_date_epoch_from_changelog %{nil}" \
+            /io/'"$SPEC"
+fi
 mv "rpmbuild/RPMS/$RPM_ARCH/$PKG-$VERSION-1.$RPM_ARCH.rpm" \
     "$DIST/$PKG-$VERSION${SUFFIX:+-$SUFFIX}-$TRIPLE.rpm"
 

@@ -31,18 +31,22 @@ jobs:
             glibc: 2.31
             deb-arch: arm64
             rpm-arch: aarch64
+            rpm-machine: linux/arm64
           - target: aarch64-unknown-linux-musl
             deb-arch: arm64
             rpm-arch: aarch64
+            rpm-machine: linux/arm64
             suffix: musl
           - target: armv7-unknown-linux-gnueabihf
             glibc: 2.31
             deb-arch: armhf
             rpm-arch: armv7hl
+            rpm-machine: linux/arm/v7
           - target: riscv64gc-unknown-linux-gnu
             glibc: 2.31
             deb-arch: riscv64
             rpm-arch: riscv64
+            rpm-machine: linux/riscv64
     env:
       VERSION: ${{ github.ref_name }}
     steps:
@@ -81,13 +85,15 @@ jobs:
 
       - name: Package (tar.gz + deb + rpm)
         run: |
-          sudo apt-get update && sudo apt-get install -y rpm
+          sudo apt-get update && sudo apt-get install -y rpm qemu-user-static
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
           scripts/package-dist.sh \
             target/${{ matrix.target }}/release \
             ${{ matrix.target }} \
             "${VERSION#v}" \
             --deb-arch "${{ matrix.deb-arch }}" \
             --rpm-arch "${{ matrix.rpm-arch }}" \
+            --rpm-machine "${{ matrix.rpm-machine }}" \
             --suffix "${{ matrix.suffix }}"
         env:
           VERSION: ${{ github.ref_name }}
