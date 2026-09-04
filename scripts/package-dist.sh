@@ -88,7 +88,8 @@ RPMDIR=$PWD/rpmbuild
 STAGED_BIN=rpmtop-staged/usr/bin/$PKG
 mkdir -p "$RPMDIR/$(dirname "$STAGED_BIN")"
 install -m 0755 "$BIN" "$RPMDIR/$STAGED_BIN"
-cat > "$STAGE.spec" <<EOF
+SPEC=$RPMDIR/$STAGE.spec
+cat > "$SPEC" <<EOF
 Name:           $PKG
 Version:        $VERSION
 Release:        1%{?dist}
@@ -115,7 +116,7 @@ if [ "$RPM_ARCH" = "x86_64" ]; then
         --define "debug_package %{nil}" \
         --define "__os_install_post %{nil}" \
         --define "source_date_epoch_from_changelog %{nil}" \
-        "$PWD/$STAGE.spec"
+        "$SPEC"
 else
     docker run --rm --platform "$RPM_MACHINE" \
         -v "$RPMDIR":/rpmtop \
