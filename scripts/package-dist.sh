@@ -118,9 +118,12 @@ if [ "$RPM_ARCH" = "x86_64" ]; then
         --define "source_date_epoch_from_changelog %{nil}" \
         "$SPEC"
 else
+    # fedora:41 publishes only amd64/arm64 manifests; debian:trixie ships
+    # armv7 + riscv64 too, and under QEMU emulation the host-keyed arch
+    # check passes natively for all three.
     docker run --rm --platform "$RPM_MACHINE" \
         -v "$RPMDIR":/rpmtop \
-        fedora:41 bash -lc 'dnf install -y rpm-build >/dev/null && rpmbuild -bb \
+        debian:trixie bash -c 'apt-get update -qq >/dev/null && apt-get install -y -qq rpm >/dev/null && rpmbuild -bb \
         --define "_topdir /rpmtop" \
         --define "_stagedbin /rpmtop/'"$STAGED_BIN"'" \
         --define "debug_package %{nil}" \
