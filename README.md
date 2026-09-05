@@ -39,8 +39,8 @@ No daemons, no web servers: you run it in a terminal when you want to scan.
 - `poppler-utils` for `pdfunite` (only needed when one session mixes DPIs)
 - `unpaper` (optional; only for the unpaper cleanup modes)
 - `libnotify` for notifications (optional)
-- `zenity`, `kdialog` or `yad` for the save dialog at finish (optional; the
-  default path is used without one)
+- `zenity`, `kdialog` or `yad` for the save dialog at finish (optional;
+  without one, the finish confirm dialog just shows the default path)
 - A SANE-compatible scanner (USB-only models like the Deskjet 1050a work fine)
 
 ## Install
@@ -125,8 +125,9 @@ you view the page). Press `f` when done; the PDF lands in
 `~/Documents/scans/` as `YYYY-MM-DD_HHMMSS.pdf` by default — the system
 save dialog (zenity/kdialog/yad when installed) opens first, so you can
 pick another folder and/or filename; overwriting an existing file asks for
-confirmation. Without a dialog tool, the build goes straight to the
-default path.
+confirmation. Without a dialog tool, the confirm dialog shows the default
+path instead. Cancelling the save dialog aborts the finish (press `f`
+again to retry).
 
 **Small print**: the default is 300 dpi — the OCR sweet spot, 2–3× faster
 per capture and fine for normal 10–12pt text. For dense small print use

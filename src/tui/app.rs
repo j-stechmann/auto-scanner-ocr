@@ -106,11 +106,14 @@ pub struct App {
     pub preview_cells: Vec<(crate::session::PageId, Rect)>,
     /// Spinner frame counter (bumped on ticks).
     pub tick: u64,
+    /// True while a spawned system save dialog is still open: `f` must not
+    /// stack a second native dialog on top (the first one's result would
+    /// arrive out of order). Cleared when its outcome is consumed.
+    pub dialog_in_flight: bool,
     /// Inbox for the system save-dialog task: `f` spawns the native dialog
-    /// (zenity/kdialog/yad) and it reports the chosen path here — None =
-    /// cancelled or no tool installed (then the plain confirm dialog is
-    /// used). Consumed by the run_tui select loop.
-    pub finish_tx: mpsc::Sender<Option<PathBuf>>,
+    /// (zenity/kdialog/yad) and it reports the outcome here — see
+    /// `SaveChoice`. Consumed by the run_tui select loop.
+    pub finish_tx: mpsc::Sender<crate::backend::filedialog::SaveChoice>,
 }
 
 impl App {
@@ -159,6 +162,7 @@ impl App {
             pane_rects: None,
             preview_cells: Vec::new(),
             tick: 0,
+            dialog_in_flight: false,
             finish_tx,
         }
     }
@@ -347,9 +351,9 @@ pub async fn run_tui(
     } = init;
     let mut report_rx = report_rx;
     let (diag_tx, mut diag_rx) = mpsc::channel::<()>(4);
-    // Save-dialog inbox: `f` spawns the native dialog task; its chosen
-    // path arrives here (None = cancelled / no tool installed).
-    let (finish_tx, mut finish_rx) = mpsc::channel::<Option<PathBuf>>(1);
+    // Save-dialog inbox: `f` spawns the native dialog task; its outcome
+    // arrives here (see SaveChoice).
+    let (finish_tx, mut finish_rx) = mpsc::channel::<crate::backend::filedialog::SaveChoice>(1);
     let mut app = App::new(cfg.clone(), diag_tx);
     app.finish_tx = finish_tx;
     app.picker_available = picker_available;
@@ -792,12 +796,14 @@ async fn handle_key(
         }
 
         // ---------------- finish / open / session
-        Char('f') => {
+        Char('f') if app.action_allowed(Action::Finish) && !app.dialog_in_flight => {
             // Delegate path choice to the system save dialog (zenity/
             // kdialog/yad) in a background task: the dialog is a blocking
             // native window and must never run in the select loop. The
-            // chosen path is delivered as an Event; without any dialog
-            // tool the plain confirm dialog (default path) is used.
+            // outcome is delivered via finish_tx; without any dialog tool
+            // the plain confirm dialog (default path) is used. The guard
+            // keeps the footer's greyed-out `f` honest and prevents
+            // stacking a second dialog while one is open.
             let path = app
                 .meta
                 .as_ref()
@@ -813,6 +819,7 @@ async fn handle_key(
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let event_tx = app.finish_tx.clone();
+            app.dialog_in_flight = true;
             tokio::spawn(async move {
                 let chosen =
                     crate::backend::filedialog::save_dialog(&dir, &filename, "Save PDF as").await;
@@ -933,17 +940,21 @@ pub fn next_dpi(current: u16, dir: i32) -> u16 {
     }
 }
 
-/// Result of the system save-dialog task for `f`: Some(path) = user picked
-/// a target (overwrite already confirmed inside the dialog), None =
-/// cancelled or no dialog tool installed (fall back to the plain confirm
-/// dialog with the reserved default path).
+/// Result of the system save-dialog task for `f`: `Chosen(path)` = user
+/// picked a target (overwrite already confirmed inside the dialog),
+/// `Cancelled` = the user dismissed the dialog (do nothing — they have not
+/// changed their mind about building, and must not be railroaded into the
+/// default-path confirm), `Unavailable` = no dialog tool installed (fall
+/// back to the plain confirm dialog with the reserved default path).
 async fn handle_dialog_result(
     app: &mut App,
-    chosen: Option<PathBuf>,
+    chosen: crate::backend::filedialog::SaveChoice,
     cmd_tx: &mpsc::Sender<session::Cmd>,
 ) {
+    use crate::backend::filedialog::SaveChoice;
+    app.dialog_in_flight = false;
     match chosen {
-        Some(out) => {
+        SaveChoice::Chosen(out) => {
             app.set_status(format!("saving to {}", out.display()));
             let _ = cmd_tx
                 .send(session::Cmd::FinishTo {
@@ -953,7 +964,10 @@ async fn handle_dialog_result(
                 })
                 .await;
         }
-        None => {
+        SaveChoice::Cancelled => {
+            app.set_status("save dialog cancelled - press f to try again");
+        }
+        SaveChoice::Unavailable => {
             let path = app
                 .meta
                 .as_ref()

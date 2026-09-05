@@ -393,8 +393,12 @@ pub fn reserve_target(path: &Path, allow_existing: bool) -> Result<PathBuf> {
         // path must still be a regular file; metadata above proved it.
         return Ok(path.to_path_buf());
     }
-    // Missing (or raced): create the zero-byte placeholder exclusively, so
-    // two concurrent sessions cannot claim the same user path.
+    // Missing (or raced): create the zero-byte placeholder exclusively.
+    // O_EXCL only guarantees the CREATE side: a session arriving after
+    // another's placeholder exists adopts it above (zero-byte), so two
+    // concurrent builds on the same user path both proceed and the last
+    // rename wins — acceptable for a UI where each session opens its own
+    // dialog, not the mutual exclusion the comment used to claim.
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

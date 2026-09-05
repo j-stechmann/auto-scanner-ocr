@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Choose where to save at finish**: `f` opens the system save dialog
   (zenity, kdialog or yad — whichever is installed) for folder + filename,
   with the default timestamped path pre-filled and the dialog's native
-  overwrite prompt. Without any dialog tool the old confirm dialog (default
-  path) is used, so the finish flow never breaks
+  overwrite prompt. Cancelling the dialog aborts the finish. Without any
+  dialog tool the old confirm dialog (default path) is used, so the finish
+  flow never breaks
 
 ## [0.2.1] - 2026-09-05
 

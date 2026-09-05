@@ -51,15 +51,16 @@ impl Confirm {
         }
     }
 
+    /// Plain confirm for the default path (no save-dialog tool installed).
     pub fn finish(path: std::path::PathBuf) -> Self {
         Self {
             kind: ConfirmKind::Finish {
-                out: path,
+                out: path.clone(),
                 overwrite: false,
             },
             title: "Build searchable PDF?".into(),
             lines: vec![
-                "Output: the default timestamped path (no save dialog found).".into(),
+                format!("Output: {}", path.display()),
                 "OCR runs over all pages; this can take a while.".into(),
             ],
             accept_label: "Enter build".into(),

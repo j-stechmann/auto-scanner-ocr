@@ -37,10 +37,10 @@ impl SaveTool {
                 "--confirm-overwrite".into(),
                 format!("--filename={filename}"),
                 format!("--title={title}"),
-                format!("--file-filter={ALL_FILTER}"),
+                format!("--file-filter={PDF_FILTER}"),
             ],
             SaveTool::Kdialog => {
-                let mut args = vec!["--getsavefilename".into(), dir, ALL_FILTER.to_string()];
+                let mut args = vec!["--getsavefilename".into(), dir, PDF_FILTER.to_string()];
                 if !title.is_empty() {
                     args.push("--title".into());
                     args.push(title);
@@ -53,15 +53,15 @@ impl SaveTool {
                 "--confirm-overwrite".into(),
                 format!("--filename={filename}"),
                 format!("--title={title}"),
-                format!("--file-filter={ALL_FILTER}"),
+                format!("--file-filter={PDF_FILTER}"),
             ],
         }
     }
 }
 
-/// Shared filter: everything (the dialog is for choosing a save location,
-/// not filtering scan output).
-const ALL_FILTER: &str = "PDF files (*.pdf) | *.pdf";
+/// Shared filter: PDF files (the session output is always a PDF; the
+/// dialog is for choosing a save location, not filtering scan output).
+const PDF_FILTER: &str = "PDF files (*.pdf) | *.pdf";
 
 /// Which save dialog tool is available, in preference order (zenity is the
 /// most common on GTK desktops, kdialog on KDE, yad as fallback).
@@ -76,16 +76,32 @@ pub fn available_tool() -> Option<SaveTool> {
 /// keeps the default path; nothing destructive happens either way).
 const CANCELLED: i32 = 1;
 
-/// Open a native save dialog. Returns None on cancel (or when the dialog
-/// could not run, e.g. no display). The pre-set directory/filename seed the
+/// Outcome of the system save dialog, distinguishing why no path was
+/// chosen: `Cancelled` means the dialog ran and the user dismissed it
+/// (Esc/Cancel), `Unavailable` means no dialog tool is installed (or it
+/// could not run, e.g. no display). The TUI only falls back to the plain
+/// confirm overlay for the latter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveChoice {
+    Chosen(PathBuf),
+    Cancelled,
+    Unavailable,
+}
+
+/// Open a native save dialog. The pre-set directory/filename seed the
 /// dialog; the user may change both.
-pub async fn save_dialog(dir: &Path, filename: &str, title: &str) -> Option<PathBuf> {
-    let tool = available_tool()?;
+pub async fn save_dialog(dir: &Path, filename: &str, title: &str) -> SaveChoice {
+    let Some(tool) = available_tool() else {
+        return SaveChoice::Unavailable;
+    };
     let mut cmd = Command::new(tool.binary());
     cmd.args(tool.args(dir, filename, title))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        // Killing the TUI while the dialog is open must not orphan the
+        // native window (matches process.rs's kill_on_drop convention).
+        .kill_on_drop(true);
     // Never inherit the terminal: the TUI is in raw mode and a dialog
     // writing to it would corrupt the screen.
     let res = cmd.output().await;
@@ -93,7 +109,7 @@ pub async fn save_dialog(dir: &Path, filename: &str, title: &str) -> Option<Path
         Ok(out) => out,
         Err(e) => {
             tracing::warn!("{} failed: {e}", tool.binary());
-            return None;
+            return SaveChoice::Unavailable;
         }
     };
     if !out.status.success() {
@@ -101,13 +117,13 @@ pub async fn save_dialog(dir: &Path, filename: &str, title: &str) -> Option<Path
         if code != CANCELLED {
             tracing::warn!("{} exited with {code}", tool.binary());
         }
-        return None;
+        return SaveChoice::Cancelled;
     }
     let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if chosen.is_empty() {
-        return None;
+        return SaveChoice::Cancelled;
     }
-    Some(PathBuf::from(chosen))
+    SaveChoice::Chosen(PathBuf::from(chosen))
 }
 
 #[cfg(test)]
