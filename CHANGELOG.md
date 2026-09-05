@@ -22,8 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   confirm) no longer force a black background - they render in the terminal
   theme's own foreground/background pair, which fixes black-on-black text on
   light themes. A new `tui::theme` module centralizes all styling and ships a
-  contrast test that checks every fg/bg pair against ten real terminal
-  palettes (VGA, Tango, Dracula, Nord, Gruvbox Dark/Light, One Half
+  contrast test that checks every fg/bg pair against a matrix of real
+  terminal palettes (VGA, Tango, Dracula, Nord, Gruvbox Dark/Light, One Half
   Dark/Light, Solarized Dark/Light) using the WCAG 2.1 relative-luminance
   contrast ratio, with per-style minimum thresholds enforced in CI
 

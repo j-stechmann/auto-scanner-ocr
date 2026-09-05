@@ -40,7 +40,9 @@ pub const BADGE_MUTED: Style = Style::new().fg(Color::Black).bg(Color::Gray);
 
 /// Secondary text on the terminal default background. Accepted exception:
 /// DarkGray follows the theme, so contrast against the unknown default bg
-/// ranges ~1.2:1 (Solarized Dark) to ~7.7:1 (One Half Light on dark).
+/// is theme-dependent - worst case fully invisible (1.0:1) on Solarized
+/// Dark, whose slot 8 equals its default background, to ~7.7:1 (One Half
+/// Light on dark).
 pub const MUTED: Style = Style::new().fg(Color::DarkGray);
 
 /// Key-column accent in help/diagnostics. Accepted exception like MUTED:
@@ -213,7 +215,32 @@ mod tests {
         }
     }
 
-    /// Every background-carrying style the catalog defines, with the worst
+    /// Single registry of every style defined in this module. The f64 is
+    /// the worst-case contrast threshold a bg-carrying style must beat on
+    /// ANY palette; `None` marks fg-only styles, which must not paint a
+    /// background. Keeping one list means a new style cannot escape both
+    /// checks.
+    fn registry() -> Vec<(&'static str, Style, Option<f64>)> {
+        vec![
+            ("HIGHLIGHT", HIGHLIGHT, Some(4.5)),
+            ("BADGE_OK", BADGE_OK, Some(2.5)),
+            ("BADGE_FAIL", BADGE_FAIL, Some(2.0)),
+            ("BADGE_BUSY", BADGE_BUSY, Some(2.0)),
+            ("BADGE_INFO", BADGE_INFO, Some(1.5)),
+            ("BADGE_MUTED", BADGE_MUTED, Some(3.0)),
+            ("header()", header(), Some(3.0)),
+            ("header_filler()", header_filler(), Some(3.0)),
+            ("KEY", KEY, None),
+            ("ACCENT", ACCENT, None),
+            ("ACCENT_BOLD", ACCENT_BOLD, None),
+            ("MUTED", MUTED, None),
+            ("ROTATED", ROTATED, None),
+            ("border_focused()", border_focused(), None),
+            ("border_unfocused()", border_unfocused(), None),
+        ]
+    }
+
+    /// Every background-carrying style in the registry, with the worst
     /// ratio it must beat on ANY palette in the matrix. HIGHLIGHT is body
     /// text on a truecolor pair (4.5 = WCAG AA); BADGE_MUTED and the header
     /// band pass WCAG large-text AA (3.0). The remaining badges are
@@ -222,16 +249,10 @@ mod tests {
     /// palette - no slot pair does better there - so their thresholds
     /// encode that documented exception.
     fn catalog() -> Vec<(&'static str, Style, f64)> {
-        vec![
-            ("HIGHLIGHT", HIGHLIGHT, 4.5),
-            ("BADGE_OK", BADGE_OK, 2.5),
-            ("BADGE_FAIL", BADGE_FAIL, 2.0),
-            ("BADGE_BUSY", BADGE_BUSY, 2.0),
-            ("BADGE_INFO", BADGE_INFO, 1.5),
-            ("BADGE_MUTED", BADGE_MUTED, 3.0),
-            ("header()", header(), 3.0),
-            ("header_filler()", header_filler(), 3.0),
-        ]
+        registry()
+            .into_iter()
+            .filter_map(|(name, style, thr)| thr.map(|t| (name, style, t)))
+            .collect()
     }
 
     #[test]
@@ -252,36 +273,25 @@ mod tests {
 
     /// Structural invariant: a style that paints a background must also pin
     /// the foreground, or it inherits the terminal's default fg - which is
-    /// arbitrary across themes (the original 1.2:1 bug).
-    ///
-    /// Convention (enforced by review, not mechanically): every style defined
-    /// in this module must appear in exactly ONE of the two lists below -
-    /// `catalog()` for bg-carrying pairs, the `no-bg` list here for the rest.
-    /// A new style added to neither escapes both checks.
+    /// arbitrary across themes (the original 1.2:1 bug). Every style in the
+    /// registry must be a complete pair if it has a bg, and must NOT paint
+    /// a bg if it is fg-only (`None` threshold).
     #[test]
     fn backgrounds_pin_their_foreground() {
-        for (name, style, _) in catalog() {
-            assert!(
-                style.bg.is_some() && style.fg.is_some(),
-                "{name} must set BOTH fg and bg (bg alone inherits default fg)"
-            );
-        }
-        // And the complement: styles without a meaningful background must
-        // not paint a bg either, otherwise they'd need a fg pair and belong
-        // in the table above.
-        for (name, style) in [
-            ("KEY", KEY),
-            ("ACCENT", ACCENT),
-            ("ACCENT_BOLD", ACCENT_BOLD),
-            ("MUTED", MUTED),
-            ("ROTATED", ROTATED),
-            ("border_focused()", border_focused()),
-            ("border_unfocused()", border_unfocused()),
-        ] {
-            assert!(
-                style.bg.is_none(),
-                "{name} unexpectedly paints a background; move it to the pair table"
-            );
+        for (name, style, threshold) in registry() {
+            if threshold.is_some() {
+                assert!(
+                    style.bg.is_some() && style.fg.is_some(),
+                    "{name} carries a bg threshold but does not set BOTH fg and bg \
+                     (bg alone inherits default fg)"
+                );
+            } else {
+                assert!(
+                    style.bg.is_none(),
+                    "{name} unexpectedly paints a background; give it a pair and a \
+                     threshold in the registry"
+                );
+            }
         }
     }
 }
