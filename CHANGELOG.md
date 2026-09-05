@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Header is no longer overdrawn by the panes**: the header band (program,
+  DPI, mode, languages, device) has had its own reserved row ever since the
+  first TUI version, but the pane layout started on the same row, so the
+  pane titles were drawn over it - on grayscale terminal themes the result
+  was dark-gray text on the light band (~1.2:1). The panes now start one row
+  below the header, and the header's own black-on-lightblue pair is what
+  actually renders
+
 ### Changed
 
 - **Text contrast pass for the TUI**: unreadable color pairs fixed and now

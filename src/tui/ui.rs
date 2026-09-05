@@ -17,6 +17,8 @@ use crate::session::{Busy, PageId, PageStatus};
 /// Per-frame pane geometry, used by both rendering and hit-testing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PaneRects {
+    /// Top settings/device band (its own row - panes start below it).
+    pub header: Rect,
     pub sidebar: Rect,
     pub status: Rect,
     /// Preview pane INCLUDING its outer border (cells live inside).
@@ -33,7 +35,16 @@ pub struct PaneRects {
 
 pub fn layout(area: Rect) -> PaneRects {
     let whole = area;
-    let [body, footer] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    // The header needs its own row: painting it across the full width and
+    // then laying the panes over the same row makes the pane titles overdraw
+    // the header title (DarkGray on the LightBlue band ~1.2:1 on grayscale
+    // themes). Reserving Length(1) keeps the band exclusive.
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(area);
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).areas(body);
     let [sidebar, status] =
@@ -53,6 +64,7 @@ pub fn layout(area: Rect) -> PaneRects {
         preview_inner,
         text,
         footer,
+        header,
         whole,
     }
 }
@@ -175,7 +187,7 @@ pub fn draw(f: &mut Frame, app: &mut App, preview: &mut PreviewWorker) {
     let rects = layout(f.area());
     app.pane_rects = Some(rects);
 
-    draw_header(f, app, rects.whole);
+    draw_header(f, app, rects.header);
     draw_sidebar(f, app, rects.sidebar);
     draw_status(f, app, rects.status);
     draw_preview(f, app, preview, rects.preview, rects.preview_inner);
@@ -196,13 +208,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 1 {
         return;
     }
-    // Single-line header above everything: program + settings + device.
-    let row = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
+    // Single-line header in its own reserved row (see layout): program +
+    // settings + device. No pane overdraws it.
+    let row = area;
     let dirty = if app.meta.as_ref().is_some_and(|m| m.dirty) {
         " ●"
     } else {
