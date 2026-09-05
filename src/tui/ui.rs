@@ -680,7 +680,7 @@ fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
     for item in &report.items {
         let (mark, style) = match item.status {
             Status::Ok => (" OK ", super::theme::BADGE_OK),
-            Status::Warn => ("WARN", super::theme::BADGE_BUSY),
+            Status::Warn => ("WARN", super::theme::BADGE_WARN),
             Status::Fail => ("FAIL", super::theme::BADGE_FAIL),
             Status::Skip => ("SKIP", super::theme::BADGE_MUTED),
             Status::Pending => (" ...", super::theme::BADGE_INFO),

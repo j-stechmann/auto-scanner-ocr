@@ -31,6 +31,9 @@ pub const HIGHLIGHT: Style = Style::new().fg(TRUE_WHITE).bg(NAVY);
 pub const BADGE_OK: Style = Style::new().fg(Color::Black).bg(Color::Green);
 pub const BADGE_FAIL: Style = Style::new().fg(Color::White).bg(Color::Red);
 pub const BADGE_BUSY: Style = Style::new().fg(Color::Black).bg(Color::Yellow).bold();
+/// Diagnostics WARN badge: same pair as BADGE_BUSY but static (not a
+/// progress state), so it stays unbold like every other diagnostics badge.
+pub const BADGE_WARN: Style = Style::new().fg(Color::Black).bg(Color::Yellow);
 /// Info badge (N processing, diag " ..."): Black on ANSI 6. Same light-
 /// polarity exception as BADGE_FAIL/BUSY (worst 1.9:1, Gruvbox Light).
 pub const BADGE_INFO: Style = Style::new().fg(Color::Black).bg(Color::Cyan);
@@ -226,6 +229,7 @@ mod tests {
             ("BADGE_OK", BADGE_OK, Some(2.5)),
             ("BADGE_FAIL", BADGE_FAIL, Some(2.0)),
             ("BADGE_BUSY", BADGE_BUSY, Some(2.0)),
+            ("BADGE_WARN", BADGE_WARN, Some(2.0)),
             ("BADGE_INFO", BADGE_INFO, Some(1.5)),
             ("BADGE_MUTED", BADGE_MUTED, Some(3.0)),
             ("header()", header(), Some(3.0)),
@@ -290,6 +294,30 @@ mod tests {
                     style.bg.is_none(),
                     "{name} unexpectedly paints a background; give it a pair and a \
                      threshold in the registry"
+                );
+            }
+        }
+    }
+
+    /// Source-scan invariant: every color decision must live in this module,
+    /// or an inline `Color::`/`.bg(` in a consumer escapes both tests above.
+    #[test]
+    fn consumers_do_not_paint_their_own_colors() {
+        for (file, src) in [
+            ("mod.rs", include_str!("mod.rs")),
+            ("app.rs", include_str!("app.rs")),
+            ("ui.rs", include_str!("ui.rs")),
+            ("overlays.rs", include_str!("overlays.rs")),
+            ("preview.rs", include_str!("preview.rs")),
+        ] {
+            for (line_no, line) in src.lines().enumerate() {
+                // Doc comments describing theme.rs behavior are allowed.
+                let code = line.split("//").next().unwrap_or(line);
+                assert!(
+                    !code.contains("Color::") && !code.contains(".bg("),
+                    "{file}:{} paints its own colors ({code:?}); add a named style in \
+                     theme.rs instead so the contrast gate covers it",
+                    line_no + 1
                 );
             }
         }
