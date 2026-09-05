@@ -272,6 +272,11 @@ scanner window size of their own capture (mixed-DPI sessions are merged with
 `pdfunite`). If ocrmypdf fails, the PDF is still saved (without a text
 layer) and the TUI tells you so.
 
+## Contributing
+
+Development happens on the `develop` branch via git flow — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for branches, PRs and the release process.
+
 ## License
 
 GPL-2.0-or-later — see [LICENSE](LICENSE). Changes are tracked in
