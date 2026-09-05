@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.1] - 2026-09-05
 
 ### Fixed
 
@@ -190,6 +190,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - TOML config file with per-run CLI overrides
 - Desktop notifications via libnotify, logs in the XDG state dir
 
+[0.3.1]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/j-stechmann/auto-scanner-ocr/compare/773e405...v0.2.0
 [0.1.0]: https://github.com/j-stechmann/auto-scanner-ocr/tree/773e405
