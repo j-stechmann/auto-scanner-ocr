@@ -55,13 +55,24 @@ user-visible.
    `## [0.3.0] - YYYY-MM-DD` section, and bump `version` in `Cargo.toml`
    (`cargo check` will also update `Cargo.lock`). The tag **must** match
    `Cargo.toml` — the release workflow fails otherwise.
-3. Merge to `main`, merge back to `develop` (both with `--no-ff`), then tag:
+3. Merge to `main` and back to `develop` — both branches are protected, so
+   this goes through PRs (merge commits, no squash):
 
    ```sh
-   git checkout main && git merge --no-ff release/0.3.0
-   git checkout develop && git merge --no-ff release/0.3.0
-   git tag -a v0.3.0 main
-   git push origin main develop v0.3.0
+   git push -u origin release/0.3.0
+   gh pr create --base main --head release/0.3.0 --title "Release 0.3.0"
+   gh pr merge --merge --delete-branch
+   gh pr create --base develop --head main --title "Back-merge 0.3.0 into develop"
+   gh pr merge --merge --delete-branch
+   ```
+
+   (Or open the two PRs in the browser: `release/0.3.0 → main`, then
+   `main → develop`.)
+
+4. Tag on `main` and push the tag:
+
+   ```sh
+   git checkout main && git pull && git tag -a v0.3.0 -m "auto-scanner-ocr 0.3.0" && git push origin v0.3.0
    ```
 
    Pushing the tag triggers the release workflow: cross-compiled binaries,
@@ -75,14 +86,16 @@ For a critical bug in production, branch off `main` instead:
 git checkout -b hotfix/0.3.1 main
 ```
 
-Fix, bump `Cargo.toml` + CHANGELOG to `0.3.1`, merge to `main` **and**
-`develop`, tag `v0.3.1` on `main` — same as a release, just off `main`.
+Fix, bump `Cargo.toml` + CHANGELOG to `0.3.1`, then PR `hotfix/0.3.1 → main`
+and PR `main → develop`, tag `v0.3.1` on `main` — same as a release, just
+branched off `main`.
 
 ## Notes
 
 - Dependabot opens PRs against `develop`. Merge them like any other PR.
 - `main` and `develop` are long-lived: never delete them, never commit
-  directly to either (use feature/bugfix/hotfix branches and PRs).
+  directly to either — both are protected by rulesets (PR + CI required), so
+  use feature/bugfix/hotfix branches and PRs.
 - A `git-flow` extension (`git-flow-avh` on Arch/AUR, `git-flow` on
   Debian/Ubuntu) is optional — branch names above match its defaults and the
   prefix configuration is already stored in `.git/config` if you want it.
