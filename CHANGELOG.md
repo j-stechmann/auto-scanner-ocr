@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Header is no longer overdrawn by the panes**: the header band (program,
+  DPI, mode, languages, device) has had its own reserved row ever since the
+  first TUI version, but the pane layout started on the same row, so the
+  pane titles were drawn over it - on grayscale terminal themes the result
+  was dark-gray text on the light band (~1.2:1). The panes now start one row
+  below the header, and the header's own black-on-lightblue pair is what
+  actually renders
+
+### Changed
+
+- **Text contrast pass for the TUI**: unreadable color pairs fixed and now
+  CI-enforced. The page-list selection and language-picker cursor pin an
+  explicit white foreground on their dark-navy background (previously the
+  terminal default foreground was inherited, which on light themes rendered
+  dark-on-dark). The selected page row now renders uniformly white-on-navy,
+  including its status badge, instead of the badge colors vanishing against
+  the navy background; the ` deleting `/`SKIP` badges use black-on-silver
+  instead of black-on-dark-gray; the rotate marker `↻` is cyan instead of
+  ANSI blue; unfocused pane borders are brighter (were nearly invisible on
+  dark terminals); modal dialogs (help, diagnostics, language picker,
+  confirm) no longer force a black background - they render in the terminal
+  theme's own foreground/background pair, which fixes black-on-black text on
+  light themes. A new `tui::theme` module centralizes all styling and ships a
+  contrast test that checks every fg/bg pair against a matrix of real
+  terminal palettes (VGA, Tango, Dracula, Nord, Gruvbox Dark/Light, One Half
+  Dark/Light, Solarized Dark/Light) using the WCAG 2.1 relative-luminance
+  contrast ratio, with per-style minimum thresholds enforced in CI
+
 ## [0.3.0] - 2026-09-05
 
 ### Added
