@@ -283,7 +283,11 @@ pub fn to_cmd(app: &App, action: CommandAction) -> Option<session::Cmd> {
             dpi: app.settings.dpi,
             mode: app.settings.mode.clone(),
         }),
-        CommandAction::Rescan(id) => Some(session::Cmd::Rescan(id as u32)),
+        CommandAction::Rescan(id) => Some(session::Cmd::Rescan {
+            id: id as u32,
+            dpi: app.settings.dpi,
+            mode: app.settings.mode.clone(),
+        }),
         CommandAction::Rotate(id, cw) => Some(session::Cmd::Rotate(id as u32, cw)),
         CommandAction::Delete(id) => Some(session::Cmd::Delete(id as u32)),
         CommandAction::Move(from, to) => Some(session::Cmd::Move { from, to }),
