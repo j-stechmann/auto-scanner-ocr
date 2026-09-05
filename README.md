@@ -101,7 +101,7 @@ Inside the TUI:
 | `Esc` / `c` | Cancel a running scan |
 | `j`/`k` or `↑`/`↓` | Select page (Pages) · scroll (Text) |
 | `J`/`K` or `←`/`→` | Move page down/up (Pages pane) |
-| `r` | Rescan page (keeps the old image until the new scan succeeds) |
+| `r` | Rescan page with the current dpi/mode (keeps the old image until the new scan succeeds) |
 | `R` / `<` | Rotate page 90° clockwise / counter-clockwise |
 | `d` | Delete page (kills the job if it's still processing) |
 | `1`–`9` | Jump to page N |

@@ -145,8 +145,9 @@ pub enum Cmd {
     ScanNext { dpi: u16, mode: String },
     /// Cancel an in-flight scan.
     CancelScan,
-    /// Rescan page (non-destructive: old image kept until success).
-    Rescan(PageId),
+    /// Rescan page with the CURRENT dpi/mode settings (non-destructive:
+    /// old image kept until success).
+    Rescan { id: PageId, dpi: u16, mode: String },
     /// Rotate page image 90° CW (false = CCW); re-OCRs only under eager
     /// preview OCR (lazy re-extracts on demand).
     Rotate(PageId, bool),
@@ -269,6 +270,10 @@ enum JobDone {
         is_rescan: bool,
         /// Final image path (possibly the unpaper `_clean` variant).
         image: PathBuf,
+        /// Requested dpi/mode (echoed so a successful rescan can adopt them;
+        /// failure keeps the old values).
+        dpi: u16,
+        mode: String,
         /// Legacy-unpaper fully cleaned this page (see Page::unpaper_deskewed).
         unpaper_deskewed: bool,
         /// Scanner rejected requested settings; fallback attempt succeeded.
@@ -507,7 +512,7 @@ impl Session {
                 }
                 Ok(())
             }
-            Cmd::Rescan(id) => {
+            Cmd::Rescan { id, .. } => {
                 if self.device.is_empty() {
                     // Defensive: see the ScanNext guard note.
                     return Err(match self.finished {
@@ -627,11 +632,7 @@ impl Session {
         match cmd {
             Cmd::ScanNext { dpi, mode } => self.start_scan(dpi, mode, None),
             Cmd::CancelScan => self.cancel_scan(),
-            Cmd::Rescan(id) => {
-                if let Some(p) = self.pages.iter().find(|p| p.id == id) {
-                    self.start_scan(p.dpi, p.mode.clone(), Some(id));
-                }
-            }
+            Cmd::Rescan { id, dpi, mode } => self.start_scan(dpi, mode, Some(id)),
             Cmd::Rotate(id, cw) => self.start_rotate(id, cw),
             Cmd::Delete(id) => self.delete(id),
             Cmd::Move { from, to } => self.move_page(from, to),
@@ -673,6 +674,8 @@ impl Session {
                 id,
                 is_rescan,
                 image,
+                dpi,
+                mode,
                 unpaper_deskewed,
                 used_fallback,
                 result,
@@ -680,6 +683,8 @@ impl Session {
                 id,
                 is_rescan,
                 image,
+                dpi,
+                mode,
                 unpaper_deskewed,
                 used_fallback,
                 result,
@@ -799,6 +804,8 @@ impl Session {
                                 id,
                                 is_rescan,
                                 image,
+                                dpi,
+                                mode,
                                 unpaper_deskewed,
                                 used_fallback,
                                 result: Ok(()),
@@ -808,6 +815,8 @@ impl Session {
                             id,
                             is_rescan,
                             image: path,
+                            dpi,
+                            mode,
                             unpaper_deskewed: false,
                             used_fallback: false,
                             result: Err(e),
@@ -873,6 +882,8 @@ impl Session {
         id: PageId,
         is_rescan: bool,
         image: PathBuf,
+        dpi: u16,
+        mode: String,
         unpaper_deskewed: bool,
         used_fallback: bool,
         result: anyhow::Result<()>,
@@ -896,14 +907,23 @@ impl Session {
                 }
                 if is_rescan {
                     // Remove the old images only now (non-destructive rescan).
+                    // Per-file guard against the NEW final image: rescans reuse
+                    // the fixed `page_NNN.rescan.png` name, so a repeat rescan
+                    // (or one whose unpaper outcome changed) would otherwise
+                    // delete the freshly captured file it is about to adopt.
                     let old_image = self
                         .pages
                         .iter()
                         .find(|p| p.id == id)
                         .and_then(|p| p.image.clone());
                     if let Some(img) = old_image {
-                        let _ = std::fs::remove_file(&img);
-                        let _ = std::fs::remove_file(clean_variant(&img));
+                        if img != image {
+                            let _ = std::fs::remove_file(&img);
+                        }
+                        let cleaned = clean_variant(&img);
+                        if cleaned != image {
+                            let _ = std::fs::remove_file(&cleaned);
+                        }
                     }
                 }
                 // The capture is done; the text pane content will be
@@ -915,6 +935,13 @@ impl Session {
                         .find(|p| p.id == id)
                         .expect("page exists (checked above)");
                     p.image = Some(image.clone());
+                    // Rescans follow the current settings: adopt the requested
+                    // values on success (a failed rescan keeps the old page's
+                    // values, since the old image survives). Fresh scans
+                    // already carry them (no-op). Required for correct PDF
+                    // page sizing (start_finish -> img2pdf --imgsize).
+                    p.dpi = dpi;
+                    p.mode = mode;
                     p.unpaper_deskewed = unpaper_deskewed;
                     p.used_fallback = used_fallback;
                     p.text = None;
@@ -1710,6 +1737,22 @@ mod tests {
             id,
             is_rescan: false,
             image,
+            dpi: 300,
+            mode: "gray".into(),
+            unpaper_deskewed: false,
+            used_fallback: false,
+            result: Ok(()),
+        }
+    }
+
+    /// Like `scan_ok`, but for a rescan completion with new settings.
+    fn rescan_ok(id: PageId, image: PathBuf, dpi: u16, mode: &str) -> JobDone {
+        JobDone::Scan {
+            id,
+            is_rescan: true,
+            image,
+            dpi,
+            mode: mode.into(),
             unpaper_deskewed: false,
             used_fallback: false,
             result: Ok(()),
@@ -1954,7 +1997,13 @@ mod tests {
         std::fs::write(&img, b"x").unwrap();
         s.handle_job_done(scan_ok(1, img)).await;
         s.request_text(1);
-        assert!(s.guard(&Cmd::Rescan(1)).is_err());
+        assert!(s
+            .guard(&Cmd::Rescan {
+                id: 1,
+                dpi: 300,
+                mode: "gray".into()
+            })
+            .is_err());
         // A different page can still be scanned meanwhile.
         assert!(s
             .guard(&Cmd::ScanNext {
@@ -1962,6 +2011,84 @@ mod tests {
                 mode: "gray".into()
             })
             .is_ok());
+    }
+
+    /// Regression: a rescan writes to the FIXED `page_NNN.rescan.png` name,
+    /// so the second rescan's "remove old images" step used to delete the
+    /// file it had just captured (the page's own image), freezing the
+    /// preview and breaking OCR/builds. The removal must skip every
+    /// candidate equal to the new final image path.
+    #[tokio::test]
+    async fn double_rescan_keeps_its_image_file() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+
+        // First rescan: adopts the rescan path, deletes the old original.
+        let rescan_img = s.dir.join("page_001.rescan.png");
+        std::fs::write(&rescan_img, b"x").unwrap();
+        s.handle_job_done(rescan_ok(1, rescan_img.clone(), 300, "gray"))
+            .await;
+        assert_eq!(s.pages[0].image.as_deref(), Some(rescan_img.as_path()));
+        assert!(rescan_img.exists(), "first rescan image exists");
+
+        // Second rescan at the same fixed path: the old image IS the new
+        // image path; the file must survive.
+        std::fs::write(&rescan_img, b"y").unwrap();
+        s.handle_job_done(rescan_ok(1, rescan_img.clone(), 600, "color"))
+            .await;
+        assert!(rescan_img.exists(), "second rescan must not self-delete");
+        assert_eq!(s.pages[0].image.as_deref(), Some(rescan_img.as_path()));
+        assert_eq!(s.pages[0].dpi, 600, "rescan adopts requested dpi");
+        assert_eq!(s.pages[0].mode, "color", "rescan adopts requested mode");
+
+        // Mixed unpaper outcome: old = raw rescan, new = _clean variant —
+        // the guard must not let clean_variant(old) == new delete the fresh
+        // cleaned file.
+        let cleaned = s.dir.join("page_001.rescan_clean.png");
+        std::fs::write(&cleaned, b"z").unwrap();
+        std::fs::write(&rescan_img, b"raw").unwrap();
+        s.handle_job_done(rescan_ok(1, cleaned.clone(), 300, "gray"))
+            .await;
+        assert!(cleaned.exists(), "cleaned file must survive adoption");
+        assert_eq!(s.pages[0].image.as_deref(), Some(cleaned.as_path()));
+    }
+
+    /// Rescan follows the current dpi/mode settings; a FAILED rescan keeps
+    /// the old values (the old image survives, and the PDF build sizes the
+    /// page by the recorded dpi).
+    #[tokio::test]
+    async fn rescan_adopts_settings_on_success_keeps_them_on_failure() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+
+        // Failed rescan with new settings: page keeps the original values.
+        s.handle_job_done(JobDone::Scan {
+            id: 1,
+            is_rescan: true,
+            image: img.clone(),
+            dpi: 600,
+            mode: "color".into(),
+            unpaper_deskewed: false,
+            used_fallback: false,
+            result: Err(anyhow::anyhow!("boom")),
+        })
+        .await;
+        assert_eq!(s.pages[0].dpi, 300, "failure keeps old dpi");
+        assert_eq!(s.pages[0].mode, "gray", "failure keeps old mode");
+
+        // Successful rescan: values are adopted (img2pdf page sizing).
+        let rescan_img = s.dir.join("page_001.rescan.png");
+        std::fs::write(&rescan_img, b"x").unwrap();
+        s.handle_job_done(rescan_ok(1, rescan_img, 600, "color"))
+            .await;
+        assert_eq!(s.pages[0].dpi, 600);
+        assert_eq!(s.pages[0].mode, "color");
     }
 
     #[tokio::test]
@@ -2014,7 +2141,13 @@ mod tests {
             }),
             Err("scanner detection still running".into())
         );
-        assert!(s.guard(&Cmd::Rescan(1)).is_err());
+        assert!(s
+            .guard(&Cmd::Rescan {
+                id: 1,
+                dpi: 300,
+                mode: "gray".into()
+            })
+            .is_err());
         assert!(s.device.is_empty());
 
         s.handle(Cmd::SetDevice("hpaio:/usb/x".into())).await;
@@ -2042,7 +2175,14 @@ mod tests {
             }),
             expect
         );
-        assert_eq!(s.guard(&Cmd::Rescan(1)), expect);
+        assert_eq!(
+            s.guard(&Cmd::Rescan {
+                id: 1,
+                dpi: 300,
+                mode: "gray".into()
+            }),
+            expect
+        );
     }
 
     #[tokio::test]
@@ -2135,7 +2275,13 @@ mod tests {
             .is_err(),
             "scan blocked against the deleted dir"
         );
-        assert!(s.guard(&Cmd::Rescan(1)).is_err());
+        assert!(s
+            .guard(&Cmd::Rescan {
+                id: 1,
+                dpi: 300,
+                mode: "gray".into()
+            })
+            .is_err());
         assert!(s.guard(&Cmd::Rotate(1, true)).is_err());
         assert!(
             s.guard(&Cmd::Finish).is_err(),

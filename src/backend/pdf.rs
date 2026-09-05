@@ -106,6 +106,12 @@ async fn rewrite_as_png(path: &Path) -> Result<()> {
 /// original) and whether the page is fully cleaned+deskewed (only legacy
 /// mode on gray/lineart input can claim that). Skipped entirely for
 /// cleanup=off or color mode (unpaper is grayscale-only).
+///
+/// Atomicity: unpaper writes to a temp name which is re-encoded to PNG and
+/// renamed over the final `_clean` path only on success. Rescans reuse the
+/// fixed `page_NNN.rescan.png` name, so writing the output directly (or
+/// deleting it on failure) could destroy the page's live image — the old
+/// `_clean` file must survive a failed cleanup pass untouched.
 pub async fn maybe_unpaper(
     page_png: &Path,
     cleanup: Cleanup,
@@ -120,32 +126,44 @@ pub async fn maybe_unpaper(
         return (page_png.to_path_buf(), false);
     }
     let cleaned = clean_variant(page_png);
+    let tmp = page_png.with_extension("png.unpaper.tmp");
     let src = page_png.to_string_lossy().into_owned();
-    let dst = cleaned.to_string_lossy().into_owned();
+    let dst = tmp.to_string_lossy().into_owned();
     let mut cmd: Vec<String> = vec!["unpaper".into()];
     cmd.extend(unpaper_args(cleanup, extra_args));
     cmd.push(src.clone());
     cmd.push(dst.clone());
     let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
     match process::run(&refs, Some(UNPAPER_TIMEOUT)).await {
-        Ok(out) if out.success && tokio::fs::try_exists(&cleaned).await.unwrap_or(false) => {
+        Ok(out) if out.success && tokio::fs::try_exists(&tmp).await.unwrap_or(false) => {
             // unpaper always writes Netpbm data (even into `.png` names);
             // re-encode to a real PNG so downstream consumers don't rely on
             // format sniffing.
-            if let Err(e) = rewrite_as_png(&cleaned).await {
+            if let Err(e) = rewrite_as_png(&tmp).await {
                 tracing::warn!("PNG re-encode of unpaper output failed ({e}); keeping raw file");
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return (page_png.to_path_buf(), false);
+            }
+            // Rename over the final name BEFORE removing the raw: consumers
+            // only ever see a complete file, a pre-existing `_clean` image
+            // (previous rescan) survives until the new output is ready, and
+            // the raw capture stays as the failure fallback.
+            if let Err(e) = tokio::fs::rename(&tmp, &cleaned).await {
+                tracing::warn!("renaming unpaper output failed ({e}); keeping raw file");
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return (page_png.to_path_buf(), false);
             }
             let _ = tokio::fs::remove_file(page_png).await;
             (cleaned, cleanup == Cleanup::Legacy)
         }
         Ok(_) => {
             tracing::warn!("unpaper failed; using raw scan");
-            let _ = tokio::fs::remove_file(&cleaned).await;
+            let _ = tokio::fs::remove_file(&tmp).await;
             (page_png.to_path_buf(), false)
         }
         Err(e) => {
             tracing::warn!("unpaper failed ({e}); using raw scan");
-            let _ = tokio::fs::remove_file(&cleaned).await;
+            let _ = tokio::fs::remove_file(&tmp).await;
             (page_png.to_path_buf(), false)
         }
     }

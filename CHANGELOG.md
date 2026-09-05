@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Rescan self-deletion**: rescans reuse the fixed `page_NNN.rescan.png`
+  name, so the second rescan of a page deleted the image it had just
+  captured — the preview froze on the old thumbnail and the page's image
+  file was gone (breaking OCR and the PDF build). The old-image cleanup now
+  skips every file equal to the new final image path
+- **unpaper atomic output**: the cleanup pass now writes to a temp file and
+  renames over the final `_clean` name only on success. Previously a failed
+  unpaper run on a rescan could delete the page's live `_clean` image
+  ("keeps old until success" was broken), and the direct overwrite could
+  race the preview decode
+
+### Changed
+
+- **Rescan follows current settings**: `r` rescans with the currently
+  selected dpi/mode (like `m`/`+`) instead of the page's original settings;
+  the page adopts them on success and keeps its old values on failure
+
 ## [0.2.0] - 2026-09-04
 
 ### Added

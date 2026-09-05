@@ -647,7 +647,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Pages", ""),
         ("j k / ↑ ↓", "select page"),
         ("J K / ← →", "move page down / up"),
-        ("r", "rescan page (keeps old until success)"),
+        (
+            "r",
+            "rescan page (current dpi/mode; keeps old until success)",
+        ),
         ("R", "rotate page 90° clockwise"),
         ("<", "rotate page 90° counter-clockwise"),
         ("d", "delete page"),
