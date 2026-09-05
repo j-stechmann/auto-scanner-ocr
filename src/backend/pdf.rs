@@ -349,17 +349,93 @@ async fn run_pdf_step(what: &str, args: &[String], timeout: Duration) -> Result<
     Ok(())
 }
 
+/// Kernel filename limit (Linux NAME_MAX). `part_sibling` keeps the
+/// suffixed `.part` name within it: a near-limit target would otherwise
+/// make ocrmypdf's write fail with ENAMETOOLONG only after the whole OCR
+/// run.
+const NAME_MAX: usize = 255;
+/// Bytes reserved for `-<pid>-<nanos>` + `.part` (u32 pid + u128 nanos
+/// worst case). Fixed — not derived from the actual suffix — so the
+/// release/sweep matcher re-derives the same truncated stem without knowing
+/// the suffix.
+const PART_RESERVE: usize = 56;
+/// Length of the short hash appended to a truncated `.part` stem (full
+/// 64-bit hash as 16 hex chars: the collision between a truncated stem and
+/// an adversarially crafted sibling name stays cryptographically unlikely,
+/// not just "2^-32 improbable").
+const PART_HASH_LEN: usize = 16;
+
 /// `<name>-<pid>-<nanos>.part` sibling of `path`: same directory (the final
 /// rename must stay on one filesystem) with a per-build unique stem so
 /// concurrent sessions delivering to the same user path never interleave
 /// writes into a shared `.part`. The plain `<path>.part` name is still
 /// cleaned up by `release_reservation` (legacy leftovers).
 fn part_sibling(target: &Path, suffix: &str) -> PathBuf {
+    let Some(file) = target.file_name() else {
+        // Degenerate (no file component): legacy plain append.
+        let mut os = target.as_os_str().to_os_string();
+        os.push(suffix);
+        os.push(".part");
+        return PathBuf::from(os);
+    };
+    let budget = NAME_MAX - PART_RESERVE;
+    // Kept bytes of the file component before the hash tail (mirrored in
+    // `part_prefixes`).
+    let keep = budget - (PART_HASH_LEN + 1);
+    let bytes = file.as_encoded_bytes();
+    let stem = if bytes.len() > budget {
+        // Over-long filename: truncate the file component and append a
+        // short hash of the full name. Distinct long names keep distinct
+        // stems, and a truncated stem colliding with an unrelated short
+        // file's `.part` name would take a deliberate ~2^-64 crafting.
+        // Deterministic in the file name: the release/sweep matcher
+        // re-derives the same stem.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut v = bytes[..keep].to_vec();
+            v.push(b'-');
+            v.extend_from_slice(short_hash(file).as_bytes());
+            std::ffi::OsString::from_vec(v)
+        }
+        #[cfg(not(unix))]
+        {
+            // Lossy is acceptable here (Windows is not a target); keep
+            // char boundaries and the byte budget.
+            let lossy = file.to_string_lossy();
+            let mut kept = String::new();
+            for c in lossy.chars() {
+                if kept.len() + c.len_utf8() > keep {
+                    break;
+                }
+                kept.push(c);
+            }
+            kept.push('-');
+            kept.push_str(&short_hash(file));
+            std::ffi::OsString::from(kept)
+        }
+    } else {
+        file.to_os_string()
+    };
+    let mut out = target.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    out.push(stem);
+    let mut os = out.into_os_string();
     // Raw OsString append (no separator): "out.pdf" + "-123-456" + ".part".
-    let mut os = target.as_os_str().to_os_string();
     os.push(suffix);
     os.push(".part");
     PathBuf::from(os)
+}
+
+/// Stable 16-hex-char hash of an `OsStr` for the truncated `.part` stem.
+/// `DefaultHasher::new()` is fixed-key (deterministic within a binary), so
+/// both the write and the cleanup side derive the same value. (Across an
+/// std upgrade the hash may differ: old binary's truncated-stem leftovers
+/// then only get the plain-prefix match — best-effort cleanup as before.)
+fn short_hash(file: &OsStr) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    file.as_encoded_bytes().hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 /// Per-build suffix for `part_sibling` (pid + wall-clock nanos).
@@ -470,17 +546,14 @@ pub fn release_reservation(path: &Path) {
     // sweep retries on the next run).
     if let Some(file) = path.file_name() {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let prefix = {
-                let mut p = file.to_os_string();
-                p.push("-");
-                p
-            }
-            .to_string_lossy()
-            .into_owned();
+            let prefixes = part_prefixes(file);
             if let Ok(entries) = std::fs::read_dir(parent) {
                 for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if is_own_part_sibling(&name, &prefix) {
+                    let name = entry.file_name();
+                    if prefixes
+                        .iter()
+                        .any(|p| is_own_part_sibling(name.as_encoded_bytes(), p))
+                    {
                         let _ = std::fs::remove_file(entry.path());
                     }
                 }
@@ -489,24 +562,50 @@ pub fn release_reservation(path: &Path) {
     }
 }
 
+/// Byte prefixes under which this target's unique-suffix `.part` siblings
+/// are named: `<file>-` normally; plus the truncated+hashed stem's prefix
+/// when the file name is too long for the suffixed form (mirrors
+/// `part_sibling`'s truncation). Raw bytes: non-UTF-8 names must match.
+fn part_prefixes(file: &OsStr) -> Vec<Vec<u8>> {
+    let bytes = file.as_encoded_bytes();
+    let mut plain = bytes.to_vec();
+    plain.push(b'-');
+    let mut prefixes = vec![plain];
+    let budget = NAME_MAX - PART_RESERVE;
+    if bytes.len() > budget {
+        let mut truncated = bytes[..budget - (PART_HASH_LEN + 1)].to_vec();
+        truncated.push(b'-');
+        truncated.extend_from_slice(short_hash(file).as_bytes());
+        truncated.push(b'-');
+        prefixes.push(truncated);
+    }
+    prefixes
+}
+
 /// True when `name` is `<prefix><pid>-<nanos>.part` (the unique-suffix
 /// sibling shape written by `part_sibling`): strict digits between the
 /// dashes so unrelated files like `chosen.pdf-42-x.part` (a different
 /// target's live part) never match.
-fn is_own_part_sibling(name: &str, prefix: &str) -> bool {
+fn is_own_part_sibling(name: &[u8], prefix: &[u8]) -> bool {
     let Some(rest) = name.strip_prefix(prefix) else {
         return false;
     };
-    let Some(rest) = rest.strip_suffix(".part") else {
+    let Some(rest) = rest.strip_suffix(b".part") else {
         return false;
     };
-    let Some((pid, nanos)) = rest.split_once('-') else {
+    let Some((pid, nanos)) = split_once(rest, b'-') else {
         return false;
     };
     !pid.is_empty()
         && !nanos.is_empty()
-        && pid.bytes().all(|b| b.is_ascii_digit())
-        && nanos.bytes().all(|b| b.is_ascii_digit())
+        && pid.iter().all(|b| b.is_ascii_digit())
+        && nanos.iter().all(|b| b.is_ascii_digit())
+}
+
+/// First index of `needle` in `haystack` (for byte-slice `split_once`).
+fn split_once(bytes: &[u8], needle: u8) -> Option<(&[u8], &[u8])> {
+    let pos = bytes.iter().position(|b| *b == needle)?;
+    Some((&bytes[..pos], &bytes[pos + 1..]))
 }
 
 /// Local timestamp string `YYYY-MM-DD_HHMMSS` (parity with Python format).
@@ -783,22 +882,72 @@ mod tests {
 
     #[test]
     fn own_part_sibling_pattern_is_strict() {
-        let prefix = "chosen.pdf-";
-        assert!(is_own_part_sibling("chosen.pdf-42-99.part", prefix));
+        let prefix = b"chosen.pdf-";
+        assert!(is_own_part_sibling(b"chosen.pdf-42-99.part", prefix));
         assert!(is_own_part_sibling(
-            "chosen.pdf-18446744073709551615-999999999999999999999999.part",
+            b"chosen.pdf-18446744073709551615-999999999999999999999999.part",
             prefix
         ));
         // Another target's live part (prefix-superset name): no match.
         assert!(!is_own_part_sibling(
-            "chosen.pdf-backup.pdf-7-8.part",
+            b"chosen.pdf-backup.pdf-7-8.part",
             prefix
         ));
         // Non-numeric or wrong shape: no match.
-        assert!(!is_own_part_sibling("chosen.pdf-42-x.part", prefix));
-        assert!(!is_own_part_sibling("chosen.pdf-42-.part", prefix));
-        assert!(!is_own_part_sibling("chosen.pdf-4-2-3.part", prefix));
-        assert!(!is_own_part_sibling("chosen.pdf-42-99", prefix));
-        assert!(!is_own_part_sibling("chosen.pdf-42-99.bak", prefix));
+        assert!(!is_own_part_sibling(b"chosen.pdf-42-x.part", prefix));
+        assert!(!is_own_part_sibling(b"chosen.pdf-42-.part", prefix));
+        assert!(!is_own_part_sibling(b"chosen.pdf-4-2-3.part", prefix));
+        assert!(!is_own_part_sibling(b"chosen.pdf-42-99", prefix));
+        assert!(!is_own_part_sibling(b"chosen.pdf-42-99.bak", prefix));
+    }
+
+    /// A filename near NAME_MAX: the suffixed `.part` stays within the
+    /// kernel limit and the release matcher still re-derives the truncated
+    /// stem (round trip), while an unrelated short file sharing the
+    /// truncated prefix keeps its own live part.
+    #[test]
+    fn part_sibling_over_long_name_is_capped_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let stem = "l".repeat(NAME_MAX - 10); // 245 bytes: over the budget
+        let target = d.join(format!("{stem}.pdf"));
+        assert!(target.file_name().unwrap().as_encoded_bytes().len() > NAME_MAX - PART_RESERVE);
+
+        let part = part_sibling(&target, "-42-99");
+        let name = part.file_name().unwrap().as_encoded_bytes().to_vec();
+        assert!(
+            name.len() <= NAME_MAX,
+            "suffixed part stays within NAME_MAX (got {})",
+            name.len()
+        );
+        assert!(name.ends_with(b"-42-99.part"));
+        // Deterministic: the matcher re-derives the same truncated stem.
+        let prefixes = part_prefixes(target.file_name().unwrap());
+        assert!(
+            is_own_part_sibling(&name, &prefixes[0]) || is_own_part_sibling(&name, &prefixes[1])
+        );
+
+        // Round trip through release_reservation on the filesystem.
+        std::fs::write(&part, b"half written").unwrap();
+        std::fs::write(&target, b"delivered").unwrap();
+        // An unrelated short file sharing the truncated prefix: its part
+        // (hash differs) must survive.
+        let other_target = d.join(format!("{}X.pdf", "l".repeat(NAME_MAX - 10)));
+        let other_part = part_sibling(&other_target, "-7-8");
+        std::fs::write(&other_part, b"live").unwrap();
+        release_reservation(&target);
+        assert!(target.exists());
+        assert!(!part.exists(), "truncated-stem part discarded");
+        assert!(other_part.exists(), "unrelated long target's part kept");
+    }
+
+    /// Short names never take the truncation path (plain shape unchanged).
+    #[test]
+    fn part_sibling_short_name_untouched() {
+        let target = Path::new("/tmp/out/custom.pdf");
+        assert_eq!(
+            part_sibling(target, "-1-2"),
+            PathBuf::from("/tmp/out/custom.pdf-1-2.part")
+        );
     }
 }

@@ -114,12 +114,12 @@ fn looks_unavailable(status: &std::process::ExitStatus, stderr: &str) -> bool {
 
 /// Open a native save dialog. The pre-set directory/filename seed the
 /// dialog; the user may change both.
-pub async fn save_dialog(dir: &Path, filename: &str, title: &str) -> SaveChoice {
+pub async fn save_dialog(dir: PathBuf, filename: String, title: &str) -> SaveChoice {
     let Some(tool) = available_tool() else {
         return SaveChoice::Unavailable;
     };
     let mut cmd = Command::new(tool.binary());
-    cmd.args(tool.args(dir, filename, title))
+    cmd.args(tool.args(&dir, &filename, title))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         // Piped (not null): the exit-1 display-failure discriminator reads
@@ -154,29 +154,35 @@ pub async fn save_dialog(dir: &Path, filename: &str, title: &str) -> SaveChoice 
     }
     // Read stdout as raw bytes: Linux paths may legally contain non-UTF-8
     // bytes, and from_utf8_lossy would silently pick a different target.
-    let chosen = std::path::PathBuf::from(os_string_from_capped(&out.stdout));
+    let chosen = std::path::PathBuf::from(os_string_from_dialog_stdout(&out.stdout));
     if chosen.as_os_str().is_empty() {
         return SaveChoice::Cancelled;
     }
     SaveChoice::Chosen(chosen)
 }
 
-/// Decode raw dialog stdout into an `OsString`, trimming the trailing
-/// newline without UTF-8 loss (bytes outside the filename are trimmed as
-/// ASCII whitespace; the path bytes themselves are preserved verbatim).
-fn os_string_from_capped(bytes: &[u8]) -> std::ffi::OsString {
+/// Decode raw dialog stdout into an `OsString`, stripping only the tools'
+/// line terminator (LF, plus CR for CRLF variants). Filenames are NOT
+/// trimmed of other whitespace: a trailing space is legal on Linux, and
+/// trimming it would deliver a path different from the one the dialog's
+/// overwrite prompt confirmed. Empty output (tools print nothing when the
+/// user cancels) stays empty.
+fn os_string_from_dialog_stdout(bytes: &[u8]) -> std::ffi::OsString {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
         let end = bytes
             .iter()
-            .rposition(|b| !b.is_ascii_whitespace())
+            .rposition(|b| *b != b'\n' && *b != b'\r')
             .map_or(0, |i| i + 1);
         std::ffi::OsString::from_vec(bytes[..end].to_vec())
     }
     #[cfg(not(unix))]
     {
-        String::from_utf8_lossy(bytes).trim_end().to_string().into()
+        String::from_utf8_lossy(bytes)
+            .trim_end_matches(['\n', '\r'])
+            .to_string()
+            .into()
     }
 }
 
@@ -210,20 +216,46 @@ mod tests {
 
     #[test]
     fn stdout_decoding_trims_and_keeps_bytes() {
-        assert_eq!(os_string_from_capped(b"/tmp/x.pdf\n"), "/tmp/x.pdf");
-        assert_eq!(os_string_from_capped(b"/tmp/x.pdf\n\n"), "/tmp/x.pdf");
-        // Non-UTF-8 filename byte (0xFF) survives verbatim on Unix.
+        assert_eq!(os_string_from_dialog_stdout(b"/tmp/x.pdf\n"), "/tmp/x.pdf");
+        assert_eq!(
+            os_string_from_dialog_stdout(b"/tmp/x.pdf\n\n"),
+            "/tmp/x.pdf"
+        );
+        assert_eq!(
+            os_string_from_dialog_stdout(b"/tmp/x.pdf\r\n"),
+            "/tmp/x.pdf"
+        );
+        // Only the terminator is stripped: filename whitespace is legal and
+        // part of the chosen path (the dialog's overwrite prompt confirmed
+        // this exact name).
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
             let raw = b"/tmp/x\xffy.pdf\n".to_vec();
             assert_eq!(
-                os_string_from_capped(&raw),
+                os_string_from_dialog_stdout(&raw),
                 std::ffi::OsString::from_vec(b"/tmp/x\xffy.pdf".to_vec())
             );
+            let spaced = b"/tmp/x y .pdf \n".to_vec();
+            assert_eq!(
+                os_string_from_dialog_stdout(&spaced),
+                std::ffi::OsString::from_vec(b"/tmp/x y .pdf ".to_vec())
+            );
         }
-        // Whitespace-only output: empty (treated as cancelled).
-        assert!(os_string_from_capped(b" \n").is_empty());
+        // Empty output (tools print nothing on cancel): empty.
+        assert!(os_string_from_dialog_stdout(b"").is_empty());
+        // Whitespace-only output: only terminators are stripped, so a lone
+        // space survives (a space-only filename is odd but legal; the
+        // reserve layer treats a zero-byte file as a placeholder either
+        // way).
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert_eq!(
+                os_string_from_dialog_stdout(b" \n"),
+                std::ffi::OsString::from_vec(b" ".to_vec())
+            );
+        }
     }
 
     #[test]

@@ -117,8 +117,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config, diagnostics_request_tx: mpsc::Sender<()>) -> Self {
-        let (finish_tx, _finish_rx) = mpsc::channel(1);
+    pub fn new(
+        cfg: Config,
+        diagnostics_request_tx: mpsc::Sender<()>,
+        finish_tx: mpsc::Sender<crate::backend::filedialog::SaveChoice>,
+    ) -> Self {
         let settings = Settings {
             dpi: cfg.dpi,
             mode: cfg.mode.clone(),
@@ -354,8 +357,7 @@ pub async fn run_tui(
     // Save-dialog inbox: `f` spawns the native dialog task; its outcome
     // arrives here (see SaveChoice).
     let (finish_tx, mut finish_rx) = mpsc::channel::<crate::backend::filedialog::SaveChoice>(1);
-    let mut app = App::new(cfg.clone(), diag_tx);
-    app.finish_tx = finish_tx;
+    let mut app = App::new(cfg.clone(), diag_tx, finish_tx);
     app.picker_available = picker_available;
 
     let mut preview = PreviewWorker::new(picker);
@@ -820,9 +822,25 @@ async fn handle_key(
                 .unwrap_or_default();
             let event_tx = app.finish_tx.clone();
             app.dialog_in_flight = true;
+            // Panic guard: the dialog task must ALWAYS report an outcome, or
+            // `dialog_in_flight` would wedge and disable `f` for the rest of
+            // the run. The inner task's panic (tokio catches it and surfaces
+            // it through the JoinHandle) is mapped to Unavailable, which
+            // routes to the plain confirm dialog — the finish flow degrades,
+            // it never breaks.
+            let inner = tokio::spawn(crate::backend::filedialog::save_dialog(
+                dir,
+                filename,
+                "Save PDF as",
+            ));
             tokio::spawn(async move {
-                let chosen =
-                    crate::backend::filedialog::save_dialog(&dir, &filename, "Save PDF as").await;
+                let chosen = match inner.await {
+                    Ok(chosen) => chosen,
+                    Err(join_err) => {
+                        tracing::error!("save dialog task failed: {join_err}");
+                        crate::backend::filedialog::SaveChoice::Unavailable
+                    }
+                };
                 let _ = event_tx.send(chosen).await;
             });
         }
@@ -1079,7 +1097,8 @@ mod tests {
     /// App with throwaway channels; meta/pages are set per-test.
     fn test_app() -> App {
         let (diag_tx, _diag_rx) = mpsc::channel(4);
-        App::new(Config::default(), diag_tx)
+        let (finish_tx, _finish_rx) = mpsc::channel(1);
+        App::new(Config::default(), diag_tx, finish_tx)
     }
 
     fn ready_page(id: u32) -> PageView {
