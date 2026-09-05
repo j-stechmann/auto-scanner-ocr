@@ -120,3 +120,78 @@ async fn interrupted_part_is_discarded_by_release_reservation() {
     assert!(!out.exists(), "placeholder released");
     assert!(!part.exists(), "partial output discarded");
 }
+
+/// FinishTo overwrite semantics against the real toolchain: a pre-existing
+/// non-empty target is adopted byte-identical (the build never opens it),
+/// replaced only by the successful build's final rename. A failed build
+/// (missing language data -> fallback path) also replaces the file, via the
+/// fallback rename.
+#[tokio::test]
+async fn overwrite_adopts_existing_file_and_replaces_on_success() {
+    if auto_scanner_ocr::backend::which("ocrmypdf").is_none()
+        || auto_scanner_ocr::backend::which("img2pdf").is_none()
+        || !tesseract_has_eng()
+    {
+        eprintln!("skipping: ocrmypdf/img2pdf/tesseract(eng) not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("existing-report.pdf");
+    std::fs::write(&out, b"previous version of the report").unwrap();
+
+    // Reserve the target with overwrite intent (reserve_target): adoption
+    // must not truncate the previous file.
+    let reserved = auto_scanner_ocr::backend::pdf::reserve_target(&out, true).unwrap();
+    assert_eq!(reserved, out);
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        b"previous version of the report",
+        "adoption leaves the existing file byte-identical"
+    );
+
+    // A successful build replaces it atomically.
+    let plan = plan_for(dir.path(), out.clone());
+    let outcome = build_pdf(&plan).await.expect("build succeeds");
+    assert_eq!(outcome, BuildOutcome::Searchable);
+    let meta = std::fs::metadata(&out).unwrap();
+    assert!(meta.len() > 0, "target replaced by the built PDF");
+    assert!(
+        meta.len() as usize != "previous version of the report".len(),
+        "content actually replaced"
+    );
+    assert!(!out.with_extension("pdf.part").exists());
+}
+
+#[tokio::test]
+async fn failed_build_leaves_adopted_target_untouched() {
+    if auto_scanner_ocr::backend::which("img2pdf").is_none() {
+        eprintln!("skipping: img2pdf not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("precious.pdf");
+    std::fs::write(&out, b"must survive a failed build").unwrap();
+    auto_scanner_ocr::backend::pdf::reserve_target(&out, true).unwrap();
+
+    // Force the img2pdf step to fail (fatal before .part is created):
+    // garbage image path.
+    let page = dir.path().join("missing.png");
+    let plan = BuildPlan {
+        pages: vec![(page, 300)],
+        any_page_needing_cleanup: false,
+        manually_rotated: false,
+        langs: "eng".into(),
+        out_pdf: out.clone(),
+    };
+    assert!(build_pdf(&plan).await.is_err(), "img2pdf failure is fatal");
+
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        b"must survive a failed build",
+        "adopted target untouched by the failed build"
+    );
+    assert!(
+        !out.with_extension("pdf.part").exists(),
+        "no .part created when img2pdf aborts first"
+    );
+}

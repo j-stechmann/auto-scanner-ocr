@@ -39,6 +39,8 @@ No daemons, no web servers: you run it in a terminal when you want to scan.
 - `poppler-utils` for `pdfunite` (only needed when one session mixes DPIs)
 - `unpaper` (optional; only for the unpaper cleanup modes)
 - `libnotify` for notifications (optional)
+- `zenity`, `kdialog` or `yad` for the save dialog at finish (optional; the
+  default path is used without one)
 - A SANE-compatible scanner (USB-only models like the Deskjet 1050a work fine)
 
 ## Install
@@ -105,7 +107,7 @@ Inside the TUI:
 | `R` / `<` | Rotate page 90° clockwise / counter-clockwise |
 | `d` | Delete page (kills the job if it's still processing) |
 | `1`–`9` | Jump to page N |
-| `f` | Build the searchable PDF (confirm dialog shows the output path) |
+| `f` | Build the searchable PDF (system save dialog: choose folder + filename) |
 | `o` | Open the finished PDF with `xdg-open` |
 | `n` | New session |
 | `m` | Cycle scan mode: gray → color → lineart |
@@ -120,7 +122,11 @@ page 2 on the glass, press `s` again — the scanner is free as soon as page
 1's capture ends (its text-pane OCR and cleanup continue in the background,
 and under the default `preview_ocr = "lazy"` text is only extracted when
 you view the page). Press `f` when done; the PDF lands in
-`~/Documents/scans/` as `YYYY-MM-DD_HHMMSS.pdf`.
+`~/Documents/scans/` as `YYYY-MM-DD_HHMMSS.pdf` by default — the system
+save dialog (zenity/kdialog/yad when installed) opens first, so you can
+pick another folder and/or filename; overwriting an existing file asks for
+confirmation. Without a dialog tool, the build goes straight to the
+default path.
 
 **Small print**: the default is 300 dpi — the OCR sweet spot, 2–3× faster
 per capture and fine for normal 10–12pt text. For dense small print use

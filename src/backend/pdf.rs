@@ -366,6 +366,42 @@ pub fn reserve_output_path(dir: &Path, stamp: String) -> Result<PathBuf> {
     }
 }
 
+/// Reserve an exact, user-chosen output path for `FinishTo` (no collision
+/// ladder — the ladder is for auto-generated stamps). An existing DIRECTORY
+/// is always rejected here: O_EXCL on a directory also surfaces as
+/// AlreadyExists, and adopting one would only be discovered at the final
+/// rename (EISDIR) after the whole OCR run. An existing zero-byte file is
+/// always adopted (placeholder semantics). An existing non-empty file is
+/// adopted as-is only when `allow_existing` (overwrite intent): the build
+/// never opens the target — img2pdf/ocrmypdf write elsewhere and the final
+/// `.part` rename replaces it — so the previous file stays byte-identical
+/// until a successful build. Other open errors (missing dir => NotFound,
+/// unwritable dir => PermissionDenied) propagate; the caller must have
+/// created the target dir already.
+pub fn reserve_target(path: &Path, allow_existing: bool) -> Result<PathBuf> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_dir() {
+            anyhow::bail!("{} is a directory", path.display());
+        }
+        if meta.is_file() && meta.len() > 0 && !allow_existing {
+            anyhow::bail!(
+                "{} already exists (choose a different name or allow overwrite)",
+                path.display()
+            );
+        }
+        // Adopted as-is (zero-byte placeholder, or overwrite intent). The
+        // path must still be a regular file; metadata above proved it.
+        return Ok(path.to_path_buf());
+    }
+    // Missing (or raced): create the zero-byte placeholder exclusively, so
+    // two concurrent sessions cannot claim the same user path.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    Ok(path.to_path_buf())
+}
+
 /// Remove a reservation made by `reserve_output_path`. Only deletes the
 /// zero-byte placeholder, so a real PDF (written by a finished build) is
 /// never touched. Also discards a leftover `<path>.part` (an interrupted
@@ -537,5 +573,72 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(calls[0].windows(2).any(|w| w == ["--imgsize", "300dpi"]));
         assert!(calls[0].contains(&"a.png".to_string()) && calls[0].contains(&"b.png".to_string()));
+    }
+
+    #[test]
+    fn reserve_target_fresh_zero_byte_and_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // Free path: reserved, zero-byte placeholder exists.
+        let fresh = d.join("custom.pdf");
+        assert_eq!(reserve_target(&fresh, false).unwrap(), fresh);
+        assert!(fresh.exists());
+        assert_eq!(std::fs::metadata(&fresh).unwrap().len(), 0);
+
+        // A second reserve of the same free path (still zero-byte) is
+        // adopted, not an error: the placeholder is ours.
+        assert_eq!(reserve_target(&fresh, false).unwrap(), fresh);
+
+        // Non-empty target without overwrite intent: rejected, file
+        // untouched.
+        let taken = d.join("taken.pdf");
+        std::fs::write(&taken, b"real pdf bytes").unwrap();
+        assert!(reserve_target(&taken, false).is_err());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"real pdf bytes");
+
+        // Non-empty target with overwrite intent: adopted as-is (no
+        // truncate — the file is only replaced by the build's final
+        // rename).
+        assert_eq!(reserve_target(&taken, true).unwrap(), taken);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"real pdf bytes");
+
+        // Zero-byte targets are adoptable even without overwrite intent
+        // (placeholder semantics; release_reservation will clean them up).
+        let empty = d.join("empty.pdf");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(reserve_target(&empty, false).unwrap(), empty);
+
+        // A directory named foo.pdf is rejected up front, never adopted.
+        let as_dir = d.join("dir.pdf");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(reserve_target(&as_dir, true).is_err());
+        assert!(as_dir.is_dir());
+
+        // Missing target dir: NotFound propagates, nothing created.
+        let missing_dir = d.join("no/such/dir");
+        assert!(reserve_target(&missing_dir.join("x.pdf"), false).is_err());
+        assert!(!missing_dir.exists());
+    }
+
+    #[test]
+    fn release_keeps_adopted_target_and_discards_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // Adopted non-empty file survives release; a sibling .part from an
+        // interrupted overwrite build is discarded.
+        let target = d.join("adopted.pdf");
+        std::fs::write(&target, b"previous content").unwrap();
+        std::fs::write(target.with_extension("pdf.part"), b"garbage").unwrap();
+        release_reservation(&target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous content");
+        assert!(!target.with_extension("pdf.part").exists());
+
+        // A created placeholder is released entirely.
+        let placeholder = d.join("placeholder.pdf");
+        reserve_target(&placeholder, false).unwrap();
+        release_reservation(&placeholder);
+        assert!(!placeholder.exists());
     }
 }

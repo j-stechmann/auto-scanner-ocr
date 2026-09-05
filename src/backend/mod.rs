@@ -1,3 +1,4 @@
+pub mod filedialog;
 pub mod pdf;
 pub mod process;
 pub mod scan;

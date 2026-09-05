@@ -18,7 +18,13 @@ pub enum Overlay {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmKind {
     Quit,
-    Finish,
+    /// Build to an explicit user-chosen path (system save dialog). The
+    /// actor retargets the reserved placeholder; `overwrite` is already
+    /// confirmed by the dialog's own prompt.
+    Finish {
+        out: std::path::PathBuf,
+        overwrite: bool,
+    },
     NewSession,
     DeletePage(usize),
     DeleteBusy,
@@ -47,10 +53,13 @@ impl Confirm {
 
     pub fn finish(path: std::path::PathBuf) -> Self {
         Self {
-            kind: ConfirmKind::Finish,
+            kind: ConfirmKind::Finish {
+                out: path,
+                overwrite: false,
+            },
             title: "Build searchable PDF?".into(),
             lines: vec![
-                format!("Output: {}", path.display()),
+                "Output: the default timestamped path (no save dialog found).".into(),
                 "OCR runs over all pages; this can take a while.".into(),
             ],
             accept_label: "Enter build".into(),
@@ -217,8 +226,13 @@ async fn accept_confirm(
     use crate::session::Cmd;
     match kind {
         ConfirmKind::Quit => app.quit_requested = true,
-        ConfirmKind::Finish => {
-            let _ = cmd_tx.send(Cmd::Finish).await;
+        ConfirmKind::Finish { out, overwrite } => {
+            let _ = cmd_tx
+                .send(Cmd::FinishTo {
+                    out: out.clone(),
+                    overwrite: *overwrite,
+                })
+                .await;
         }
         ConfirmKind::NewSession => {
             let _ = cmd_tx.send(Cmd::NewSession).await;

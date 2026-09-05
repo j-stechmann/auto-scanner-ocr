@@ -106,10 +106,16 @@ pub struct App {
     pub preview_cells: Vec<(crate::session::PageId, Rect)>,
     /// Spinner frame counter (bumped on ticks).
     pub tick: u64,
+    /// Inbox for the system save-dialog task: `f` spawns the native dialog
+    /// (zenity/kdialog/yad) and it reports the chosen path here — None =
+    /// cancelled or no tool installed (then the plain confirm dialog is
+    /// used). Consumed by the run_tui select loop.
+    pub finish_tx: mpsc::Sender<Option<PathBuf>>,
 }
 
 impl App {
     pub fn new(cfg: Config, diagnostics_request_tx: mpsc::Sender<()>) -> Self {
+        let (finish_tx, _finish_rx) = mpsc::channel(1);
         let settings = Settings {
             dpi: cfg.dpi,
             mode: cfg.mode.clone(),
@@ -153,6 +159,7 @@ impl App {
             pane_rects: None,
             preview_cells: Vec::new(),
             tick: 0,
+            finish_tx,
         }
     }
 
@@ -340,7 +347,11 @@ pub async fn run_tui(
     } = init;
     let mut report_rx = report_rx;
     let (diag_tx, mut diag_rx) = mpsc::channel::<()>(4);
+    // Save-dialog inbox: `f` spawns the native dialog task; its chosen
+    // path arrives here (None = cancelled / no tool installed).
+    let (finish_tx, mut finish_rx) = mpsc::channel::<Option<PathBuf>>(1);
     let mut app = App::new(cfg.clone(), diag_tx);
+    app.finish_tx = finish_tx;
     app.picker_available = picker_available;
 
     let mut preview = PreviewWorker::new(picker);
@@ -406,6 +417,10 @@ pub async fn run_tui(
                         let _ = report_tx.send(report).await;
                     });
                 }
+            }
+            // System save-dialog result for the finish flow (f key).
+            Some(chosen) = finish_rx.recv() => {
+                handle_dialog_result(&mut app, chosen, &cmd_tx).await;
             }
             // Periodic tick: elapsed timers, spinner frames, and the lazy
             // preview-OCR request for the selected page.
@@ -778,12 +793,31 @@ async fn handle_key(
 
         // ---------------- finish / open / session
         Char('f') => {
+            // Delegate path choice to the system save dialog (zenity/
+            // kdialog/yad) in a background task: the dialog is a blocking
+            // native window and must never run in the select loop. The
+            // chosen path is delivered as an Event; without any dialog
+            // tool the plain confirm dialog (default path) is used.
             let path = app
                 .meta
                 .as_ref()
                 .map(|m| m.output_path.clone())
                 .unwrap_or_default();
-            app.overlay = Some(Overlay::Confirm(Confirm::finish(path)));
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| app.cfg.output.clone());
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let event_tx = app.finish_tx.clone();
+            tokio::spawn(async move {
+                let chosen =
+                    crate::backend::filedialog::save_dialog(&dir, &filename, "Save PDF as").await;
+                let _ = event_tx.send(chosen).await;
+            });
         }
         Char('o') => {
             if let Some((path, _, _)) = &app.last_result {
@@ -895,6 +929,37 @@ pub fn next_dpi(current: u16, dir: i32) -> u16 {
                     .copied()
                     .unwrap_or(DPI_PRESETS[0])
             }
+        }
+    }
+}
+
+/// Result of the system save-dialog task for `f`: Some(path) = user picked
+/// a target (overwrite already confirmed inside the dialog), None =
+/// cancelled or no dialog tool installed (fall back to the plain confirm
+/// dialog with the reserved default path).
+async fn handle_dialog_result(
+    app: &mut App,
+    chosen: Option<PathBuf>,
+    cmd_tx: &mpsc::Sender<session::Cmd>,
+) {
+    match chosen {
+        Some(out) => {
+            app.set_status(format!("saving to {}", out.display()));
+            let _ = cmd_tx
+                .send(session::Cmd::FinishTo {
+                    out,
+                    // The dialog's own overwrite prompt already asked.
+                    overwrite: true,
+                })
+                .await;
+        }
+        None => {
+            let path = app
+                .meta
+                .as_ref()
+                .map(|m| m.output_path.clone())
+                .unwrap_or_default();
+            app.overlay = Some(Overlay::Confirm(Confirm::finish(path)));
         }
     }
 }
