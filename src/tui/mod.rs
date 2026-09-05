@@ -1,6 +1,7 @@
 mod app;
 mod overlays;
 mod preview;
+mod theme;
 mod ui;
 
 pub use app::{run_tui, App, Settings, TuiInit};

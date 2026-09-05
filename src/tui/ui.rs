@@ -1,7 +1,7 @@
 //! Rendering: layout, panes, footer, and hit-testing for mouse focus.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -221,18 +221,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .width
         .saturating_sub(title.len() as u16 + device.len() as u16) as usize;
     let spans = vec![
-        Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightBlue)
-                .bold(),
-        ),
-        Span::styled(" ".repeat(filler), Style::default().bg(Color::LightBlue)),
-        Span::styled(
-            device,
-            Style::default().fg(Color::Black).bg(Color::LightBlue),
-        ),
+        Span::styled(title, super::theme::header()),
+        Span::styled(" ".repeat(filler), super::theme::header_filler()),
+        Span::styled(device, super::theme::header_filler()),
     ];
     let line = Line::from(spans);
     f.render_widget(Paragraph::new(line), row);
@@ -259,13 +250,8 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     for (idx, page) in app.pages.iter().enumerate() {
         let selected = idx == app.selected;
         let status_span = match page.status {
-            PageStatus::Ready => Span::styled(
-                " ready ",
-                Style::default().fg(Color::Black).bg(Color::Green),
-            ),
-            PageStatus::Failed => {
-                Span::styled(" FAILED ", Style::default().fg(Color::White).bg(Color::Red))
-            }
+            PageStatus::Ready => Span::styled(" ready ", super::theme::BADGE_OK),
+            PageStatus::Failed => Span::styled(" FAILED ", super::theme::BADGE_FAIL),
             // Live elapsed timer: recomputed every draw (250ms tick keeps
             // this fresh during long scans) - no actor round-trips needed.
             PageStatus::Scanning | PageStatus::Processing => {
@@ -274,15 +260,9 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                     .stage_started
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(0);
-                Span::styled(
-                    format!(" {label} {secs:>3}s "),
-                    Style::default().fg(Color::Black).bg(Color::Yellow),
-                )
+                Span::styled(format!(" {label} {secs:>3}s "), super::theme::BADGE_BUSY)
             }
-            PageStatus::DeletePending => Span::styled(
-                " deleting ",
-                Style::default().fg(Color::Black).bg(Color::DarkGray),
-            ),
+            PageStatus::DeletePending => Span::styled(" deleting ", super::theme::BADGE_MUTED),
         };
         let num = format!("{:>2}. ", idx + 1);
         let settings = format!("{}dpi {}", page.dpi, page.mode);
@@ -298,15 +278,15 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             ),
             status_span,
             Span::raw(" "),
-            Span::styled(settings, Style::default().fg(Color::DarkGray)),
-            Span::styled(rot, Style::default().fg(Color::Blue)),
+            Span::styled(settings, super::theme::MUTED),
+            Span::styled(rot, super::theme::ROTATED),
         ]);
         items.push(ListItem::new(line));
     }
 
     let list = List::new(items)
         .block(block_with_title("Pages", is_focused(app, Pane::Sidebar)))
-        .highlight_style(Style::default().bg(Color::Rgb(40, 60, 80)))
+        .highlight_style(super::theme::HIGHLIGHT)
         .highlight_symbol("▸ ");
     // Use offset so the selection stays visible.
     let mut state = ratatui::widgets::ListState::default().with_selected(Some(app.selected));
@@ -357,8 +337,7 @@ fn draw_preview(
     app.preview_cells.clear();
     if n == 0 {
         f.render_widget(
-            Paragraph::new("press s to scan your first page")
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("press s to scan your first page").style(super::theme::MUTED),
             inner,
         );
         return;
@@ -383,11 +362,9 @@ fn draw_cell(
     selected: bool,
 ) -> Rect {
     let border_style = if selected {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        super::theme::ACCENT_BOLD
     } else {
-        Style::default().fg(Color::Rgb(70, 70, 70))
+        super::theme::border_unfocused()
     };
     let page = app.pages.iter().find(|p| p.id == id);
     let num = page.map(|p| p.id).unwrap_or(id);
@@ -398,9 +375,9 @@ fn draw_cell(
         .title(Span::styled(
             format!(" {num} "),
             if selected {
-                Style::default().fg(Color::Cyan).bold()
+                super::theme::ACCENT_BOLD
             } else {
-                Style::default().fg(Color::DarkGray)
+                super::theme::MUTED
             },
         ));
     let inner = block.inner(cell);
@@ -415,10 +392,7 @@ fn draw_cell(
         } else {
             String::new()
         };
-        f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
-            inner,
-        );
+        f.render_widget(Paragraph::new(hint).style(super::theme::MUTED), inner);
     }
     inner
 }
@@ -468,7 +442,7 @@ fn draw_text(f: &mut Frame, app: &mut App, area: Rect) {
         };
         vec![Line::from(Span::styled(
             content_str(&hint),
-            Style::default().fg(Color::DarkGray),
+            super::theme::MUTED,
         ))]
     } else {
         text.lines().map(Line::from).collect()
@@ -506,7 +480,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or(0);
             spans.push(Span::styled(
                 format!(" SCANNING {secs}s "),
-                Style::default().fg(Color::Black).bg(Color::Yellow).bold(),
+                super::theme::BADGE_BUSY,
             ));
         }
         Busy::Finishing => {
@@ -518,7 +492,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or(0);
             spans.push(Span::styled(
                 format!(" BUILDING PDF {secs}s "),
-                Style::default().fg(Color::Black).bg(Color::Yellow).bold(),
+                super::theme::BADGE_BUSY,
             ));
         }
     }
@@ -526,7 +500,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if jobs > 0 {
         spans.push(Span::styled(
             format!(" {jobs} processing "),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            super::theme::BADGE_INFO,
         ));
     }
     for (key, action, label) in [
@@ -540,51 +514,39 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     ] {
         let allowed = app.action_allowed(action);
         let style = if allowed {
-            Style::default().fg(Color::Cyan)
+            super::theme::ACCENT
         } else {
-            Style::default().fg(Color::DarkGray)
+            super::theme::MUTED
         };
         spans.push(Span::styled(format!(" {key}"), style));
-        spans.push(Span::styled(
-            format!(" {label} ·"),
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled(format!(" {label} ·"), super::theme::MUTED));
     }
     // Live dpi/mode hint (discoverability of +/- and m; the header shows
     // the same values). String spans because the value is dynamic.
     let settings_allowed = app.action_allowed(Action::Settings);
     let settings_style = if settings_allowed {
-        Style::default().fg(Color::Cyan)
+        super::theme::ACCENT
     } else {
-        Style::default().fg(Color::DarkGray)
+        super::theme::MUTED
     };
     spans.push(Span::styled(" +/-", settings_style));
     spans.push(Span::styled(
         format!(" {}dpi ·", app.settings.dpi),
-        Style::default().fg(Color::DarkGray),
+        super::theme::MUTED,
     ));
     spans.push(Span::styled(" m", settings_style));
     spans.push(Span::styled(
         format!(" {} ·", app.settings.mode),
-        Style::default().fg(Color::DarkGray),
+        super::theme::MUTED,
     ));
-    spans.push(Span::styled(" Tab", Style::default().fg(Color::Cyan)));
-    spans.push(Span::styled(
-        " pane · ",
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::styled("?", Style::default().fg(Color::Cyan)));
-    spans.push(Span::styled(
-        " help · ",
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::styled("!", Style::default().fg(Color::Cyan)));
-    spans.push(Span::styled(
-        " diag · ",
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::styled("q", Style::default().fg(Color::Cyan)));
-    spans.push(Span::styled(" quit", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(" Tab", super::theme::ACCENT));
+    spans.push(Span::styled(" pane · ", super::theme::MUTED));
+    spans.push(Span::styled("?", super::theme::ACCENT));
+    spans.push(Span::styled(" help · ", super::theme::MUTED));
+    spans.push(Span::styled("!", super::theme::ACCENT));
+    spans.push(Span::styled(" diag · ", super::theme::MUTED));
+    spans.push(Span::styled("q", super::theme::ACCENT));
+    spans.push(Span::styled(" quit", super::theme::MUTED));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -594,16 +556,14 @@ fn is_focused(app: &App, pane: Pane) -> bool {
 
 fn block_with_title(title: &str, focused: bool) -> Block<'_> {
     let title_style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        super::theme::ACCENT_BOLD
     } else {
-        Style::default().fg(Color::DarkGray)
+        super::theme::MUTED
     };
     let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+        super::theme::border_focused()
     } else {
-        Style::default().fg(Color::Rgb(70, 70, 70))
+        super::theme::border_unfocused()
     };
     Block::default()
         .title(Span::styled(format!(" {title} "), title_style))
@@ -628,15 +588,17 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn overlay_block(title: &str) -> Block<'_> {
+    // No explicit bg: Clear resets the dialog cells to Reset (SGR 39/49), so
+    // body text renders in the theme's own fg/bg pair by construction. A
+    // themed bg(Black) would break on light palettes, where slot 0 is pale.
     Block::default()
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(Color::Cyan).bold(),
+            super::theme::ACCENT_BOLD,
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(super::theme::border_focused())
         .border_set(symbols::border::ROUNDED)
-        .style(Style::default().bg(Color::Black))
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -673,11 +635,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
         if v.is_empty() {
             lines.push(Line::from(Span::styled(
                 k.to_string(),
-                Style::default().bold().fg(Color::Cyan),
+                super::theme::ACCENT_BOLD,
             )));
         } else {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {k:<20}"), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("  {k:<20}"), super::theme::KEY),
                 Span::raw(v),
             ]));
         }
@@ -705,18 +667,15 @@ fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
     };
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         "press r to re-run checks · Esc to close",
-        Style::default().fg(Color::DarkGray),
+        super::theme::MUTED,
     ))];
     for item in &report.items {
         let (mark, style) = match item.status {
-            Status::Ok => (" OK ", Style::default().fg(Color::Black).bg(Color::Green)),
-            Status::Warn => ("WARN", Style::default().fg(Color::Black).bg(Color::Yellow)),
-            Status::Fail => ("FAIL", Style::default().fg(Color::White).bg(Color::Red)),
-            Status::Skip => (
-                "SKIP",
-                Style::default().fg(Color::Black).bg(Color::DarkGray),
-            ),
-            Status::Pending => (" ...", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Status::Ok => (" OK ", super::theme::BADGE_OK),
+            Status::Warn => ("WARN", super::theme::BADGE_BUSY),
+            Status::Fail => ("FAIL", super::theme::BADGE_FAIL),
+            Status::Skip => ("SKIP", super::theme::BADGE_MUTED),
+            Status::Pending => (" ...", super::theme::BADGE_INFO),
         };
         if item.status == Status::Pending {
             lines.push(Line::from(vec![
@@ -727,7 +686,7 @@ fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
                         " {}",
                         item.pending_detail.as_deref().unwrap_or("running...")
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    super::theme::MUTED,
                 ),
             ]));
             continue;
@@ -739,14 +698,14 @@ fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
         if !item.detail.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("        {}", item.detail),
-                Style::default().fg(Color::DarkGray),
+                super::theme::MUTED,
             )));
         }
         if let Some(hint) = &item.hint {
             for line in hint.lines() {
                 lines.push(Line::from(Span::styled(
                     format!("        install: {line}"),
-                    Style::default().fg(Color::Yellow),
+                    super::theme::KEY,
                 )));
             }
         }
@@ -772,7 +731,7 @@ fn draw_lang_picker(f: &mut Frame, picker: &overlays::LangPicker, area: Rect) {
         let cursor = idx == picker.cursor;
         let marker = if selected { "[x]" } else { "[ ]" };
         let style = if cursor {
-            Style::default().bg(Color::Rgb(40, 60, 80))
+            super::theme::HIGHLIGHT
         } else {
             Style::default()
         };
@@ -788,7 +747,7 @@ fn draw_lang_picker(f: &mut Frame, picker: &overlays::LangPicker, area: Rect) {
                 picker.result()
             }
         ),
-        Style::default().fg(Color::DarkGray),
+        super::theme::MUTED,
     )));
     let height = (picker.available.len() as u16 + 6).min(24);
     let area = centered_rect(40, height, area);
@@ -824,10 +783,10 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled(
             format!(" [{}] ", confirm.accept_label),
-            Style::default().fg(Color::Black).bg(Color::Green),
+            super::theme::BADGE_OK,
         ),
         Span::raw("  "),
-        Span::styled("[Esc] cancel", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Esc] cancel", super::theme::MUTED),
     ]));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
