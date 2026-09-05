@@ -106,10 +106,22 @@ pub struct App {
     pub preview_cells: Vec<(crate::session::PageId, Rect)>,
     /// Spinner frame counter (bumped on ticks).
     pub tick: u64,
+    /// True while a spawned system save dialog is still open: `f` must not
+    /// stack a second native dialog on top (the first one's result would
+    /// arrive out of order). Cleared when its outcome is consumed.
+    pub dialog_in_flight: bool,
+    /// Inbox for the system save-dialog task: `f` spawns the native dialog
+    /// (zenity/kdialog/yad) and it reports the outcome here — see
+    /// `SaveChoice`. Consumed by the run_tui select loop.
+    pub finish_tx: mpsc::Sender<crate::backend::filedialog::SaveChoice>,
 }
 
 impl App {
-    pub fn new(cfg: Config, diagnostics_request_tx: mpsc::Sender<()>) -> Self {
+    pub fn new(
+        cfg: Config,
+        diagnostics_request_tx: mpsc::Sender<()>,
+        finish_tx: mpsc::Sender<crate::backend::filedialog::SaveChoice>,
+    ) -> Self {
         let settings = Settings {
             dpi: cfg.dpi,
             mode: cfg.mode.clone(),
@@ -153,6 +165,8 @@ impl App {
             pane_rects: None,
             preview_cells: Vec::new(),
             tick: 0,
+            dialog_in_flight: false,
+            finish_tx,
         }
     }
 
@@ -245,7 +259,11 @@ impl App {
             Action::Delete => !self.pages.is_empty(),
             Action::Reorder => !self.pages.is_empty(),
             Action::Finish => {
-                !self.pages.is_empty()
+                // A system save dialog is blocking in the background: the
+                // outcome is still pending, so `f` must not stack a second
+                // dialog (and the footer greys the key accordingly).
+                !self.dialog_in_flight
+                    && !self.pages.is_empty()
                     && matches!(busy, Busy::Idle)
                     && !finished
                     && self.pages.iter().all(|p| {
@@ -340,7 +358,10 @@ pub async fn run_tui(
     } = init;
     let mut report_rx = report_rx;
     let (diag_tx, mut diag_rx) = mpsc::channel::<()>(4);
-    let mut app = App::new(cfg.clone(), diag_tx);
+    // Save-dialog inbox: `f` spawns the native dialog task; its outcome
+    // arrives here (see SaveChoice).
+    let (finish_tx, mut finish_rx) = mpsc::channel::<crate::backend::filedialog::SaveChoice>(1);
+    let mut app = App::new(cfg.clone(), diag_tx, finish_tx);
     app.picker_available = picker_available;
 
     let mut preview = PreviewWorker::new(picker);
@@ -406,6 +427,10 @@ pub async fn run_tui(
                         let _ = report_tx.send(report).await;
                     });
                 }
+            }
+            // System save-dialog result for the finish flow (f key).
+            Some(chosen) = finish_rx.recv() => {
+                handle_dialog_result(&mut app, chosen, &cmd_tx).await;
             }
             // Periodic tick: elapsed timers, spinner frames, and the lazy
             // preview-OCR request for the selected page.
@@ -777,13 +802,52 @@ async fn handle_key(
         }
 
         // ---------------- finish / open / session
-        Char('f') => {
+        Char('f') if app.action_allowed(Action::Finish) => {
+            // Delegate path choice to the system save dialog (zenity/
+            // kdialog/yad) in a background task: the dialog is a blocking
+            // native window and must never run in the select loop. The
+            // outcome is delivered via finish_tx; without any dialog tool
+            // the plain confirm dialog (default path) is used. The
+            // dialog-in-flight flag is part of action_allowed(Finish), so
+            // the keypress guard and the footer stay in sync and a second
+            // dialog can never stack while one is open.
             let path = app
                 .meta
                 .as_ref()
                 .map(|m| m.output_path.clone())
                 .unwrap_or_default();
-            app.overlay = Some(Overlay::Confirm(Confirm::finish(path)));
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| app.cfg.output.clone());
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let event_tx = app.finish_tx.clone();
+            app.dialog_in_flight = true;
+            // Panic guard: the dialog task must ALWAYS report an outcome, or
+            // `dialog_in_flight` would wedge and disable `f` for the rest of
+            // the run. The inner task's panic (tokio catches it and surfaces
+            // it through the JoinHandle) is mapped to Unavailable, which
+            // routes to the plain confirm dialog — the finish flow degrades,
+            // it never breaks.
+            let inner = tokio::spawn(crate::backend::filedialog::save_dialog(
+                dir,
+                filename,
+                "Save PDF as",
+            ));
+            tokio::spawn(async move {
+                let chosen = match inner.await {
+                    Ok(chosen) => chosen,
+                    Err(join_err) => {
+                        tracing::error!("save dialog task failed: {join_err}");
+                        crate::backend::filedialog::SaveChoice::Unavailable
+                    }
+                };
+                let _ = event_tx.send(chosen).await;
+            });
         }
         Char('o') => {
             if let Some((path, _, _)) = &app.last_result {
@@ -899,6 +963,54 @@ pub fn next_dpi(current: u16, dir: i32) -> u16 {
     }
 }
 
+/// Result of the system save-dialog task for `f`: `Chosen(path)` = user
+/// picked a target (overwrite already confirmed inside the dialog),
+/// `Cancelled` = the user dismissed the dialog (do nothing — they have not
+/// changed their mind about building, and must not be railroaded into the
+/// default-path confirm), `Unavailable` = no dialog tool installed, or the
+/// tool could not run (no display, e.g. SSH without forwarding — exit-1
+/// display failures are discriminated by stderr). Unavailable falls back
+/// to the plain confirm dialog with the reserved default path.
+async fn handle_dialog_result(
+    app: &mut App,
+    chosen: crate::backend::filedialog::SaveChoice,
+    cmd_tx: &mpsc::Sender<session::Cmd>,
+) {
+    use crate::backend::filedialog::SaveChoice;
+    app.dialog_in_flight = false;
+    match chosen {
+        SaveChoice::Chosen(out) => {
+            app.set_status(format!("saving to {}", out.display()));
+            let _ = cmd_tx
+                .send(session::Cmd::FinishTo {
+                    out,
+                    // The dialog's own overwrite prompt already asked.
+                    overwrite: true,
+                })
+                .await;
+        }
+        SaveChoice::Cancelled => {
+            app.set_status("save dialog cancelled - press f to try again");
+        }
+        SaveChoice::Unavailable => {
+            // The TUI stayed interactive while the dialog ran, so the user
+            // may have opened an overlay meanwhile (? / ! / quit confirm).
+            // Same guard as apply_report: never steal their overlay.
+            let path = app
+                .meta
+                .as_ref()
+                .map(|m| m.output_path.clone())
+                .unwrap_or_default();
+            let confirm = Overlay::Confirm(Confirm::finish(path));
+            if app.overlay.is_none() {
+                app.overlay = Some(confirm);
+            } else {
+                app.set_status("save dialog unavailable - press f to retry");
+            }
+        }
+    }
+}
+
 async fn open_result(path: &std::path::Path) {
     if crate::backend::which("xdg-open").is_none() {
         tracing::warn!("xdg-open not found");
@@ -998,7 +1110,8 @@ mod tests {
     /// App with throwaway channels; meta/pages are set per-test.
     fn test_app() -> App {
         let (diag_tx, _diag_rx) = mpsc::channel(4);
-        App::new(Config::default(), diag_tx)
+        let (finish_tx, _finish_rx) = mpsc::channel(1);
+        App::new(Config::default(), diag_tx, finish_tx)
     }
 
     fn ready_page(id: u32) -> PageView {
@@ -1535,5 +1648,62 @@ mod tests {
         app.pages = vec![p];
         assert!(!app.scan_allowed());
         assert!(!app.action_allowed(Action::Scan));
+    }
+
+    /// The dialog-in-flight flag is part of action_allowed(Finish): while a
+    /// system save dialog is pending, `f` is blocked and the footer greys it.
+    #[test]
+    fn finish_blocked_while_dialog_in_flight() {
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        assert!(app.action_allowed(Action::Finish));
+
+        app.dialog_in_flight = true;
+        assert!(
+            !app.action_allowed(Action::Finish),
+            "pending dialog must block a second `f` and grey the key"
+        );
+
+        app.dialog_in_flight = false;
+        assert!(app.action_allowed(Action::Finish));
+    }
+
+    /// The Unavailable fallback never steals an overlay the user opened
+    /// while the (blocking) system save dialog was pending; instead it
+    /// reports via the status line. `f` remains available for a retry.
+    #[tokio::test]
+    async fn dialog_unavailable_preserves_open_overlay() {
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.overlay = Some(Overlay::Confirm(Confirm::quit()));
+
+        handle_dialog_result(
+            &mut app,
+            crate::backend::filedialog::SaveChoice::Unavailable,
+            &mpsc::channel(1).0,
+        )
+        .await;
+        let overlay_kind = match &app.overlay {
+            Some(Overlay::Confirm(c)) => Some(c.kind.clone()),
+            _ => None,
+        };
+        assert!(
+            matches!(overlay_kind, Some(ConfirmKind::Quit)),
+            "user-opened overlay must survive the Unavailable fallback"
+        );
+        assert!(!app.dialog_in_flight, "flag released");
+        assert!(app.action_allowed(Action::Finish), "f available to retry");
+
+        // With no overlay open, Unavailable installs the finish confirm.
+        app.overlay = None;
+        handle_dialog_result(
+            &mut app,
+            crate::backend::filedialog::SaveChoice::Unavailable,
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
     }
 }

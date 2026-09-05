@@ -656,7 +656,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("d", "delete page"),
         ("1-9", "jump to page N"),
         ("Finish", ""),
-        ("f", "build searchable PDF (confirm dialog)"),
+        ("f", "build PDF (browser: choose folder + filename)"),
         ("o", "open PDF with xdg-open"),
         ("n", "new session"),
         ("Settings", ""),

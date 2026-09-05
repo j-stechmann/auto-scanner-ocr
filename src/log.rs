@@ -80,23 +80,13 @@ fn chrono_local() -> ChronoLocal {
     ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".to_string())
 }
 
-/// Record a completed command with output tails (parity with Python's run()).
-pub fn log_command(cmd: &[&str], output: &crate::backend::process::Output) {
-    tracing::debug!("{} rc-success={}", cmd.join(" "), output.success);
-    if !output.stdout.is_empty() {
-        tracing::debug!("stdout: {}", tail_bytes(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        tracing::debug!("stderr: {}", tail_bytes(&output.stderr));
-    }
-}
-
 /// Record a failed command (spawn error / timeout).
 pub fn log_failure(cmd: &[&str], err: impl std::fmt::Display) {
     tracing::debug!("{} failed: {err}", cmd.join(" "));
 }
 
-fn tail_bytes(bytes: &[u8]) -> String {
+/// Truncate to the last N bytes, lossily decoded (shared log formatting).
+pub fn tail_bytes(bytes: &[u8]) -> String {
     const MAX: usize = 2000;
     let start = bytes.len().saturating_sub(MAX);
     String::from_utf8_lossy(&bytes[start..]).into_owned()

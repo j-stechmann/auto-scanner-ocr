@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Choose where to save at finish**: `f` opens the system save dialog
+  (zenity, kdialog or yad — whichever is installed) for folder + filename,
+  with the default timestamped path pre-filled and the dialog's native
+  overwrite prompt. Cancelling the dialog aborts the finish. Without any
+  dialog tool the old confirm dialog (default path) is used, so the finish
+  flow never breaks
+
+### Fixed
+
+- **Save dialog panic can no longer wedge `f`**: the dialog task always
+  reports an outcome (a panic inside it is mapped to the plain-confirm
+  fallback); previously a panicking dialog task left `f` disabled for the
+  rest of the run
+- **Over-long chosen filenames no longer fail after the whole OCR run**:
+  the per-build `.part` name truncates the file component (with a short
+  hash to stay unique) so it stays within the kernel's NAME_MAX, and the
+  cleanup matcher re-derives the same truncated stem
+- **Filenames ending in whitespace are delivered exactly**: only the
+  dialog tools' line terminator (`\n`/`\r\n`) is stripped from their
+  stdout; other trailing whitespace (a trailing space is legal in a Linux
+  filename) is part of the chosen path
+- **Save dialog opens in the reserved output directory**: the dialog is
+  now seeded with the full default path (directory + filename) for all
+  three tools; previously zenity/yad opened wherever the app was launched
+  from, with only kdialog seeded at all
+- **Save dialog over SSH**: when the dialog tool is installed but cannot
+  open a window (no display, e.g. SSH without forwarding), the finish now
+  falls back to the plain confirm dialog instead of reporting "save dialog
+  cancelled" forever
+- **Concurrent builds to the same custom path no longer corrupt each
+  other**: each build writes its own unique `<name>-<pid>-<nanos>.part`
+  sibling; previously two sessions delivering to the same path shared one
+  `.part` and interleaved writes could corrupt the delivered file
+- **Non-UTF-8 filenames no longer mangled**: the dialog's chosen path is
+  read as raw bytes and threaded through the PDF build as `OsStr` (argv,
+  `.part` sibling, crash-recovery marker), so filenames that are legal on
+  Linux but not valid UTF-8 are delivered exactly instead of silently
+  targeting a different (lossily substituted) file
+
+### Changed
+
+- kdialog receives a plain Qt name filter instead of the zenity-style
+  `| *.pdf` variant, which kdialog split into two entries
+- Command logging: every child process now logs its rc and stdout/stderr
+  tails at DEBUG level uniformly in the process runner (scans included);
+  the per-call helper is gone
+
 ## [0.2.1] - 2026-09-05
 
 ### Fixed

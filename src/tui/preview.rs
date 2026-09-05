@@ -386,7 +386,8 @@ mod tests {
     /// runtime via #[tokio::test].
     fn test_app_with_pages(n: usize) -> App {
         let (diag_tx, _diag_rx) = mpsc::channel(4);
-        let mut app = App::new(crate::config::Config::default(), diag_tx);
+        let (finish_tx, _finish_rx) = mpsc::channel(1);
+        let mut app = App::new(crate::config::Config::default(), diag_tx, finish_tx);
         app.device_label = "test device".into();
         app.settings = Settings {
             dpi: 300,
