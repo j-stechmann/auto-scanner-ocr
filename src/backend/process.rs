@@ -11,6 +11,7 @@
 //! - children are killed on drop and run in their own process group, so a
 //!   cancelled scan takes down SANE helper processes too
 
+use std::ffi::OsStr;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -78,6 +79,14 @@ pub async fn run(cmd: &[&str], timeout: Option<Duration>) -> Result<Output, RunE
     run_inner(cmd, timeout, None).await
 }
 
+/// Like [`run`], but accepts `OsStr` arguments: filenames may legally
+/// contain non-UTF-8 bytes, and `to_string_lossy` would silently target a
+/// different (U+FFFD-mangled) path. Only file paths need this; all other
+/// command lines in this codebase are plain ASCII.
+pub async fn run_os(cmd: &[&OsStr], timeout: Option<Duration>) -> Result<Output, RunError> {
+    run_inner_os(cmd, timeout, None).await
+}
+
 /// Like [`run`], but abortable: when the token is cancelled the child (and
 /// its process group) is killed and `RunError::Cancelled` is returned.
 pub async fn run_cancellable(
@@ -104,7 +113,7 @@ async fn run_inner(
         // Own process group: lets us kill SANE helper processes as a group.
         .process_group(0);
 
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             log::log_failure(cmd, &RunError::NotFound);
@@ -118,7 +127,73 @@ async fn run_inner(
             return Err(RunError::Io(e));
         }
     };
+    finish_run(child, cmd.join(" "), timeout, token).await
+}
 
+async fn run_inner_os(
+    cmd: &[&OsStr],
+    timeout: Option<Duration>,
+    token: Option<&CancellationToken>,
+) -> Result<Output, RunError> {
+    // Log line is lossy by design (it is a log); the argv passed to the
+    // child below is not.
+    debug!("run: {}", OsStrArgs(cmd).to_string());
+    let mut command = Command::new(cmd[0]);
+    command
+        .args(&cmd[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        // Own process group: lets us kill SANE helper processes as a group.
+        .process_group(0);
+
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let s = OsStrArgs(cmd).to_string();
+            let s = [s.as_str()];
+            log::log_failure(&s, &RunError::NotFound);
+            return Err(RunError::NotFound);
+        }
+        Err(e) => {
+            let s = OsStrArgs(cmd).to_string();
+            let s = [s.as_str()];
+            log::log_failure(
+                &s,
+                RunError::Io(std::io::Error::new(e.kind(), e.to_string())),
+            );
+            return Err(RunError::Io(e));
+        }
+    };
+    finish_run(child, OsStrArgs(cmd).to_string(), timeout, token).await
+}
+
+/// `&[&str]`-like shim so the shared logging helpers can take either arg
+/// type (only `to_string` is used on it).
+struct OsStrArgs<'a>(&'a [&'a OsStr]);
+
+impl std::fmt::Display for OsStrArgs<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for a in self.0 {
+            if !first {
+                f.write_str(" ")?;
+            }
+            f.write_str(&a.to_string_lossy())?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
+/// Shared tail of `run_inner`/`run_inner_os` (drain, timeout, cancel, wait).
+async fn finish_run(
+    mut child: tokio::process::Child,
+    cmd_for_log: String,
+    timeout: Option<Duration>,
+    token: Option<&CancellationToken>,
+) -> Result<Output, RunError> {
     // Drain stderr concurrently so the child never blocks on a full pipe.
     let mut stderr_pipe = child.stderr.take().expect("stderr piped");
     let stderr_task = tokio::spawn(async move {
@@ -160,7 +235,7 @@ async fn run_inner(
         _ = cancel_fut => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            log::log_failure(cmd, &RunError::Cancelled);
+            warn!("{cmd_for_log} cancelled");
             return Err(RunError::Cancelled);
         }
     };
@@ -170,16 +245,13 @@ async fn run_inner(
         Outcome::Done(Err(e)) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            log::log_failure(
-                cmd,
-                RunError::Io(std::io::Error::new(e.kind(), e.to_string())),
-            );
+            warn!("{cmd_for_log} failed: io error: {e}");
             return Err(RunError::Io(e));
         }
         Outcome::TimedOut(d) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            log::log_failure(cmd, RunError::Timeout(d));
+            warn!("{cmd_for_log} timed out after {}s", d.as_secs());
             return Err(RunError::Timeout(d));
         }
     };
@@ -190,7 +262,7 @@ async fn run_inner(
         Err(_) => (false, -1),
     };
     if !success {
-        warn!("{cmd:?} exited with {rc}");
+        warn!("{cmd_for_log} exited with {rc}");
     }
 
     let output = Output {
@@ -198,7 +270,13 @@ async fn run_inner(
         stderr: stderr_buf,
         success,
     };
-    log::log_command(cmd, &output);
+    debug!("{} rc-success={}", cmd_for_log, success);
+    if !output.stdout.is_empty() {
+        tracing::debug!("stdout: {}", log::tail_bytes(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        tracing::debug!("stderr: {}", log::tail_bytes(&output.stderr));
+    }
     Ok(output)
 }
 

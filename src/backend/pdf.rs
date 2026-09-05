@@ -1,6 +1,7 @@
 //! Page cleanup (unpaper), rotation, and searchable-PDF assembly
 //! (img2pdf -> ocrmypdf).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -298,21 +299,32 @@ pub async fn build_pdf(plan: &BuildPlan) -> Result<BuildOutcome> {
         ocr_args.push("--clean".into());
     }
     // Final delivery is atomic: ocrmypdf and the fallback copy write to a
-    // `.part` sibling that is renamed into place only on success. A build
-    // killed mid-write therefore leaves the zero-byte reservation untouched
-    // (plus a garbage `.part` that release/sweep discard) instead of a
-    // truncated file the sweep would mistake for a finished PDF.
-    let mut part_os = plan.out_pdf.as_os_str().to_os_string();
-    part_os.push(".part");
-    let part = PathBuf::from(part_os);
+    // `<pid>-<nano>.part` sibling (unique per build: two concurrent
+    // sessions must never write the same `.part` and corrupt each other's
+    // output) that is renamed into place only on success. A build killed
+    // mid-write therefore leaves the zero-byte reservation untouched (plus
+    // a garbage `.part` that release/sweep discard) instead of a truncated
+    // file the sweep would mistake for a finished PDF.
+    let part = part_sibling(&plan.out_pdf, &unique_suffix());
 
-    ocr_args.push(raw_pdf.to_string_lossy().into_owned());
-    ocr_args.push(part.to_string_lossy().into_owned());
-
-    let refs: Vec<&str> = ocr_args.iter().map(String::as_str).collect();
-    let out = process::run(&refs, Some(OCRYPDF_TIMEOUT))
+    // ocrmypdf takes the raw OsStr paths: a chosen output path may legally
+    // contain non-UTF-8 bytes, and to_string_lossy would silently target a
+    // different (U+FFFD-mangled) file.
+    let os_args: Vec<&std::ffi::OsStr> = ocr_args
+        .iter()
+        .map(OsStr::new)
+        .chain([raw_pdf.as_os_str(), part.as_os_str()])
+        .collect();
+    let out = process::run_os(&os_args, Some(OCRYPDF_TIMEOUT))
         .await
-        .map_err(|e| process::fail_with_log_err("OCR (ocrmypdf)", &refs, e))?;
+        .map_err(|e| {
+            // Error context is a log/message: lossy paths are fine there.
+            let mut refs: Vec<String> = ocr_args.to_vec();
+            refs.push(raw_pdf.to_string_lossy().into_owned());
+            refs.push(part.to_string_lossy().into_owned());
+            let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+            process::fail_with_log_err("OCR (ocrmypdf)", &refs, e)
+        })?;
     if out.success {
         tokio::fs::rename(&part, &plan.out_pdf).await?;
         return Ok(BuildOutcome::Searchable);
@@ -335,6 +347,107 @@ async fn run_pdf_step(what: &str, args: &[String], timeout: Duration) -> Result<
         return Err(process::fail_with_log(what, &out));
     }
     Ok(())
+}
+
+/// Kernel filename limit (Linux NAME_MAX). `part_sibling` keeps the
+/// suffixed `.part` name within it: a near-limit target would otherwise
+/// make ocrmypdf's write fail with ENAMETOOLONG only after the whole OCR
+/// run.
+const NAME_MAX: usize = 255;
+/// Bytes reserved for `-<pid>-<nanos>` + `.part` (u32 pid + u128 nanos
+/// worst case). Fixed — not derived from the actual suffix — so the
+/// release/sweep matcher re-derives the same truncated stem without knowing
+/// the suffix.
+const PART_RESERVE: usize = 56;
+/// Length of the short hash appended to a truncated `.part` stem (full
+/// 64-bit hash as 16 hex chars: the collision between a truncated stem and
+/// an adversarially crafted sibling name stays cryptographically unlikely,
+/// not just "2^-32 improbable").
+const PART_HASH_LEN: usize = 16;
+
+/// `<name>-<pid>-<nanos>.part` sibling of `path`: same directory (the final
+/// rename must stay on one filesystem) with a per-build unique stem so
+/// concurrent sessions delivering to the same user path never interleave
+/// writes into a shared `.part`. The plain `<path>.part` name is still
+/// cleaned up by `release_reservation` (legacy leftovers).
+fn part_sibling(target: &Path, suffix: &str) -> PathBuf {
+    let Some(file) = target.file_name() else {
+        // Degenerate (no file component): legacy plain append.
+        let mut os = target.as_os_str().to_os_string();
+        os.push(suffix);
+        os.push(".part");
+        return PathBuf::from(os);
+    };
+    let budget = NAME_MAX - PART_RESERVE;
+    // Kept bytes of the file component before the hash tail (mirrored in
+    // `part_prefixes`).
+    let keep = budget - (PART_HASH_LEN + 1);
+    let bytes = file.as_encoded_bytes();
+    let stem = if bytes.len() > budget {
+        // Over-long filename: truncate the file component and append a
+        // short hash of the full name. Distinct long names keep distinct
+        // stems, and a truncated stem colliding with an unrelated short
+        // file's `.part` name would take a deliberate ~2^-64 crafting.
+        // Deterministic in the file name: the release/sweep matcher
+        // re-derives the same stem.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut v = bytes[..keep].to_vec();
+            v.push(b'-');
+            v.extend_from_slice(short_hash(file).as_bytes());
+            std::ffi::OsString::from_vec(v)
+        }
+        #[cfg(not(unix))]
+        {
+            // Lossy is acceptable here (Windows is not a target); keep
+            // char boundaries and the byte budget.
+            let lossy = file.to_string_lossy();
+            let mut kept = String::new();
+            for c in lossy.chars() {
+                if kept.len() + c.len_utf8() > keep {
+                    break;
+                }
+                kept.push(c);
+            }
+            kept.push('-');
+            kept.push_str(&short_hash(file));
+            std::ffi::OsString::from(kept)
+        }
+    } else {
+        file.to_os_string()
+    };
+    let mut out = target.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    out.push(stem);
+    let mut os = out.into_os_string();
+    // Raw OsString append (no separator): "out.pdf" + "-123-456" + ".part".
+    os.push(suffix);
+    os.push(".part");
+    PathBuf::from(os)
+}
+
+/// Stable 16-hex-char hash of an `OsStr` for the truncated `.part` stem.
+/// `DefaultHasher::new()` is fixed-key (deterministic within a binary), so
+/// both the write and the cleanup side derive the same value. (Across an
+/// std upgrade the hash may differ: old binary's truncated-stem leftovers
+/// then only get the plain-prefix match — best-effort cleanup as before.)
+fn short_hash(file: &OsStr) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    file.as_encoded_bytes().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Per-build suffix for `part_sibling` (pid + wall-clock nanos).
+fn unique_suffix() -> String {
+    format!(
+        "-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
 }
 
 /// Timestamped unique output path: `YYYY-MM-DD_HHMMSS.pdf` with `_2`, `_3`...
@@ -366,10 +479,54 @@ pub fn reserve_output_path(dir: &Path, stamp: String) -> Result<PathBuf> {
     }
 }
 
+/// Reserve an exact, user-chosen output path for `FinishTo` (no collision
+/// ladder — the ladder is for auto-generated stamps). An existing DIRECTORY
+/// is always rejected here: O_EXCL on a directory also surfaces as
+/// AlreadyExists, and adopting one would only be discovered at the final
+/// rename (EISDIR) after the whole OCR run. An existing zero-byte file is
+/// always adopted (placeholder semantics). An existing non-empty file is
+/// adopted as-is only when `allow_existing` (overwrite intent): the build
+/// never opens the target — img2pdf/ocrmypdf write elsewhere and the final
+/// `.part` rename replaces it — so the previous file stays byte-identical
+/// until a successful build. Other open errors (missing dir => NotFound,
+/// unwritable dir => PermissionDenied) propagate; the caller must have
+/// created the target dir already.
+pub fn reserve_target(path: &Path, allow_existing: bool) -> Result<PathBuf> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_dir() {
+            anyhow::bail!("{} is a directory", path.display());
+        }
+        if meta.is_file() && meta.len() > 0 && !allow_existing {
+            anyhow::bail!(
+                "{} already exists (choose a different name or allow overwrite)",
+                path.display()
+            );
+        }
+        // Adopted as-is (zero-byte placeholder, or overwrite intent). The
+        // path must still be a regular file; metadata above proved it.
+        return Ok(path.to_path_buf());
+    }
+    // Missing (or raced): create the zero-byte placeholder exclusively.
+    // O_EXCL only guarantees the CREATE side: a session arriving after
+    // another's placeholder exists adopts it above (zero-byte), so two
+    // concurrent builds on the same user path both proceed and the last
+    // rename wins — acceptable for a UI where each session opens its own
+    // dialog, not the mutual exclusion the comment used to claim. Each
+    // build writes its own unique `.part` sibling (see `part_sibling`), so
+    // the loser is replaced cleanly rather than corrupting the winner's
+    // file mid-write.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    Ok(path.to_path_buf())
+}
+
 /// Remove a reservation made by `reserve_output_path`. Only deletes the
 /// zero-byte placeholder, so a real PDF (written by a finished build) is
-/// never touched. Also discards a leftover `<path>.part` (an interrupted
-/// build's partial output): a non-empty placeholder can only mean a race
+/// never touched. Also discards leftover `.part` siblings of the target
+/// (an interrupted build's partial output, incl. the per-build unique
+/// `-pid-nanos.part` names): a non-empty placeholder can only mean a race
 /// between a live build and the release, in which case the `.part` garbage
 /// is dead weight anyway. Best effort.
 pub fn release_reservation(path: &Path) {
@@ -381,6 +538,74 @@ pub fn release_reservation(path: &Path) {
     let mut part_os = path.as_os_str().to_os_string();
     part_os.push(".part");
     let _ = std::fs::remove_file(PathBuf::from(part_os));
+    // Unique-suffix `.part` siblings (`<file>-<pid>-<nanos>.part`): list
+    // the parent dir and match the strict stem pattern. The digits check
+    // keeps other targets whose names merely start with `<file>-` (e.g.
+    // a different session's `report.pdf-backup.pdf`) out of the blast
+    // radius. Directory listing failures are ignored (best effort; the
+    // sweep retries on the next run).
+    if let Some(file) = path.file_name() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let prefixes = part_prefixes(file);
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if prefixes
+                        .iter()
+                        .any(|p| is_own_part_sibling(name.as_encoded_bytes(), p))
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Byte prefixes under which this target's unique-suffix `.part` siblings
+/// are named: `<file>-` normally; plus the truncated+hashed stem's prefix
+/// when the file name is too long for the suffixed form (mirrors
+/// `part_sibling`'s truncation). Raw bytes: non-UTF-8 names must match.
+fn part_prefixes(file: &OsStr) -> Vec<Vec<u8>> {
+    let bytes = file.as_encoded_bytes();
+    let mut plain = bytes.to_vec();
+    plain.push(b'-');
+    let mut prefixes = vec![plain];
+    let budget = NAME_MAX - PART_RESERVE;
+    if bytes.len() > budget {
+        let mut truncated = bytes[..budget - (PART_HASH_LEN + 1)].to_vec();
+        truncated.push(b'-');
+        truncated.extend_from_slice(short_hash(file).as_bytes());
+        truncated.push(b'-');
+        prefixes.push(truncated);
+    }
+    prefixes
+}
+
+/// True when `name` is `<prefix><pid>-<nanos>.part` (the unique-suffix
+/// sibling shape written by `part_sibling`): strict digits between the
+/// dashes so unrelated files like `chosen.pdf-42-x.part` (a different
+/// target's live part) never match.
+fn is_own_part_sibling(name: &[u8], prefix: &[u8]) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(b".part") else {
+        return false;
+    };
+    let Some((pid, nanos)) = split_once(rest, b'-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !nanos.is_empty()
+        && pid.iter().all(|b| b.is_ascii_digit())
+        && nanos.iter().all(|b| b.is_ascii_digit())
+}
+
+/// First index of `needle` in `haystack` (for byte-slice `split_once`).
+fn split_once(bytes: &[u8], needle: u8) -> Option<(&[u8], &[u8])> {
+    let pos = bytes.iter().position(|b| *b == needle)?;
+    Some((&bytes[..pos], &bytes[pos + 1..]))
 }
 
 /// Local timestamp string `YYYY-MM-DD_HHMMSS` (parity with Python format).
@@ -537,5 +762,192 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(calls[0].windows(2).any(|w| w == ["--imgsize", "300dpi"]));
         assert!(calls[0].contains(&"a.png".to_string()) && calls[0].contains(&"b.png".to_string()));
+    }
+
+    #[test]
+    fn reserve_target_fresh_zero_byte_and_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // Free path: reserved, zero-byte placeholder exists.
+        let fresh = d.join("custom.pdf");
+        assert_eq!(reserve_target(&fresh, false).unwrap(), fresh);
+        assert!(fresh.exists());
+        assert_eq!(std::fs::metadata(&fresh).unwrap().len(), 0);
+
+        // A second reserve of the same free path (still zero-byte) is
+        // adopted, not an error: the placeholder is ours.
+        assert_eq!(reserve_target(&fresh, false).unwrap(), fresh);
+
+        // Non-empty target without overwrite intent: rejected, file
+        // untouched.
+        let taken = d.join("taken.pdf");
+        std::fs::write(&taken, b"real pdf bytes").unwrap();
+        assert!(reserve_target(&taken, false).is_err());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"real pdf bytes");
+
+        // Non-empty target with overwrite intent: adopted as-is (no
+        // truncate — the file is only replaced by the build's final
+        // rename).
+        assert_eq!(reserve_target(&taken, true).unwrap(), taken);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"real pdf bytes");
+
+        // Zero-byte targets are adoptable even without overwrite intent
+        // (placeholder semantics; release_reservation will clean them up).
+        let empty = d.join("empty.pdf");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(reserve_target(&empty, false).unwrap(), empty);
+
+        // A directory named foo.pdf is rejected up front, never adopted.
+        let as_dir = d.join("dir.pdf");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(reserve_target(&as_dir, true).is_err());
+        assert!(as_dir.is_dir());
+
+        // Missing target dir: NotFound propagates, nothing created.
+        let missing_dir = d.join("no/such/dir");
+        assert!(reserve_target(&missing_dir.join("x.pdf"), false).is_err());
+        assert!(!missing_dir.exists());
+    }
+
+    #[test]
+    fn release_keeps_adopted_target_and_discards_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // Adopted non-empty file survives release; a sibling .part from an
+        // interrupted overwrite build is discarded.
+        let target = d.join("adopted.pdf");
+        std::fs::write(&target, b"previous content").unwrap();
+        std::fs::write(target.with_extension("pdf.part"), b"garbage").unwrap();
+        release_reservation(&target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous content");
+        assert!(!target.with_extension("pdf.part").exists());
+
+        // A created placeholder is released entirely.
+        let placeholder = d.join("placeholder.pdf");
+        reserve_target(&placeholder, false).unwrap();
+        release_reservation(&placeholder);
+        assert!(!placeholder.exists());
+    }
+
+    #[test]
+    fn part_sibling_is_unique_and_in_place() {
+        let target = Path::new("/tmp/out/custom.pdf");
+        let s = part_sibling(target, "-123-456");
+        assert!(s.starts_with("/tmp/out/"));
+        assert_eq!(
+            s.file_name().unwrap().to_string_lossy(),
+            "custom.pdf-123-456.part"
+        );
+        // Same target, fresh suffixes: never equal (concurrent builds).
+        let a = part_sibling(target, &unique_suffix());
+        let b = part_sibling(target, &unique_suffix());
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().ends_with(".part"));
+    }
+
+    #[test]
+    fn release_discards_unique_part_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let target = d.join("chosen.pdf");
+        std::fs::write(&target, b"delivered").unwrap();
+        // Simulate a killed build's unique .part + files that must survive:
+        // an unrelated file, a prefix-matching non-.part name, and another
+        // target's live .part whose name merely starts with our prefix.
+        let part = part_sibling(&target, "-42-99");
+        std::fs::write(&part, b"half written").unwrap();
+        let other = d.join("other.pdf");
+        std::fs::write(&other, b"other").unwrap();
+        let prefix_no_part = d.join("chosen.pdf-42-x");
+        std::fs::write(&prefix_no_part, b"keep").unwrap();
+        let others_part = d.join("chosen.pdf-backup.pdf-7-8.part");
+        std::fs::write(&others_part, b"live in-flight build").unwrap();
+        let others_target = d.join("chosen.pdf-backup.pdf");
+        std::fs::write(&others_target, b"other session target").unwrap();
+
+        release_reservation(&target);
+
+        assert!(target.exists(), "delivered PDF is never released");
+        assert!(!part.exists(), "unique-suffix .part discarded");
+        assert!(other.exists(), "unrelated file untouched");
+        assert!(prefix_no_part.exists(), "non-.part prefix match untouched");
+        assert!(
+            others_part.exists(),
+            "a different target's .part must never be deleted"
+        );
+        assert!(others_target.exists(), "other session's target untouched");
+    }
+
+    #[test]
+    fn own_part_sibling_pattern_is_strict() {
+        let prefix = b"chosen.pdf-";
+        assert!(is_own_part_sibling(b"chosen.pdf-42-99.part", prefix));
+        assert!(is_own_part_sibling(
+            b"chosen.pdf-18446744073709551615-999999999999999999999999.part",
+            prefix
+        ));
+        // Another target's live part (prefix-superset name): no match.
+        assert!(!is_own_part_sibling(
+            b"chosen.pdf-backup.pdf-7-8.part",
+            prefix
+        ));
+        // Non-numeric or wrong shape: no match.
+        assert!(!is_own_part_sibling(b"chosen.pdf-42-x.part", prefix));
+        assert!(!is_own_part_sibling(b"chosen.pdf-42-.part", prefix));
+        assert!(!is_own_part_sibling(b"chosen.pdf-4-2-3.part", prefix));
+        assert!(!is_own_part_sibling(b"chosen.pdf-42-99", prefix));
+        assert!(!is_own_part_sibling(b"chosen.pdf-42-99.bak", prefix));
+    }
+
+    /// A filename near NAME_MAX: the suffixed `.part` stays within the
+    /// kernel limit and the release matcher still re-derives the truncated
+    /// stem (round trip), while an unrelated short file sharing the
+    /// truncated prefix keeps its own live part.
+    #[test]
+    fn part_sibling_over_long_name_is_capped_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let stem = "l".repeat(NAME_MAX - 10); // 245 bytes: over the budget
+        let target = d.join(format!("{stem}.pdf"));
+        assert!(target.file_name().unwrap().as_encoded_bytes().len() > NAME_MAX - PART_RESERVE);
+
+        let part = part_sibling(&target, "-42-99");
+        let name = part.file_name().unwrap().as_encoded_bytes().to_vec();
+        assert!(
+            name.len() <= NAME_MAX,
+            "suffixed part stays within NAME_MAX (got {})",
+            name.len()
+        );
+        assert!(name.ends_with(b"-42-99.part"));
+        // Deterministic: the matcher re-derives the same truncated stem.
+        let prefixes = part_prefixes(target.file_name().unwrap());
+        assert!(
+            is_own_part_sibling(&name, &prefixes[0]) || is_own_part_sibling(&name, &prefixes[1])
+        );
+
+        // Round trip through release_reservation on the filesystem.
+        std::fs::write(&part, b"half written").unwrap();
+        std::fs::write(&target, b"delivered").unwrap();
+        // An unrelated short file sharing the truncated prefix: its part
+        // (hash differs) must survive.
+        let other_target = d.join(format!("{}X.pdf", "l".repeat(NAME_MAX - 10)));
+        let other_part = part_sibling(&other_target, "-7-8");
+        std::fs::write(&other_part, b"live").unwrap();
+        release_reservation(&target);
+        assert!(target.exists());
+        assert!(!part.exists(), "truncated-stem part discarded");
+        assert!(other_part.exists(), "unrelated long target's part kept");
+    }
+
+    /// Short names never take the truncation path (plain shape unchanged).
+    #[test]
+    fn part_sibling_short_name_untouched() {
+        let target = Path::new("/tmp/out/custom.pdf");
+        assert_eq!(
+            part_sibling(target, "-1-2"),
+            PathBuf::from("/tmp/out/custom.pdf-1-2.part")
+        );
     }
 }

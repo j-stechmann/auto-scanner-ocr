@@ -157,6 +157,13 @@ pub enum Cmd {
     Move { from: usize, to: usize },
     /// Build the final PDF; actor refuses while busy.
     Finish,
+    /// Build the final PDF to an explicit user-chosen path (file browser).
+    /// The actor retargets the reserved placeholder to `out` first (mkdir
+    /// parent, reserve/adopt, release old, re-record the marker); a failed
+    /// retarget aborts with the old reservation untouched. `overwrite`
+    /// adopts a pre-existing non-empty file; the build only replaces it on
+    /// success (final `.part` rename).
+    FinishTo { out: PathBuf, overwrite: bool },
     /// Reset the session (drop all pages, new output path).
     NewSession,
     /// Extract the selected page's preview text on demand (lazy mode).
@@ -389,9 +396,12 @@ impl Session {
             .out_pdf
             .canonicalize()
             .unwrap_or_else(|_| self.out_pdf.clone());
+        // Raw bytes (not to_string_lossy): a non-UTF-8 output path must be
+        // restorable exactly, or the sweep would release a mangled
+        // non-existent path and leak the real placeholder.
         if let Err(e) = std::fs::write(
             self.dir.join(".pending_out"),
-            path.to_string_lossy().as_bytes(),
+            path.as_os_str().as_encoded_bytes(),
         ) {
             // Best effort by design, but a failed marker means a hard kill
             // later will leak the zero-byte placeholder (the sweep has
@@ -568,7 +578,7 @@ impl Session {
                 }
                 Ok(())
             }
-            Cmd::Finish => {
+            Cmd::Finish | Cmd::FinishTo { .. } => {
                 if self.pages.is_empty() {
                     return Err("no pages scanned yet".into());
                 }
@@ -636,7 +646,10 @@ impl Session {
             Cmd::Rotate(id, cw) => self.start_rotate(id, cw),
             Cmd::Delete(id) => self.delete(id),
             Cmd::Move { from, to } => self.move_page(from, to),
-            Cmd::Finish => self.start_finish(),
+            Cmd::Finish => self.start_finish_to(None, false),
+            Cmd::FinishTo { out, overwrite } => {
+                self.start_finish_to(Some(out), overwrite);
+            }
             Cmd::NewSession => self.new_session(),
             Cmd::RequestText(id) => self.request_text(id),
             Cmd::ListLangs => {
@@ -1261,7 +1274,31 @@ impl Session {
         self.status(format!("page {id} rotated"));
     }
 
-    fn start_finish(&mut self) {
+    /// Retarget the reserved output placeholder to `out` (when given) and
+    /// spawn the build. All fallible retarget steps run synchronously
+    /// BEFORE `busy` changes, so a failure leaves the session Idle with the
+    /// old reservation fully intact (same acquire-before-teardown contract
+    /// as `new_session`). Ordering when retargeting:
+    ///   1. mkdir the target's parent (a custom dir bypasses the startup
+    ///      output check; O_EXCL then doubles as the writability probe),
+    ///   2. reserve/adopt the target (abort keeps the old reservation),
+    ///   3. release the OLD placeholder while `.pending_out` still covers
+    ///      it (release deletes only zero-byte files + `.part`),
+    ///   4. swap `out_pdf` and re-record the marker via the canonicalizing
+    ///      helper.
+    ///
+    /// A hard kill inside the two-statement release/swap window can orphan
+    /// at most one zero-byte file (the same accepted window `new_session`
+    /// has); a crash mid-BUILD is fully covered by the marker + sweep.
+    fn start_finish_to(&mut self, target: Option<PathBuf>, overwrite: bool) {
+        // Retarget BEFORE any state change: a failure leaves the session
+        // Idle with the old reservation and OCR jobs fully intact.
+        if let Some(out) = target {
+            if let Err(e) = self.retarget_output(&out, overwrite) {
+                self.status(format!("finish blocked: {e:#}"));
+                return;
+            }
+        }
         self.busy = Busy::Finishing;
         self.busy_since = Some(Instant::now());
         // Cancel any outstanding per-page jobs: at this point every `jobs`
@@ -1296,6 +1333,40 @@ impl Session {
             out_pdf: self.out_pdf.clone(),
         };
         self.spawn_job(Job::Finish { plan });
+    }
+
+    /// Point the session's output reservation at `out`. Adopting an
+    /// existing non-empty file requires `overwrite` (the user confirmed);
+    /// the file is only replaced by the build's final `.part` rename, so a
+    /// failed build leaves it byte-identical.
+    fn retarget_output(&mut self, out: &std::path::Path, overwrite: bool) -> anyhow::Result<()> {
+        // Same target requested (lexically, or through a symlink): keep the
+        // current reservation, no churn.
+        if self.out_pdf == out {
+            return Ok(());
+        }
+        if let (Ok(new), Ok(cur)) = (out.canonicalize(), self.out_pdf.canonicalize()) {
+            if new == cur {
+                return Ok(());
+            }
+        }
+        // A custom dir bypasses the startup output check (cfg.output):
+        // create it here; reserve_target's O_EXCL then doubles as the
+        // writability probe.
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        pdf::reserve_target(out, overwrite)?;
+        // All fallible steps done. Release the OLD placeholder while
+        // `.pending_out` still points at it, then swap and re-record via
+        // the canonicalizing helper (same order as `new_session`).
+        pdf::release_reservation(&self.out_pdf);
+        self.out_pdf = out.to_path_buf();
+        self.record_reservation();
+        tracing::info!("finish retargeted output to {}", out.display());
+        Ok(())
     }
 
     fn on_finish_done(&mut self, result: anyhow::Result<BuildOutcome>) {
@@ -1643,8 +1714,26 @@ fn sweep_stale_sessions(root: &std::path::Path) {
         // A quit during a PDF build defers its output reservation here
         // (see Drop): release the zero-byte placeholder now that the owner
         // is confirmed dead. Missing file / non-empty file => no-op.
-        if let Ok(pending) = std::fs::read_to_string(path.join(".pending_out")) {
-            pdf::release_reservation(std::path::Path::new(pending.trim()));
+        // Raw bytes (see record_reservation): the recorded path may be
+        // non-UTF-8 and must be restored exactly. Trailing ASCII
+        // whitespace is not part of the path.
+        if let Ok(bytes) = std::fs::read(path.join(".pending_out")) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let end = bytes
+                    .iter()
+                    .rposition(|b| !b.is_ascii_whitespace())
+                    .map_or(0, |i| i + 1);
+                pdf::release_reservation(std::path::Path::new(std::ffi::OsStr::from_bytes(
+                    &bytes[..end],
+                )));
+            }
+            #[cfg(not(unix))]
+            {
+                let pending = String::from_utf8_lossy(&bytes).trim().to_string();
+                pdf::release_reservation(std::path::Path::new(&pending));
+            }
             let _ = std::fs::remove_file(path.join(".pending_out"));
         }
         match std::fs::remove_dir_all(&path) {
@@ -1880,7 +1969,7 @@ mod tests {
         let img = s.dir.join("page_001.png");
         std::fs::write(&img, b"x").unwrap();
         s.handle_job_done(scan_ok(1, img.clone())).await;
-        s.start_finish();
+        s.start_finish_to(None, false);
         assert_eq!(s.busy, Busy::Finishing);
         assert!(s.jobs.is_empty(), "finish cancels and drains OCR jobs");
         // Late completion arrives after the cancel.
@@ -2865,5 +2954,200 @@ mod tests {
             corpse.join("page_001.png").exists(),
             "corpse contents untouched"
         );
+    }
+
+    /// Fabricate a FinishTo command against a temp output path.
+    fn finish_to(out: PathBuf, overwrite: bool) -> Cmd {
+        Cmd::FinishTo { out, overwrite }
+    }
+
+    #[tokio::test]
+    async fn finish_to_retargets_reservation_and_keeps_guard_parity() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let out = target_dir.path().join("receipts").join("custom.pdf");
+        // Guard parity with Finish (path-agnostic checks only).
+        assert!(s.guard(&finish_to(out.clone(), false)).is_ok());
+        let old_out = s.out_pdf.clone();
+
+        s.handle(finish_to(out.clone(), false)).await;
+
+        assert_eq!(s.out_pdf, out, "reservation points at the chosen path");
+        assert!(out.exists(), "new placeholder reserved at the target");
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            0,
+            "placeholder is zero-byte until the build renames"
+        );
+        assert!(
+            !old_out.exists(),
+            "old placeholder released; only zero-byte files are deletable"
+        );
+        // Marker re-recorded so the sweep recovers a mid-build crash.
+        assert_eq!(
+            std::fs::read_to_string(s.dir.join(".pending_out"))
+                .unwrap()
+                .trim(),
+            out.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(s.busy, Busy::Finishing, "build spawned after retarget");
+        // The plan carries the new path; complete the build to a real file.
+        std::fs::write(&out, b"pdf bytes").unwrap();
+        s.handle_job_done(JobDone::Finish {
+            result: Ok(pdf::BuildOutcome::Searchable),
+        })
+        .await;
+        assert!(s.finished);
+        assert!(out.exists(), "built PDF at the custom path survives");
+        assert!(out.to_string_lossy().contains("receipts"), "mkdir ran");
+    }
+
+    #[tokio::test]
+    async fn finish_to_failed_retarget_keeps_old_reservation_intact() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        let old_out = s.out_pdf.clone();
+
+        // Sabotage: a DIRECTORY named like the target makes create_new fail
+        // (reserve_target rejects is_dir first — same abort path).
+        let target_dir = tempfile::tempdir().unwrap();
+        let out = target_dir.path().join("occupied.pdf");
+        std::fs::write(&out, b"existing document").unwrap();
+
+        s.handle(finish_to(out.clone(), false)).await;
+
+        assert_eq!(s.busy, Busy::Idle, "no build started");
+        assert_eq!(s.busy_since, None);
+        assert_eq!(
+            s.out_pdf, old_out,
+            "old reservation untouched on failed retarget"
+        );
+        assert!(old_out.exists(), "old placeholder still reserved");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"existing document",
+            "existing file never touched without overwrite"
+        );
+        // Session stays fully usable: retry to a different path works.
+        let alt = target_dir.path().join("alt.pdf");
+        s.handle(finish_to(alt.clone(), false)).await;
+        assert_eq!(s.out_pdf, alt);
+        assert_eq!(s.busy, Busy::Finishing);
+    }
+
+    #[tokio::test]
+    async fn finish_to_overwrite_adopts_existing_file() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let out = target_dir.path().join("existing.pdf");
+        std::fs::write(&out, b"previous version").unwrap();
+
+        s.handle(finish_to(out.clone(), true)).await;
+
+        assert_eq!(s.out_pdf, out);
+        // Adoption is non-destructive: the previous content survives until
+        // the build's final rename (simulated here by the fake completion).
+        assert_eq!(std::fs::read(&out).unwrap(), b"previous version");
+        // Marker points at the adopted target (checked before the fake
+        // completion: a successful build removes the session dir).
+        assert_eq!(
+            std::fs::read_to_string(s.dir.join(".pending_out"))
+                .unwrap()
+                .trim(),
+            out.canonicalize().unwrap().to_string_lossy()
+        );
+        std::fs::write(&out, b"new pdf").unwrap();
+        s.handle_job_done(JobDone::Finish {
+            result: Ok(pdf::BuildOutcome::Searchable),
+        })
+        .await;
+        assert!(s.finished);
+        assert!(out.exists());
+    }
+
+    #[tokio::test]
+    async fn finish_to_same_path_is_no_churn() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        let reserved = s.out_pdf.clone();
+
+        // Same path through a symlinked dir: canonical comparison hits, the
+        // reservation is kept without release/re-record. (The link's
+        // tempdir guard must outlive the use.)
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(reserved.parent().unwrap(), &link).unwrap();
+        #[cfg(not(unix))]
+        panic!("unix only");
+        let via_link = link.join(reserved.file_name().unwrap());
+        s.handle(finish_to(via_link, false)).await;
+        assert_eq!(s.out_pdf, reserved, "identical target: no retarget");
+        assert_eq!(s.busy, Busy::Finishing);
+    }
+
+    #[tokio::test]
+    async fn finish_to_then_quit_during_build_defers_to_marker() {
+        // Retargeted output + quit while the build runs: the Drop defers to
+        // the sweep, which reads `.pending_out` (pointing at the CUSTOM
+        // path) and releases the zero-byte placeholder there. The idle-path
+        // Drop (already exercised by other tests) is not in play here since
+        // busy == Finishing.
+        let (mut s, dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        let target_dir = tempfile::tempdir().unwrap();
+        let out = target_dir.path().join("midbuild.pdf");
+        s.handle(finish_to(out.clone(), false)).await;
+        assert_eq!(s.out_pdf, out);
+        // Simulate the in-flight build window (busy stays Finishing), then
+        // quit: dir + marker are left for the next startup's sweep.
+        let session_dir = s.dir.clone();
+        drop(s);
+        assert!(session_dir.exists(), "build-window Drop keeps the dir");
+        assert!(session_dir.join(".pending_out").exists());
+        assert!(out.exists(), "placeholder survives for the sweep");
+        // Startup sweep of the now-dead owner: releases the CUSTOM
+        // placeholder and deletes the dir.
+        sweep_stale_sessions(session_dir.parent().unwrap());
+        assert!(!session_dir.exists(), "swept dir");
+        assert!(!out.exists(), "sweep released the retargeted placeholder");
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn finish_to_blocked_by_same_guards_as_finish() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        let out = PathBuf::from("/tmp/never-written.pdf");
+        // No pages: both variants blocked identically.
+        assert_eq!(
+            s.guard(&Cmd::Finish),
+            s.guard(&finish_to(out.clone(), false))
+        );
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        // Post-finish (stub pages): both blocked.
+        s.finished = true;
+        assert_eq!(s.guard(&Cmd::Finish), s.guard(&finish_to(out, false)));
     }
 }
