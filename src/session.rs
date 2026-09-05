@@ -944,6 +944,11 @@ impl Session {
                     p.mode = mode;
                     p.unpaper_deskewed = unpaper_deskewed;
                     p.used_fallback = used_fallback;
+                    // A fresh capture is upright: drop any manual rotation
+                    // from the replaced image so start_finish doesn't set
+                    // manually_rotated (and omit --rotate-pages) for the
+                    // whole session based on stale state.
+                    p.rotated = false;
                     p.text = None;
                     p.text_pending = false;
                     p.ocr_failed_gen = None;
@@ -2053,6 +2058,10 @@ mod tests {
         s.handle_job_done(rescan_ok(1, cleaned.clone(), 300, "gray"))
             .await;
         assert!(cleaned.exists(), "cleaned file must survive adoption");
+        assert!(
+            !rescan_img.exists(),
+            "old raw rescan image must be deleted on adoption"
+        );
         assert_eq!(s.pages[0].image.as_deref(), Some(cleaned.as_path()));
     }
 
