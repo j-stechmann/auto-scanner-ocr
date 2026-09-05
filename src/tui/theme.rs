@@ -50,7 +50,7 @@ pub const MUTED: Style = Style::new().fg(Color::DarkGray);
 
 /// Key-column accent in help/diagnostics. Accepted exception like MUTED:
 /// theme-dependent, verified bright on the dark palettes in the matrix
-/// (worst 6.5:1 on black); on light palettes yellow keys are decorative.
+/// (worst 4.0:1 on black, VGA); on light palettes yellow keys are decorative.
 pub const KEY: Style = Style::new().fg(Color::Yellow);
 
 pub fn header() -> Style {
@@ -222,7 +222,7 @@ mod tests {
     /// the worst-case contrast threshold a bg-carrying style must beat on
     /// ANY palette; `None` marks fg-only styles, which must not paint a
     /// background. Keeping one list means a new style cannot escape both
-    /// checks.
+    /// checks (enforced by `registry_covers_every_defined_style`).
     fn registry() -> Vec<(&'static str, Style, Option<f64>)> {
         vec![
             ("HIGHLIGHT", HIGHLIGHT, Some(4.5)),
@@ -242,6 +242,47 @@ mod tests {
             ("border_focused()", border_focused(), None),
             ("border_unfocused()", border_unfocused(), None),
         ]
+    }
+
+    #[test]
+    fn registry_covers_every_defined_style() {
+        let src = include_str!("theme.rs");
+        let mut names: std::collections::HashSet<&str> =
+            registry().into_iter().map(|(name, _, _)| name).collect();
+        // Style definitions: `pub const X: Style`, `const X: Style` (pub
+        // functions return styles too, so match `-> Style`).
+        for line in src.lines() {
+            let Some(rest) = line
+                .strip_prefix("pub const ")
+                .or_else(|| line.strip_prefix("const "))
+                .or_else(|| line.strip_prefix("pub fn "))
+                .or_else(|| line.strip_prefix("fn "))
+            else {
+                continue;
+            };
+            let is_style_def = (rest.contains(": Style =") || rest.contains("-> Style"))
+                && !line.contains("#[test]");
+            if !is_style_def {
+                continue;
+            }
+            let name = rest.split([':', '(']).next().unwrap_or("").trim();
+            // Functions are listed in registry() with a trailing "()" .
+            let registered = if rest.contains("-> Style") {
+                format!("{name}()")
+            } else {
+                name.to_string()
+            };
+            assert!(
+                names.contains(registered.as_str()),
+                "{name} is defined in theme.rs but missing from registry(); \
+                 add it there so the contrast gate covers it"
+            );
+            names.remove(registered.as_str());
+        }
+        assert!(
+            names.is_empty(),
+            "registry() lists styles that no longer exist: {names:?}"
+        );
     }
 
     /// Every background-carrying style in the registry, with the worst
@@ -324,7 +365,10 @@ mod tests {
             let file = path.file_name().unwrap().to_string_lossy();
             for (line_no, line) in src.lines().enumerate() {
                 // Doc comments describing theme.rs behavior are allowed.
-                let code = line.split("//").next().unwrap_or(line);
+                // Strip block comments first (they can span a line), then
+                // line comments - but only outside string literals, so a
+                // `"a://b"` string does not hide real code after it.
+                let code = strip_comments(line);
                 assert!(
                     !code.contains("Color::") && !code.contains(".bg("),
                     "{file}:{} paints its own colors ({code:?}); add a named style in \
@@ -333,5 +377,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Remove `/* */` and `//` comments, respecting string literals so a
+    /// `//` inside a string is not treated as a comment start. Unterminated
+    /// block comments strip to end of line (single-line scan); this keeps
+    /// the gate conservative (code after an unclosed `/*` on the same line
+    /// is scanned, string-literal aware). Scans chars, not bytes, so
+    /// multi-byte UTF-8 in strings survives intact.
+    fn strip_comments(line: &str) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0;
+        let mut in_string = false;
+        while i < chars.len() {
+            match chars[i] {
+                // Inside a string, `\` escapes the next char (`\"` does not
+                // close the string; `\\` is a literal backslash).
+                '\\' if in_string => {
+                    out.push('\\');
+                    if let Some(next) = chars.get(i + 1) {
+                        out.push(*next);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                '"' => {
+                    in_string = !in_string;
+                    out.push('"');
+                    i += 1;
+                }
+                '/' if !in_string && chars.get(i + 1) == Some(&'/') => break,
+                '/' if !in_string && chars.get(i + 1) == Some(&'*') => {
+                    let close = chars[i + 2..]
+                        .windows(2)
+                        .position(|w| w[0] == '*' && w[1] == '/');
+                    match close {
+                        Some(j) => {
+                            i += 2 + j + 2;
+                            // The gap left by a block comment could join two
+                            // tokens; keep one space so `a/*x*/b` stays two.
+                            out.push(' ');
+                        }
+                        // Unterminated: strip the rest of the line.
+                        None => break,
+                    }
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn strip_comments_edge_cases() {
+        // Line comments are stripped.
+        assert_eq!(strip_comments("let x = 1; // Color::Red"), "let x = 1; ");
+        // But not inside string literals.
+        assert_eq!(strip_comments(r#"let u = "a://b";"#), r#"let u = "a://b";"#);
+        // Block comments are removed, code after them survives.
+        assert_eq!(strip_comments("a /* Color::Red */ b"), "a   b");
+        // Unterminated block comments strip to end of line.
+        assert_eq!(strip_comments("a /* unclosed"), "a ");
+        // Block comments inside strings are untouched.
+        assert_eq!(
+            strip_comments(r#"let u = "/* not a comment */";"#),
+            r#"let u = "/* not a comment */";"#
+        );
+        // Escaped quotes do not close the string.
+        assert_eq!(
+            strip_comments(r#"let u = "\"; // not a comment";"#),
+            r#"let u = "\"; // not a comment";"#
+        );
+        // Escaped backslash before a quote: `\\` is a literal backslash, so
+        // the quote DOES close the string and the `//` after it is a real
+        // comment (the byte-wise version kept it — a false negative).
+        assert_eq!(
+            strip_comments(r#"let u = "\\"; // stripped"#),
+            r#"let u = "\\"; "#
+        );
+        // Multi-byte UTF-8 survives (char-indexed scan, no panics).
+        assert_eq!(
+            strip_comments("let ü = \"Übergang\"; /* c */"),
+            "let ü = \"Übergang\";  "
+        );
+        // `a/*x*/b` keeps a separating space.
+        assert_eq!(strip_comments("a/*x*/b"), "a b");
+        // Plain code passes through unchanged.
+        assert_eq!(
+            strip_comments("Style::new().bg(NAVY)"),
+            "Style::new().bg(NAVY)"
+        );
     }
 }
