@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-05
+
 ### Fixed
 
 - **Rescan self-deletion**: rescans reuse the fixed `page_NNN.rescan.png`
@@ -107,5 +109,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - TOML config file with per-run CLI overrides
 - Desktop notifications via libnotify, logs in the XDG state dir
 
+[0.2.1]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/j-stechmann/auto-scanner-ocr/compare/773e405...v0.2.0
 [0.1.0]: https://github.com/j-stechmann/auto-scanner-ocr/tree/773e405
