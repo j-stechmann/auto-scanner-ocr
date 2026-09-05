@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   name, so the second rescan of a page deleted the image it had just
   captured — the preview froze on the old thumbnail and the page's image
   file was gone (breaking OCR and the PDF build). The old-image cleanup now
-  skips every file equal to the new final image path
+  skips every file equal to the new final image path.
 - **unpaper atomic output**: the cleanup pass now writes to a temp file and
   renames over the final `_clean` name only on success. Previously a failed
   unpaper run on a rescan could delete the page's live `_clean` image

@@ -118,6 +118,40 @@ async fn color_mode_is_never_unpapered() {
     assert_eq!(before, std::fs::read(&raw).unwrap());
 }
 
+#[tokio::test]
+async fn failed_unpaper_keeps_previous_clean_image() {
+    if auto_scanner_ocr::backend::which("unpaper").is_none() {
+        eprintln!("skipping: unpaper not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let raw = dir.path().join("page_001.png");
+
+    // First pass succeeds: this is the page's live `_clean` image (as after
+    // a rescan, which reuses the fixed raw name).
+    write_flatbed_page(&raw);
+    let (cleaned, _) =
+        maybe_unpaper(&raw, auto_scanner_ocr::config::Cleanup::Legacy, &[], "gray").await;
+    assert_eq!(cleaned, raw.with_file_name("page_001_clean.png"));
+    let clean_before = std::fs::read(&cleaned).unwrap();
+    assert!(!clean_before.is_empty());
+
+    // Second capture (rescan) is garbage, so unpaper must fail. The previous
+    // `_clean` image must survive byte-for-byte and the raw capture must
+    // stay as the fallback.
+    std::fs::write(&raw, b"corrupt capture, not an image").unwrap();
+    let (cleaned2, deskewed) =
+        maybe_unpaper(&raw, auto_scanner_ocr::config::Cleanup::Legacy, &[], "gray").await;
+    assert!(!deskewed);
+    assert_eq!(cleaned2, raw, "failure must fall back to the raw path");
+    assert_eq!(
+        clean_before,
+        std::fs::read(&cleaned).unwrap(),
+        "failed unpaper run damaged the live _clean image"
+    );
+    assert!(raw.exists(), "raw capture must survive as the fallback");
+}
+
 #[test]
 fn unpaper_args_file_args_come_last() {
     // Callers append `src dst` after the builder output; ensure the builder
