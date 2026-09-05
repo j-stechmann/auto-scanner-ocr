@@ -24,13 +24,15 @@ pub const ACCENT: Style = Style::new().fg(Color::Cyan);
 pub const ACCENT_BOLD: Style = Style::new().fg(Color::Cyan).bold();
 
 /// Selection highlight and picker cursor: truecolor fg AND bg. The fg must
-/// not be an ANSI slot - on light themes slot 15 can render dark (One Half
-/// Light), which would put dark text on this dark navy.
+/// not be an ANSI slot - on light themes slot 15 can render dark (Gruvbox
+/// Light maps it to a near-black), which would put dark text on this navy.
 pub const HIGHLIGHT: Style = Style::new().fg(TRUE_WHITE).bg(NAVY);
 
 pub const BADGE_OK: Style = Style::new().fg(Color::Black).bg(Color::Green);
 pub const BADGE_FAIL: Style = Style::new().fg(Color::White).bg(Color::Red);
 pub const BADGE_BUSY: Style = Style::new().fg(Color::Black).bg(Color::Yellow).bold();
+/// Info badge (N processing, diag " ..."): Black on ANSI 6. Same light-
+/// polarity exception as BADGE_FAIL/BUSY (worst 1.9:1, Gruvbox Light).
 pub const BADGE_INFO: Style = Style::new().fg(Color::Black).bg(Color::Cyan);
 /// Muted badge (deleting, SKIP): Black on ANSI 7 passes on every palette in
 /// the matrix (worst 4.3:1, Gruvbox Light); no fg passes on ANSI 8 there.
@@ -53,7 +55,8 @@ pub fn header() -> Style {
 
 pub fn header_filler() -> Style {
     // Same pair as the header band; the fg only applies to filler spaces
-    // (invisible) but keeps the band's pair explicit for the invariant test.
+    // (invisible) but makes the band's colors explicit. Checked in the
+    // catalog test alongside header().
     Style::new().fg(Color::Black).bg(Color::LightBlue)
 }
 
@@ -65,9 +68,11 @@ pub fn border_unfocused() -> Style {
     Style::new().fg(BORDER_DIM)
 }
 
-/// Rotate marker: the only persistent per-page rotation indicator; Cyan
-/// keeps it readable on dark and light default backgrounds alike (worst
-/// 6.0:1 on black across the matrix). It renders White on selected rows.
+/// Rotate marker: the only persistent per-page rotation indicator. Cyan is
+/// a large win on dark palettes (blue was ~1.2-2.2:1 there); accepted
+/// exception like MUTED on light ones (~1.9-2.9:1, slightly below the old
+/// blue on Gruvbox/Solarized Light) for a decorative glyph. It renders
+/// White on selected rows.
 pub const ROTATED: Style = ACCENT;
 
 #[cfg(test)]
@@ -206,16 +211,23 @@ mod tests {
     }
 
     /// Every background-carrying style the catalog defines, with the worst
-    /// ratio it must beat on ANY palette in the matrix. Bold badge text is
-    /// "large text" in WCAG terms (3.0 threshold); the rest need 4.5.
+    /// ratio it must beat on ANY palette in the matrix. HIGHLIGHT is body
+    /// text on a truecolor pair (4.5 = WCAG AA); BADGE_MUTED and the header
+    /// band pass WCAG large-text AA (3.0). The remaining badges are
+    /// pure-ANSI pairs whose worst cases on light-polarity palettes
+    /// (Gruvbox Light: 1.9-2.7:1) cannot be fixed within the 16-color
+    /// palette - no slot pair does better there - so their thresholds
+    /// encode that documented exception.
     fn catalog() -> Vec<(&'static str, Style, f64)> {
         vec![
             ("HIGHLIGHT", HIGHLIGHT, 4.5),
-            ("BADGE_OK", BADGE_OK, 2.0),
+            ("BADGE_OK", BADGE_OK, 2.5),
             ("BADGE_FAIL", BADGE_FAIL, 2.0),
             ("BADGE_BUSY", BADGE_BUSY, 2.0),
+            ("BADGE_INFO", BADGE_INFO, 1.5),
             ("BADGE_MUTED", BADGE_MUTED, 3.0),
-            ("header()", header(), 2.0),
+            ("header()", header(), 3.0),
+            ("header_filler()", header_filler(), 3.0),
         ]
     }
 
