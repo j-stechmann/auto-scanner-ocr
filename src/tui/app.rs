@@ -944,8 +944,10 @@ pub fn next_dpi(current: u16, dir: i32) -> u16 {
 /// picked a target (overwrite already confirmed inside the dialog),
 /// `Cancelled` = the user dismissed the dialog (do nothing — they have not
 /// changed their mind about building, and must not be railroaded into the
-/// default-path confirm), `Unavailable` = no dialog tool installed (fall
-/// back to the plain confirm dialog with the reserved default path).
+/// default-path confirm), `Unavailable` = no dialog tool installed, or the
+/// tool could not run (no display, e.g. SSH without forwarding — exit-1
+/// display failures are discriminated by stderr). Unavailable falls back
+/// to the plain confirm dialog with the reserved default path.
 async fn handle_dialog_result(
     app: &mut App,
     chosen: crate::backend::filedialog::SaveChoice,

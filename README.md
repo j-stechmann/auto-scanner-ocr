@@ -40,7 +40,8 @@ No daemons, no web servers: you run it in a terminal when you want to scan.
 - `unpaper` (optional; only for the unpaper cleanup modes)
 - `libnotify` for notifications (optional)
 - `zenity`, `kdialog` or `yad` for the save dialog at finish (optional;
-  without one, the finish confirm dialog just shows the default path)
+  without one — or when the tool can't open a window, e.g. over SSH — the
+  finish confirm dialog just shows the default path)
 - A SANE-compatible scanner (USB-only models like the Deskjet 1050a work fine)
 
 ## Install

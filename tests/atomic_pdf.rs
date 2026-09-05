@@ -53,6 +53,16 @@ fn tesseract_has_eng() -> bool {
     })
 }
 
+/// True when no `<...>.part` file remains in `dir` (builds write to a
+/// unique `<name>-<pid>-<nanos>.part` sibling; a successful build renames
+/// it away, so any leftover means a leak).
+fn no_part_leftovers(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .all(|e| !e.file_name().to_string_lossy().ends_with(".part"))
+}
+
 #[tokio::test]
 async fn successful_build_renames_part_into_reserved_path() {
     if auto_scanner_ocr::backend::which("ocrmypdf").is_none()
@@ -71,9 +81,11 @@ async fn successful_build_renames_part_into_reserved_path() {
     assert_eq!(outcome, BuildOutcome::Searchable);
     let meta = std::fs::metadata(&out).unwrap();
     assert!(meta.len() > 0, "reserved path now holds the real PDF");
+    // Builds write to a unique `<name>-<pid>-<nanos>.part` sibling; after
+    // success none of them may remain in the output dir.
     assert!(
-        !out.with_extension("pdf.part").exists(),
-        "no .part leftover after success"
+        no_part_leftovers(dir.path()),
+        "no unique .part leftover after success"
     );
     // A finished build's output is never released.
     release_reservation(&out);
@@ -98,8 +110,8 @@ async fn failed_ocrmypdf_fallback_also_delivers_atomically() {
     let meta = std::fs::metadata(&out).unwrap();
     assert!(meta.len() > 0, "fallback output landed atomically");
     assert!(
-        !out.with_extension("pdf.part").exists(),
-        "no .part leftover after fallback"
+        no_part_leftovers(dir.path()),
+        "no unique .part leftover after fallback"
     );
 }
 
@@ -159,7 +171,7 @@ async fn overwrite_adopts_existing_file_and_replaces_on_success() {
         meta.len() as usize != "previous version of the report".len(),
         "content actually replaced"
     );
-    assert!(!out.with_extension("pdf.part").exists());
+    assert!(no_part_leftovers(dir.path()));
 }
 
 #[tokio::test]
@@ -191,7 +203,7 @@ async fn failed_build_leaves_adopted_target_untouched() {
         "adopted target untouched by the failed build"
     );
     assert!(
-        !out.with_extension("pdf.part").exists(),
+        no_part_leftovers(dir.path()),
         "no .part created when img2pdf aborts first"
     );
 }

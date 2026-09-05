@@ -16,6 +16,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dialog tool the old confirm dialog (default path) is used, so the finish
   flow never breaks
 
+### Fixed
+
+- **Save dialog opens in the reserved output directory**: the dialog is
+  now seeded with the full default path (directory + filename) for all
+  three tools; previously zenity/yad opened wherever the app was launched
+  from, with only kdialog seeded at all
+- **Save dialog over SSH**: when the dialog tool is installed but cannot
+  open a window (no display, e.g. SSH without forwarding), the finish now
+  falls back to the plain confirm dialog instead of reporting "save dialog
+  cancelled" forever
+- **Concurrent builds to the same custom path no longer corrupt each
+  other**: each build writes its own unique `<name>-<pid>-<nanos>.part`
+  sibling; previously two sessions delivering to the same path shared one
+  `.part` and interleaved writes could corrupt the delivered file
+- **Non-UTF-8 filenames no longer mangled**: the dialog's chosen path is
+  read as raw bytes and threaded through the PDF build as `OsStr` (argv,
+  `.part` sibling, crash-recovery marker), so filenames that are legal on
+  Linux but not valid UTF-8 are delivered exactly instead of silently
+  targeting a different (lossily substituted) file
+
+### Changed
+
+- kdialog receives a plain Qt name filter instead of the zenity-style
+  `| *.pdf` variant, which kdialog split into two entries
+
 ## [0.2.1] - 2026-09-05
 
 ### Fixed

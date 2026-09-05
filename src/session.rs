@@ -396,9 +396,12 @@ impl Session {
             .out_pdf
             .canonicalize()
             .unwrap_or_else(|_| self.out_pdf.clone());
+        // Raw bytes (not to_string_lossy): a non-UTF-8 output path must be
+        // restorable exactly, or the sweep would release a mangled
+        // non-existent path and leak the real placeholder.
         if let Err(e) = std::fs::write(
             self.dir.join(".pending_out"),
-            path.to_string_lossy().as_bytes(),
+            path.as_os_str().as_encoded_bytes(),
         ) {
             // Best effort by design, but a failed marker means a hard kill
             // later will leak the zero-byte placeholder (the sweep has
@@ -1711,8 +1714,26 @@ fn sweep_stale_sessions(root: &std::path::Path) {
         // A quit during a PDF build defers its output reservation here
         // (see Drop): release the zero-byte placeholder now that the owner
         // is confirmed dead. Missing file / non-empty file => no-op.
-        if let Ok(pending) = std::fs::read_to_string(path.join(".pending_out")) {
-            pdf::release_reservation(std::path::Path::new(pending.trim()));
+        // Raw bytes (see record_reservation): the recorded path may be
+        // non-UTF-8 and must be restored exactly. Trailing ASCII
+        // whitespace is not part of the path.
+        if let Ok(bytes) = std::fs::read(path.join(".pending_out")) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let end = bytes
+                    .iter()
+                    .rposition(|b| !b.is_ascii_whitespace())
+                    .map_or(0, |i| i + 1);
+                pdf::release_reservation(std::path::Path::new(std::ffi::OsStr::from_bytes(
+                    &bytes[..end],
+                )));
+            }
+            #[cfg(not(unix))]
+            {
+                let pending = String::from_utf8_lossy(&bytes).trim().to_string();
+                pdf::release_reservation(std::path::Path::new(&pending));
+            }
             let _ = std::fs::remove_file(path.join(".pending_out"));
         }
         match std::fs::remove_dir_all(&path) {

@@ -96,7 +96,8 @@ pub fn log_failure(cmd: &[&str], err: impl std::fmt::Display) {
     tracing::debug!("{} failed: {err}", cmd.join(" "));
 }
 
-fn tail_bytes(bytes: &[u8]) -> String {
+/// Truncate to the last N bytes, lossily decoded (shared log formatting).
+pub fn tail_bytes(bytes: &[u8]) -> String {
     const MAX: usize = 2000;
     let start = bytes.len().saturating_sub(MAX);
     String::from_utf8_lossy(&bytes[start..]).into_owned()
