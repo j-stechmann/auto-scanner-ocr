@@ -598,7 +598,9 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 fn overlay_block(title: &str) -> Block<'_> {
     // No explicit bg: Clear resets the dialog cells to Reset (SGR 39/49), so
     // body text renders in the theme's own fg/bg pair by construction. A
-    // themed bg(Black) would break on light palettes, where slot 0 is pale.
+    // themed bg(Black) breaks on light-polarity themes whose slot 0 is dark
+    // (One Half Light paints default fg on slot 0 at a 1.0:1 ratio); a pale
+    // slot 0 under a dark default fg was already readable.
     Block::default()
         .title(Span::styled(
             format!(" {title} "),

@@ -301,15 +301,27 @@ mod tests {
 
     /// Source-scan invariant: every color decision must live in this module,
     /// or an inline `Color::`/`.bg(` in a consumer escapes both tests above.
+    /// The consumer list is derived from the directory so a new top-level
+    /// module is covered by default (the scan is not recursive; keep modules
+    /// flat in src/tui/).
     #[test]
     fn consumers_do_not_paint_their_own_colors() {
-        for (file, src) in [
-            ("mod.rs", include_str!("mod.rs")),
-            ("app.rs", include_str!("app.rs")),
-            ("ui.rs", include_str!("ui.rs")),
-            ("overlays.rs", include_str!("overlays.rs")),
-            ("preview.rs", include_str!("preview.rs")),
-        ] {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let entries = std::fs::read_dir(manifest_dir.join("src/tui"))
+            .expect("src/tui must exist to scan consumers");
+        let mut files: Vec<_> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .filter(|p| p.file_name() != Some(std::ffi::OsStr::new("theme.rs")))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no consumer modules found in src/tui");
+
+        for path in &files {
+            let src = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let file = path.file_name().unwrap().to_string_lossy();
             for (line_no, line) in src.lines().enumerate() {
                 // Doc comments describing theme.rs behavior are allowed.
                 let code = line.split("//").next().unwrap_or(line);
