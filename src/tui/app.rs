@@ -259,7 +259,11 @@ impl App {
             Action::Delete => !self.pages.is_empty(),
             Action::Reorder => !self.pages.is_empty(),
             Action::Finish => {
-                !self.pages.is_empty()
+                // A system save dialog is blocking in the background: the
+                // outcome is still pending, so `f` must not stack a second
+                // dialog (and the footer greys the key accordingly).
+                !self.dialog_in_flight
+                    && !self.pages.is_empty()
                     && matches!(busy, Busy::Idle)
                     && !finished
                     && self.pages.iter().all(|p| {
@@ -798,14 +802,15 @@ async fn handle_key(
         }
 
         // ---------------- finish / open / session
-        Char('f') if app.action_allowed(Action::Finish) && !app.dialog_in_flight => {
+        Char('f') if app.action_allowed(Action::Finish) => {
             // Delegate path choice to the system save dialog (zenity/
             // kdialog/yad) in a background task: the dialog is a blocking
             // native window and must never run in the select loop. The
             // outcome is delivered via finish_tx; without any dialog tool
-            // the plain confirm dialog (default path) is used. The guard
-            // keeps the footer's greyed-out `f` honest and prevents
-            // stacking a second dialog while one is open.
+            // the plain confirm dialog (default path) is used. The
+            // dialog-in-flight flag is part of action_allowed(Finish), so
+            // the keypress guard and the footer stay in sync and a second
+            // dialog can never stack while one is open.
             let path = app
                 .meta
                 .as_ref()
@@ -988,12 +993,20 @@ async fn handle_dialog_result(
             app.set_status("save dialog cancelled - press f to try again");
         }
         SaveChoice::Unavailable => {
+            // The TUI stayed interactive while the dialog ran, so the user
+            // may have opened an overlay meanwhile (? / ! / quit confirm).
+            // Same guard as apply_report: never steal their overlay.
             let path = app
                 .meta
                 .as_ref()
                 .map(|m| m.output_path.clone())
                 .unwrap_or_default();
-            app.overlay = Some(Overlay::Confirm(Confirm::finish(path)));
+            let confirm = Overlay::Confirm(Confirm::finish(path));
+            if app.overlay.is_none() {
+                app.overlay = Some(confirm);
+            } else {
+                app.set_status("save dialog unavailable - press f to retry");
+            }
         }
     }
 }
@@ -1635,5 +1648,62 @@ mod tests {
         app.pages = vec![p];
         assert!(!app.scan_allowed());
         assert!(!app.action_allowed(Action::Scan));
+    }
+
+    /// The dialog-in-flight flag is part of action_allowed(Finish): while a
+    /// system save dialog is pending, `f` is blocked and the footer greys it.
+    #[test]
+    fn finish_blocked_while_dialog_in_flight() {
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        assert!(app.action_allowed(Action::Finish));
+
+        app.dialog_in_flight = true;
+        assert!(
+            !app.action_allowed(Action::Finish),
+            "pending dialog must block a second `f` and grey the key"
+        );
+
+        app.dialog_in_flight = false;
+        assert!(app.action_allowed(Action::Finish));
+    }
+
+    /// The Unavailable fallback never steals an overlay the user opened
+    /// while the (blocking) system save dialog was pending; instead it
+    /// reports via the status line. `f` remains available for a retry.
+    #[tokio::test]
+    async fn dialog_unavailable_preserves_open_overlay() {
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.overlay = Some(Overlay::Confirm(Confirm::quit()));
+
+        handle_dialog_result(
+            &mut app,
+            crate::backend::filedialog::SaveChoice::Unavailable,
+            &mpsc::channel(1).0,
+        )
+        .await;
+        let overlay_kind = match &app.overlay {
+            Some(Overlay::Confirm(c)) => Some(c.kind.clone()),
+            _ => None,
+        };
+        assert!(
+            matches!(overlay_kind, Some(ConfirmKind::Quit)),
+            "user-opened overlay must survive the Unavailable fallback"
+        );
+        assert!(!app.dialog_in_flight, "flag released");
+        assert!(app.action_allowed(Action::Finish), "f available to retry");
+
+        // With no overlay open, Unavailable installs the finish confirm.
+        app.overlay = None;
+        handle_dialog_result(
+            &mut app,
+            crate::backend::filedialog::SaveChoice::Unavailable,
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
     }
 }
