@@ -143,6 +143,9 @@ mod tests {
     ];
     #[rustfmt::skip]
     const SOLARIZED_LIGHT: Palette = [
+        // Same canonical 16 as Solarized Dark (iTerm2 defaults swap only
+        // fg/bg/selection, not the slots); kept as a named row so the
+        // matrix output reads naturally, not for extra slot coverage.
         [7, 54, 66], [220, 50, 47], [133, 153, 0], [181, 137, 0],
         [38, 139, 210], [211, 54, 130], [42, 161, 152], [238, 232, 213],
         [0, 43, 54], [203, 75, 22], [88, 110, 117], [147, 161, 161],
@@ -250,6 +253,11 @@ mod tests {
     /// Structural invariant: a style that paints a background must also pin
     /// the foreground, or it inherits the terminal's default fg - which is
     /// arbitrary across themes (the original 1.2:1 bug).
+    ///
+    /// Convention (enforced by review, not mechanically): every style defined
+    /// in this module must appear in exactly ONE of the two lists below -
+    /// `catalog()` for bg-carrying pairs, the `no-bg` list here for the rest.
+    /// A new style added to neither escapes both checks.
     #[test]
     fn backgrounds_pin_their_foreground() {
         for (name, style, _) in catalog() {

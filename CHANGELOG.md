@@ -13,13 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   CI-enforced. The page-list selection and language-picker cursor pin an
   explicit white foreground on their dark-navy background (previously the
   terminal default foreground was inherited, which on light themes rendered
-  dark-on-dark); the ` deleting `/`SKIP` badges use black-on-silver instead
-  of black-on-dark-gray; the rotate marker `↻` is cyan instead of ANSI blue;
-  unfocused pane borders are brighter (were nearly invisible on dark
-  terminals); modal dialogs (help, diagnostics, language picker, confirm) no
-  longer force a black background - they render in the terminal theme's own
-  foreground/background pair, which fixes black-on-black text on light
-  themes. A new `tui::theme` module centralizes all styling and ships a
+  dark-on-dark). The selected page row now renders uniformly white-on-navy,
+  including its status badge, instead of the badge colors vanishing against
+  the navy background; the ` deleting `/`SKIP` badges use black-on-silver
+  instead of black-on-dark-gray; the rotate marker `↻` is cyan instead of
+  ANSI blue; unfocused pane borders are brighter (were nearly invisible on
+  dark terminals); modal dialogs (help, diagnostics, language picker,
+  confirm) no longer force a black background - they render in the terminal
+  theme's own foreground/background pair, which fixes black-on-black text on
+  light themes. A new `tui::theme` module centralizes all styling and ships a
   contrast test that checks every fg/bg pair against ten real terminal
   palettes (VGA, Tango, Dracula, Nord, Gruvbox Dark/Light, One Half
   Dark/Light, Solarized Dark/Light) using the WCAG 2.1 relative-luminance
