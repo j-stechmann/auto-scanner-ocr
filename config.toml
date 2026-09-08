@@ -10,7 +10,7 @@
 # scanners — avoid.
 dpi = 300
 
-# Scan mode: "gray" (recommended for OCR), "color", or "lineart"
+# Scan mode: "color" (default), "gray", or "lineart"
 mode = "color"
 
 # OCR languages, plus-separated. Language data must be installed, e.g.:
