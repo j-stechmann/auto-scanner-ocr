@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Dialogs no longer close when the mouse pointer moves**: mouse capture
+  delivers an event for every pointer step over the terminal, and while a
+  modal overlay (help, diagnostics, language picker, confirmations) was
+  open any such event silently discarded the dialog — it vanished as soon
+  as the pointer crossed the window. The overlay now survives all mouse
+  traffic; a left click inside the dialog is swallowed, and a left click
+  outside dismisses (except diagnostics, which stay open against
+  accidental clicks and close via Esc as before)
 - **Header is no longer overdrawn by the panes**: the header band (program,
   DPI, mode, languages, device) has had its own reserved row ever since the
   first TUI version, but the pane layout started on the same row, so the

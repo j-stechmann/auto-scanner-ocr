@@ -101,6 +101,10 @@ pub struct App {
     pub picker_available: bool,
     /// Pane geometry from the last frame (hit-testing + preview sync).
     pub pane_rects: Option<crate::tui::ui::PaneRects>,
+    /// Rendered overlay dialog rect from the last frame: clicks inside the
+    /// dialog are swallowed, clicks outside dismiss (except Diagnostics).
+    /// Recomputed every frame alongside `pane_rects`.
+    pub overlay_rect: Option<Rect>,
     /// Preview grid cell rects from the last frame: (page id, cell rect),
     /// in draw order. Used for click-to-select on the contact sheet.
     pub preview_cells: Vec<(crate::session::PageId, Rect)>,
@@ -163,6 +167,7 @@ impl App {
             langs_cache: Vec::new(),
             picker_available: false,
             pane_rects: None,
+            overlay_rect: None,
             preview_cells: Vec::new(),
             tick: 0,
             dialog_in_flight: false,
@@ -656,7 +661,11 @@ async fn handle_event(
                     app.overlay = Some(overlay);
                 }
             }
-            CtEvent::Mouse(mouse) => overlays::handle_mouse(app, &mut overlay, mouse),
+            CtEvent::Mouse(mouse) => {
+                if overlays::handle_mouse(app, &mut overlay, mouse) {
+                    app.overlay = Some(overlay);
+                }
+            }
             _ => app.overlay = Some(overlay),
         }
         return Ok(());
@@ -1705,5 +1714,48 @@ mod tests {
         )
         .await;
         assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
+    }
+
+    /// Regression: with mouse capture on, a mere pointer move over the
+    /// terminal is a Mouse event, and the old stub dropped the taken
+    /// overlay — every dialog closed as soon as the pointer moved. The
+    /// overlay must come back out of the mouse branch untouched.
+    #[tokio::test]
+    async fn mouse_moved_preserves_open_overlay() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Help);
+        handle_event(
+            &mut app,
+            &mpsc::channel(1).0,
+            CtEvent::Mouse(ratatui::crossterm::event::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(app.overlay, Some(Overlay::Help)),
+            "pointer movement must not close the help dialog"
+        );
+
+        // Left click outside the dialog rect (no rect recorded yet keeps
+        // too) closes; the click-inside path is covered in overlays.rs.
+        app.overlay_rect = Some(Rect::new(10, 5, 20, 6));
+        handle_event(
+            &mut app,
+            &mpsc::channel(1).0,
+            CtEvent::Mouse(ratatui::crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(app.overlay.is_none(), "click outside dismisses");
     }
 }
