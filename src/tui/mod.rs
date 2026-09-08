@@ -1,4 +1,5 @@
 mod app;
+mod editor;
 mod overlays;
 mod preview;
 mod theme;

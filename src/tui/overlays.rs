@@ -28,6 +28,11 @@ pub enum ConfirmKind {
     NewSession,
     DeletePage(usize),
     DeleteBusy,
+    /// Crop page `id` to `rect` (original image pixels; destructive).
+    Crop {
+        id: crate::session::PageId,
+        rect: crate::backend::pdf::CropRect,
+    },
 }
 
 #[derive(Debug)]
@@ -91,6 +96,21 @@ impl Confirm {
             title: "Delete page while it is processing?".into(),
             lines: vec!["The running job will be cancelled.".into()],
             accept_label: "y delete".into(),
+        }
+    }
+
+    pub fn crop(id: crate::session::PageId, rect: crate::backend::pdf::CropRect) -> Self {
+        Self {
+            kind: ConfirmKind::Crop { id, rect },
+            title: format!("Crop page {id}?"),
+            lines: vec![
+                format!(
+                    "Keep {}x{} px of the page; removed pixels are",
+                    rect.w, rect.h
+                ),
+                "discarded (rescan restores them).".into(),
+            ],
+            accept_label: "Enter crop".into(),
         }
     }
 }
@@ -219,7 +239,7 @@ pub async fn handle_key(
     keep
 }
 
-async fn accept_confirm(
+pub(crate) async fn accept_confirm(
     app: &mut App,
     kind: &ConfirmKind,
     cmd_tx: &mpsc::Sender<crate::session::Cmd>,
@@ -244,6 +264,26 @@ async fn accept_confirm(
             }
         }
         ConfirmKind::DeleteBusy => {}
+        ConfirmKind::Crop { id, rect } => {
+            let _ = cmd_tx
+                .send(Cmd::Crop {
+                    id: *id,
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                })
+                .await;
+            // The actor bumps image_gen on completion; the editor stays
+            // open and its worker re-decodes from the same (path, gen)
+            // reconcile the thumbnails use. The tool closes; a rejected
+            // command (guard) surfaces as a status line.
+            if let Some(e) = app.editor.as_mut() {
+                e.crop = None;
+                e.drag = None;
+                e.esc_pending = false;
+            }
+        }
     }
 }
 
