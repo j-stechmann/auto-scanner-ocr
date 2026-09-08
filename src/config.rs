@@ -116,7 +116,7 @@ impl Default for Config {
             // 300 is the OCR sweet spot and 2-3x faster per capture; use
             // 600 for dense small print (CLI -d / TUI +/-).
             dpi: 300,
-            mode: "gray".into(),
+            mode: "color".into(),
             langs: "deu+Latin".into(),
             device: "auto".into(),
             output: dirs::home_dir()
@@ -390,7 +390,7 @@ mod tests {
     fn defaults_are_sane() {
         let cfg = Config::default();
         assert_eq!(cfg.dpi, 300);
-        assert_eq!(cfg.mode, "gray");
+        assert_eq!(cfg.mode, "color");
         assert_eq!(cfg.langs, "deu+Latin");
         assert_eq!(cfg.device, "auto");
         assert_eq!(cfg.cleanup, Cleanup::Off);

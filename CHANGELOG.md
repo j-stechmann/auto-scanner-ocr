@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Default scan mode is now `color`**: new scans and the shipped
+  `config.toml` default to color instead of gray, so photographs and other
+  non-text content come out right without editing the config. Note for
+  existing setups: color mode skips the unpaper cleanup pass (gray mode
+  still runs it), so upgrades that relied on the old gray default with
+  `cleanup = "conservative"`/`"legacy"` will no longer get unpaper —
+  deskew/clean at finish via ocrmypdf still applies. OCR quality is
+  unchanged (tesseract binarizes to grayscale internally, so color and
+   gray input OCR identically). Set `mode = "gray"` to keep the old
+   behavior
 - **Text contrast pass for the TUI**: unreadable color pairs fixed and now
   CI-enforced. The page-list selection and language-picker cursor pin an
   explicit white foreground on their dark-navy background (previously the
