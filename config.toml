@@ -11,7 +11,7 @@
 dpi = 300
 
 # Scan mode: "gray" (recommended for OCR), "color", or "lineart"
-mode = "gray"
+mode = "color"
 
 # OCR languages, plus-separated. Language data must be installed, e.g.:
 #   Arch:  sudo pacman -S tesseract-data-eng tesseract-data-deu

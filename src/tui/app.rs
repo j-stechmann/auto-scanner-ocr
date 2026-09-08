@@ -1357,7 +1357,7 @@ mod tests {
         match cmd_rx.recv().await {
             Some(session::Cmd::ScanNext { dpi, mode }) => {
                 assert_eq!(dpi, Config::default().dpi);
-                assert_eq!(mode, "gray");
+                assert_eq!(mode, "color");
             }
             other => panic!("expected ScanNext, got {other:?}"),
         }
