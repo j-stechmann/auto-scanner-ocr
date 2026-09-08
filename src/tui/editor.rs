@@ -325,7 +325,7 @@ pub fn draw_editor(
     let hint = if app.editor_crop_rect().is_some() {
         " drag edge resize · inside move · outside redraw · hjkl move · Alt+hjkl shrink · HJKL grow · Enter apply · c done · Esc back "
     } else {
-        " c crop · drag to draw · Esc back "
+        " c crop (drag/keys shape the rect) · Esc back "
     };
     f.render_widget(
         ratatui::widgets::Paragraph::new(ratatui::text::Line::from(hint))
@@ -535,7 +535,6 @@ pub async fn handle_mouse(
                 end_drag(app);
                 return;
             };
-            let max = (w, h);
             match (crop, drag) {
                 (Some(rect), None) => {
                     // Edge hit (with a small pixel tolerance) -> resize;
@@ -563,18 +562,15 @@ pub async fn handle_mouse(
                         );
                     }
                 }
-                (None, _) => {
-                    // No tool yet: start drawing a fresh rect.
-                    start_drag(app, Drag::Draw { anchor: px });
-                    if let Some(e) = app.editor.as_mut() {
-                        e.crop = Some(normalize_rect(px, px, max));
-                    }
-                }
                 (Some(_), Some(d)) => {
                     // Down during an active drag: finalize it.
                     apply_drag(app, d, px, geom);
                     end_drag(app);
                 }
+                // Tool off: clicks do nothing (the crop tool is entered
+                // explicitly with `c`; a stray click must not conjure a
+                // rect that then arms the Esc-discard prompt).
+                (None, _) => {}
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {

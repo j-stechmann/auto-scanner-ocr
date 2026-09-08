@@ -668,7 +668,7 @@ fn draw_help(f: &mut Frame, area: Rect) -> Rect {
         ("c (in edit)", "start / finish cropping"),
         ("hjkl / HJKL", "move crop / grow its edges"),
         ("Alt+hjkl", "shrink the crop from its edges"),
-        ("drag", "edge: resize · inside: move · outside: draw"),
+        ("drag (in edit)", "edge: resize · inside: move"),
         ("Enter (in edit)", "apply crop (confirm; pixels are lost)"),
         ("Finish", ""),
         ("f", "build PDF (browser: choose folder + filename)"),

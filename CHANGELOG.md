@@ -11,12 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Page editor with cropping** (`e` or `Enter` on a ready page): a
   full-screen editing view showing the page as large as the terminal
-  allows. The `c` key activates the crop tool — the selection rectangle is
-  drawn directly into the image (it stays visible on every image protocol,
-  including kitty and sixel) and can be shaped with the mouse (drag an
-  edge/corner to resize, the interior to move, outside the rect to draw a
-  fresh one) or the keyboard (`hjkl` moves it, `HJKL` grows it,
-  `Alt+hjkl` shrinks it, arrows move). Enter shows a confirm dialog and
+  allows. The `c` key activates the crop tool (clicks do nothing before
+  it) — the selection rectangle is drawn directly into the image (it stays
+  visible on every image protocol, including kitty and sixel) and can be
+  shaped with the mouse (drag an edge/corner to resize, the interior to
+  move) or the keyboard (`hjkl` moves it, `HJKL` grows it, `Alt+hjkl`
+  shrinks it, arrows move). Enter shows a confirm dialog and
   then crops the page image; the crop is applied to the actual scan, so
   the final PDF contains exactly the kept region (page size derives from
   the image pixels + DPI as before). Two safety rails: leaving the editor
