@@ -1,7 +1,7 @@
 //! Modal overlays: help, diagnostics, language picker, confirmations.
 //! All input reaches overlays first (modal routing per the UX review).
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
 use super::app::App;
@@ -247,9 +247,142 @@ async fn accept_confirm(
     }
 }
 
-pub fn handle_mouse(app: &mut App, overlay: &mut Overlay, mouse: MouseEvent) {
-    // Overlays swallow clicks; clicking outside closes them (common TUI
-    // convention), except diagnostics where accidental dismissal hurts.
-    let _ = (app, overlay);
-    let _ = mouse;
+/// Handle a mouse event inside an overlay. Returns true when the overlay
+/// should stay open; a left click outside the dialog rect closes it
+/// (common TUI convention), except Diagnostics where accidental dismissal
+/// hurts. Mere pointer movement, releases, drags and scrolling never
+/// close — mouse capture delivers a `Moved` event for every pointer step,
+/// so without the movement rule any dialog would vanish as soon as the
+/// pointer crosses the terminal.
+pub fn handle_mouse(app: &mut App, overlay: &mut Overlay, mouse: MouseEvent) -> bool {
+    // Down(Left) outside the dialog is the only closing gesture. The
+    // catch-all covers Up/Drag (a press inside dragged out must not close
+    // on release), Moved, Scroll* (incl. ScrollLeft/ScrollRight) and
+    // right/middle buttons.
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return true;
+    }
+    // Missing rect (no draw yet) or degenerate rect (tiny terminal, nothing
+    // visible to click on): never close.
+    let Some(rect) = app.overlay_rect.filter(|r| r.width > 0 && r.height > 0) else {
+        return true;
+    };
+    let inside = mouse.column >= rect.x
+        && mouse.column < rect.x + rect.width
+        && mouse.row >= rect.y
+        && mouse.row < rect.y + rect.height;
+    inside || matches!(overlay, Overlay::Diagnostics)
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::crossterm::event::KeyModifiers;
+    use ratatui::layout::Rect;
+
+    use super::*;
+
+    /// App with throwaway channels (mirrors app.rs's test_app()).
+    fn test_app() -> App {
+        let (diag_tx, _diag_rx) = mpsc::channel(4);
+        let (finish_tx, _finish_rx) = mpsc::channel(1);
+        App::new(crate::config::Config::default(), diag_tx, finish_tx)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Dialog rect at (10, 5) sized 20x6, set the way ui::draw would.
+    fn app_with_rect() -> App {
+        let mut app = test_app();
+        app.overlay_rect = Some(Rect::new(10, 5, 20, 6));
+        app
+    }
+
+    #[test]
+    fn pointer_movement_never_closes() {
+        // The reported bug: with mouse capture on, every Moved event was
+        // routed here and dropped the overlay. Movement must keep it.
+        let mut app = app_with_rect();
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+        ] {
+            assert!(
+                handle_mouse(&mut app, &mut Overlay::Help, mouse(kind, 0, 0)),
+                "{kind:?} must not close the overlay"
+            );
+        }
+    }
+
+    #[test]
+    fn left_click_inside_keeps() {
+        let mut app = app_with_rect();
+        // Every corner + center of Rect(10, 5, 20, 6): x 10..29, y 5..10.
+        for (col, row) in [(10, 5), (29, 5), (10, 10), (29, 10), (19, 7)] {
+            assert!(handle_mouse(
+                &mut app,
+                &mut Overlay::Confirm(Confirm::quit()),
+                mouse(MouseEventKind::Down(MouseButton::Left), col, row)
+            ));
+        }
+    }
+
+    #[test]
+    fn left_click_outside_closes_except_diagnostics() {
+        let mut app = app_with_rect();
+        // Just outside the right edge and below the bottom edge.
+        for col_row in [(31, 7), (19, 12), (5, 5)] {
+            let click = mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                col_row.0,
+                col_row.1,
+            );
+            assert!(!handle_mouse(&mut app, &mut Overlay::Help, click));
+            assert!(!handle_mouse(
+                &mut app,
+                &mut Overlay::Confirm(Confirm::quit()),
+                click
+            ));
+            assert!(!handle_mouse(
+                &mut app,
+                &mut Overlay::LangPicker(LangPicker::new("eng".into())),
+                click
+            ));
+            // Diagnostics never mouse-closes (accidental dismissal hurts).
+            assert!(handle_mouse(&mut app, &mut Overlay::Diagnostics, click));
+        }
+    }
+
+    #[test]
+    fn missing_or_degenerate_rect_never_closes() {
+        // No draw yet (rect None): nothing to click on — keep.
+        let mut app = test_app();
+        assert!(handle_mouse(
+            &mut app,
+            &mut Overlay::Help,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0)
+        ));
+        // Degenerate rect (tiny terminal): invisible dialog — keep.
+        for degenerate in [Rect::new(0, 0, 0, 6), Rect::new(0, 0, 20, 0)] {
+            app.overlay_rect = Some(degenerate);
+            assert!(handle_mouse(
+                &mut app,
+                &mut Overlay::Help,
+                mouse(MouseEventKind::Down(MouseButton::Left), 0, 0)
+            ));
+        }
+    }
 }

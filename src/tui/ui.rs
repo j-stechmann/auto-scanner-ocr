@@ -194,13 +194,17 @@ pub fn draw(f: &mut Frame, app: &mut App, preview: &mut PreviewWorker) {
     draw_text(f, app, rects.text);
     draw_footer(f, app, rects.footer);
 
+    app.overlay_rect = None;
     if let Some(overlay) = &mut app.overlay {
-        match overlay {
+        // Record the dialog rect for mouse hit-testing (click inside keeps,
+        // click outside dismisses); recomputed every frame like pane_rects.
+        let rect = match overlay {
             Overlay::Help => draw_help(f, rects.whole),
             Overlay::Diagnostics => draw_diagnostics(f, app, rects.whole),
             Overlay::LangPicker(picker) => draw_lang_picker(f, picker, rects.whole),
             Overlay::Confirm(confirm) => draw_confirm(f, confirm, rects.whole),
-        }
+        };
+        app.overlay_rect = Some(rect);
     }
 }
 
@@ -611,7 +615,8 @@ fn overlay_block(title: &str) -> Block<'_> {
         .border_set(symbols::border::ROUNDED)
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
+/// Returns the rendered dialog rect (for overlay mouse hit-testing).
+fn draw_help(f: &mut Frame, area: Rect) -> Rect {
     let rows: Vec<(&str, &str)> = vec![
         ("Scanning", ""),
         ("s / Enter (pages)", "scan next page"),
@@ -660,9 +665,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    area
 }
 
-fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
+/// Returns the rendered dialog rect (for overlay mouse hit-testing).
+fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) -> Rect {
     let Some(report) = &app.report else {
         let a = centered_rect(60, 8, area);
         f.render_widget(Clear, a);
@@ -673,7 +680,7 @@ fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
             Paragraph::new("running checks...").wrap(Wrap { trim: false }),
             inner,
         );
-        return;
+        return a;
     };
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         "press r to re-run checks · Esc to close",
@@ -727,9 +734,11 @@ fn draw_diagnostics(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(dlg);
     f.render_widget(block, dlg);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    dlg
 }
 
-fn draw_lang_picker(f: &mut Frame, picker: &overlays::LangPicker, area: Rect) {
+/// Returns the rendered dialog rect (for overlay mouse hit-testing).
+fn draw_lang_picker(f: &mut Frame, picker: &overlays::LangPicker, area: Rect) -> Rect {
     let mut lines: Vec<Line> = Vec::new();
     if picker.loading {
         lines.push(Line::from("loading installed languages…"));
@@ -766,9 +775,11 @@ fn draw_lang_picker(f: &mut Frame, picker: &overlays::LangPicker, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    area
 }
 
-fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
+/// Returns the rendered dialog rect (for overlay mouse hit-testing).
+fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) -> Rect {
     let height = (confirm.lines.len() as u16 + 4).min(12);
     let width = confirm
         .lines
@@ -799,6 +810,7 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
         Span::styled("[Esc] cancel", super::theme::MUTED),
     ]));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    area
 }
 
 #[cfg(test)]
@@ -887,5 +899,41 @@ mod tests {
         // Right column cells must reach the area right edge.
         let max_x = cells.iter().map(|c| c.x + c.width).max().unwrap();
         assert_eq!(max_x, area.width);
+    }
+
+    /// draw() records the rendered dialog rect for overlay mouse
+    /// hit-testing (click inside keeps, click outside dismisses), and
+    /// clears it when no overlay is open (stale-rect guard).
+    #[test]
+    fn draw_records_overlay_rect() {
+        let (diag_tx, _diag_rx) = tokio::sync::mpsc::channel(4);
+        let (finish_tx, _finish_rx) = tokio::sync::mpsc::channel(1);
+        let mut app = App::new(crate::config::Config::default(), diag_tx, finish_tx);
+        let mut preview = crate::tui::preview::PreviewWorker::new(crate::tui::halfblocks_picker());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("test backend");
+
+        // No overlay: rect stays unset.
+        terminal
+            .draw(|f| draw(f, &mut app, &mut preview))
+            .expect("draw");
+        assert!(app.overlay_rect.is_none(), "no overlay, no rect");
+
+        // Help open: rect is the centered dialog inside the whole area.
+        app.overlay = Some(Overlay::Help);
+        terminal
+            .draw(|f| draw(f, &mut app, &mut preview))
+            .expect("draw");
+        let r = app.overlay_rect.expect("help rect recorded");
+        assert!(r.width > 0 && r.height > 0, "non-degenerate: {r:?}");
+        let expected = centered_rect(62, 30, rect(80, 24));
+        assert_eq!(r, expected);
+
+        // Closing the overlay clears the rect on the next frame.
+        app.overlay = None;
+        terminal
+            .draw(|f| draw(f, &mut app, &mut preview))
+            .expect("draw");
+        assert!(app.overlay_rect.is_none(), "stale rect cleared");
     }
 }
