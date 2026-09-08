@@ -42,6 +42,49 @@ pub async fn rotate_png(path: &Path, cw: bool) -> Result<()> {
     Ok(())
 }
 
+/// Crop rectangle in source-image pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CropRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl CropRect {
+    pub fn is_zero_area(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+}
+
+/// Crop a PNG in place (pure Rust, no external tool). The rect is clamped
+/// to the image bounds by the image crate; zero-area crops are rejected
+/// (imageops::crop would otherwise emit a 0x0 PNG that breaks preview
+/// decode and img2pdf). Same atomic .part+rename write as rotate_png.
+pub async fn crop_png(path: &Path, rect: CropRect) -> Result<()> {
+    if rect.is_zero_area() {
+        anyhow::bail!("empty crop rect");
+    }
+    let bytes = tokio::fs::read(path).await?;
+    let img = tokio::task::spawn_blocking(move || -> Result<image::DynamicImage> {
+        let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+        let img = reader.decode()?;
+        Ok(img.crop_imm(rect.x, rect.y, rect.w, rect.h))
+    })
+    .await??;
+
+    let part = path.with_extension("png.part");
+    let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png)?;
+        Ok(out.into_inner())
+    })
+    .await??;
+    tokio::fs::write(&part, encoded).await?;
+    tokio::fs::rename(&part, path).await?;
+    Ok(())
+}
+
 /// Build the unpaper argv for a cleanup mode (pure; unit-tested).
 /// File arguments (`src`, `dst`) are NOT included; callers append them last
 /// (unpaper's CLI is `unpaper [options] <in> <out>`).

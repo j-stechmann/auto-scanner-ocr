@@ -55,6 +55,7 @@ pub enum Stage {
     Scan,
     Clean,
     Ocr,
+    Crop,
 }
 
 impl Stage {
@@ -63,6 +64,7 @@ impl Stage {
             Stage::Scan => "scanning",
             Stage::Clean => "cleaning",
             Stage::Ocr => "ocr",
+            Stage::Crop => "cropping",
         }
     }
 }
@@ -151,6 +153,16 @@ pub enum Cmd {
     /// Rotate page image 90° CW (false = CCW); re-OCRs only under eager
     /// preview OCR (lazy re-extracts on demand).
     Rotate(PageId, bool),
+    /// Crop page image to the given rect in source-image pixels. Rejects
+    /// zero-area rects; preempts an in-flight preview-OCR job for the page
+    /// (lazy re-extracts on demand afterwards).
+    Crop {
+        id: PageId,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    },
     /// Delete page (kills job if processing; deferred if scanning).
     Delete(PageId),
     /// Move page within the list (index-based).
@@ -265,6 +277,16 @@ enum Job {
         dir: PathBuf,
         token: CancellationToken,
     },
+    Crop {
+        id: PageId,
+        image: PathBuf,
+        rect: pdf::CropRect,
+        /// Same semantics as Rotate.reocr (eager preview re-OCR).
+        reocr: bool,
+        langs: String,
+        dir: PathBuf,
+        token: CancellationToken,
+    },
     Finish {
         plan: pdf::BuildPlan,
     },
@@ -303,6 +325,12 @@ enum JobDone {
         id: PageId,
         /// Ok(Some(text)) = rotated + re-OCRed; Ok(None) = rotated without
         /// re-OCR (text invalidated); Err(msg) = failed/cancelled.
+        reocr: bool,
+        result: Result<Option<String>, String>,
+    },
+    Crop {
+        id: PageId,
+        /// Same payload semantics as Rotate (re-OCR ran or not).
         reocr: bool,
         result: Result<Option<String>, String>,
     },
@@ -564,6 +592,36 @@ impl Session {
                     None => Err("no such page".into()),
                 }
             }
+            Cmd::Crop { id, w, h, .. } => {
+                if *w == 0 || *h == 0 {
+                    return Err("empty crop rect".into());
+                }
+                if self.busy == Busy::Finishing {
+                    return Err("building PDF - crop once it finishes".into());
+                }
+                if self.finished {
+                    return Err("PDF already built - press n for a new session".into());
+                }
+                // A live preview-OCR job for this page is preempted by
+                // start_crop (the lazy tick re-extracts from the cropped
+                // image on demand); crop/rotate-stage jobs still block.
+                // Preview-OCR jobs look different per mode: eager runs as
+                // Processing(Stage::Ocr), lazy keeps the page Ready with
+                // text_pending set (request_text never changes status).
+                if let Some(page) = self.pages.iter().find(|p| p.id == *id) {
+                    let preview_ocr_job = page.text_pending
+                        || (page.status == PageStatus::Processing
+                            && page.stage == Some(Stage::Ocr));
+                    if self.jobs.contains_key(id) && !preview_ocr_job {
+                        return Err("page busy - crop after its job finishes".into());
+                    }
+                }
+                match self.pages.iter().find(|p| p.id == *id).map(|p| p.status) {
+                    Some(PageStatus::Ready) => Ok(()),
+                    Some(_) => Err("only ready pages can be cropped".into()),
+                    None => Err("no such page".into()),
+                }
+            }
             Cmd::CancelScan => {
                 if self.busy == Busy::Scanning {
                     Ok(())
@@ -644,6 +702,7 @@ impl Session {
             Cmd::CancelScan => self.cancel_scan(),
             Cmd::Rescan { id, dpi, mode } => self.start_scan(dpi, mode, Some(id)),
             Cmd::Rotate(id, cw) => self.start_rotate(id, cw),
+            Cmd::Crop { id, x, y, w, h } => self.start_crop(id, pdf::CropRect { x, y, w, h }),
             Cmd::Delete(id) => self.delete(id),
             Cmd::Move { from, to } => self.move_page(from, to),
             Cmd::Finish => self.start_finish_to(None, false),
@@ -709,6 +768,7 @@ impl Session {
                 result,
             } => self.on_ocr_text_done(id, image, image_gen, result),
             JobDone::Rotate { id, reocr, result } => self.on_rotate_done(id, reocr, result),
+            JobDone::Crop { id, reocr, result } => self.on_crop_done(id, reocr, result),
             JobDone::Finish { result } => self.on_finish_done(result),
         }
     }
@@ -880,6 +940,35 @@ impl Session {
                         Err(e) => Err(format!("rotate failed: {e:#}")),
                     };
                     JobDone::Rotate { id, reocr, result }
+                }
+                Job::Crop {
+                    id,
+                    image,
+                    rect,
+                    reocr,
+                    langs,
+                    dir,
+                    token,
+                } => {
+                    let result = match pdf::crop_png(&image, rect).await {
+                        Ok(()) if reocr => {
+                            if token.is_cancelled() {
+                                Err("cancelled".to_string())
+                            } else {
+                                match scan::ocr_text_cancellable(&image, &langs, &dir, &token).await
+                                {
+                                    Ok(text) => Ok(Some(text)),
+                                    Err(e) if e.to_string() == "cancelled" => {
+                                        Err("cancelled".into())
+                                    }
+                                    Err(e) => Err(format!("re-OCR failed: {e:#}")),
+                                }
+                            }
+                        }
+                        Ok(()) => Ok(None),
+                        Err(e) => Err(format!("crop failed: {e:#}")),
+                    };
+                    JobDone::Crop { id, reocr, result }
                 }
                 Job::Finish { plan } => JobDone::Finish {
                     result: pdf::build_pdf(&plan).await,
@@ -1272,6 +1361,106 @@ impl Session {
         }
         self.notify_pages();
         self.status(format!("page {id} rotated"));
+    }
+
+    /// Crop a page image to the given rect (source-image pixels). Preempts
+    /// an in-flight preview-OCR job for the page: its token is cancelled and
+    /// the jobs entry dropped, so the lazy tick will re-extract from the
+    /// cropped image once it is ready (eager mode re-OCRs inside the crop
+    /// job anyway). A live rotate/unpaper job is NOT preempted — the guard
+    /// already rejected the command in that case.
+    fn start_crop(&mut self, id: PageId, rect: pdf::CropRect) {
+        if rect.is_zero_area() {
+            return; // defensive: the guard already rejects empty rects
+        }
+        let Some(page) = self.pages.iter().find(|p| p.id == id).cloned() else {
+            return;
+        };
+        let Some(image) = page.image.clone() else {
+            return;
+        };
+        // Preempt a preview-OCR job (guards allowed it: Ready + OCR stage
+        // only). The completion handler arrives with a stale generation
+        // later and is dropped there — no status line for it.
+        if let Some(token) = self.jobs.remove(&id) {
+            token.cancel();
+        }
+        let reocr = self.cfg.preview_ocr == PreviewOcr::Eager;
+        if let Some(p) = self.pages.iter_mut().find(|p| p.id == id) {
+            p.status = PageStatus::Processing;
+            p.stage = Some(Stage::Crop);
+            p.stage_started = Some(Instant::now());
+            // Bump NOW, not at completion: a preempted OCR job's completion
+            // can land mid-crop, and without the bump its (image, gen)
+            // currency check would still match — applying ghost text to a
+            // page whose pixels are about to change and removing the crop
+            // job's token from `jobs`. The bump also makes the stale-
+            // completion branch a no-op (entry preserved, text dropped).
+            p.image_gen += 1;
+            // Under lazy/off the text pane is not re-OCRed; drop the stale
+            // pre-crop text here (on_crop_done only overwrites text when a
+            // re-OCR actually ran). Lazy re-extracts on demand.
+            if !reocr {
+                p.text = None;
+                p.text_pending = false;
+                // New image content: re-arm the lazy auto-retry.
+                p.ocr_failed_gen = None;
+            }
+        }
+        let token = CancellationToken::new();
+        self.jobs.insert(id, token.clone());
+        self.notify_pages();
+        self.status(format!("cropping page {id} to {}x{}…", rect.w, rect.h));
+        self.spawn_job(Job::Crop {
+            id,
+            image,
+            rect,
+            reocr,
+            langs: self.cfg.langs.clone(),
+            dir: self.dir.clone(),
+            token,
+        });
+    }
+
+    fn on_crop_done(&mut self, id: PageId, reocr: bool, result: Result<Option<String>, String>) {
+        self.jobs.remove(&id);
+        if self.finish_delete_if_pending(id) {
+            self.status("page deleted");
+            self.notify_pages();
+            return;
+        }
+        if let Some(p) = self.pages.iter_mut().find(|p| p.id == id) {
+            match result {
+                Ok(text) => {
+                    p.status = PageStatus::Ready;
+                    p.stage = None;
+                    p.stage_started = None;
+                    // start_crop already bumped; a second bump keeps
+                    // rescan-style generation accounting monotonic per job.
+                    p.image_gen += 1;
+                    // Re-OCR ran: refresh the pane text (Ok(None) = tesseract
+                    // found nothing). Without re-OCR the text was already
+                    // invalidated in start_crop; lazy mode re-extracts it
+                    // on demand from the cropped image.
+                    if reocr && text.is_some() {
+                        p.text = text;
+                    }
+                }
+                Err(e) if e == "cancelled" => {
+                    p.status = PageStatus::Ready;
+                    p.stage = None;
+                    p.stage_started = None;
+                }
+                Err(e) => {
+                    p.status = PageStatus::Failed;
+                    p.error = Some(e);
+                    p.stage = None;
+                    p.stage_started = None;
+                }
+            }
+        }
+        self.notify_pages();
+        self.status(format!("page {id} cropped"));
     }
 
     /// Retarget the reserved output placeholder to `out` (when given) and
@@ -2575,6 +2764,381 @@ mod tests {
         );
         s.request_text(1);
         assert!(s.pages[0].text_pending);
+    }
+
+    /// Crop helpers mirror the rotate test patterns.
+    fn crop_done(id: PageId, reocr: bool, result: Result<Option<String>, String>) -> JobDone {
+        JobDone::Crop { id, reocr, result }
+    }
+
+    fn cmd_crop(id: PageId, rect: pdf::CropRect) -> Cmd {
+        Cmd::Crop {
+            id,
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+        }
+    }
+
+    #[tokio::test]
+    async fn crop_under_lazy_invalidates_text() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+        s.request_text(1);
+        s.handle_job_done(ocr_ok(1, img.clone(), 1, "pre-crop"))
+            .await;
+        assert_eq!(s.pages[0].text.as_deref(), Some("pre-crop"));
+
+        s.start_crop(
+            1,
+            pdf::CropRect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+        );
+        assert!(
+            s.pages[0].text.is_none(),
+            "stale pre-crop text dropped synchronously"
+        );
+        assert_eq!(s.pages[0].stage, Some(Stage::Crop));
+        // The crop job reports Ok(None) with reocr=false: text stays gone.
+        s.handle_job_done(crop_done(1, false, Ok(None))).await;
+        assert_eq!(s.pages[0].status, PageStatus::Ready);
+        assert!(s.pages[0].text.is_none());
+        assert_eq!(
+            s.pages[0].image_gen, 3,
+            "crop bumps gen at start AND completion"
+        );
+        // Lazy re-extract works from the (cropped) image afterwards.
+        s.request_text(1);
+        assert!(s.pages[0].text_pending);
+    }
+
+    #[tokio::test]
+    async fn crop_re_arms_lazy_ocr_after_failure() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+
+        s.request_text(1);
+        s.handle_job_done(JobDone::OcrText {
+            id: 1,
+            image: img.clone(),
+            image_gen: 1,
+            result: Err(anyhow::anyhow!("boom")),
+        })
+        .await;
+        assert_eq!(s.pages[0].ocr_failed_gen, Some(1));
+
+        // Crop succeeds: new image content clears the failure flag.
+        s.start_crop(
+            1,
+            pdf::CropRect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+        );
+        s.handle_job_done(crop_done(1, false, Ok(None))).await;
+        assert_eq!(s.pages[0].status, PageStatus::Ready);
+        assert_eq!(
+            s.pages[0].ocr_failed_gen, None,
+            "crop re-arms the lazy retry"
+        );
+        s.request_text(1);
+        assert!(s.pages[0].text_pending);
+    }
+
+    #[tokio::test]
+    async fn crop_guard_parity_with_rotate() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+
+        // Zero-area rect rejected.
+        assert!(s
+            .guard(&cmd_crop(
+                1,
+                pdf::CropRect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 10
+                }
+            ))
+            .is_err());
+        assert!(s
+            .guard(&cmd_crop(
+                1,
+                pdf::CropRect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 0
+                }
+            ))
+            .is_err());
+        // Ready page with a valid rect: allowed.
+        assert!(s
+            .guard(&cmd_crop(
+                1,
+                pdf::CropRect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1
+                }
+            ))
+            .is_ok());
+        // No such page.
+        assert!(s
+            .guard(&cmd_crop(
+                99,
+                pdf::CropRect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1
+                }
+            ))
+            .is_err());
+
+        // Finished session: rejected.
+        s.finished = true;
+        assert!(s
+            .guard(&cmd_crop(
+                1,
+                pdf::CropRect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1
+                }
+            ))
+            .is_err());
+        s.finished = false;
+
+        // Building: rejected.
+        s.busy = Busy::Finishing;
+        assert!(s
+            .guard(&cmd_crop(
+                1,
+                pdf::CropRect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1
+                }
+            ))
+            .is_err());
+        s.busy = Busy::Idle;
+
+        // Non-ready page (processing): rejected.
+        if let Some(p) = s.pages.iter_mut().find(|p| p.id == 1) {
+            p.status = PageStatus::Processing;
+            p.stage = Some(Stage::Crop);
+        }
+        assert!(s
+            .guard(&cmd_crop(
+                1,
+                pdf::CropRect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1
+                }
+            ))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn crop_preempts_lazy_ocr_job() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+
+        // A lazy OCR job is running for the page (page still Ready,
+        // text_pending set).
+        s.request_text(1);
+        assert!(s.pages[0].text_pending);
+        assert_eq!(s.jobs.len(), 1);
+        let token = s.jobs.get(&1).cloned().unwrap();
+
+        // The guard allows the crop (preemptable job), and start_crop
+        // cancels the OCR token and replaces it with the crop token.
+        assert!(s
+            .guard(&cmd_crop(
+                1,
+                pdf::CropRect {
+                    x: 0,
+                    y: 0,
+                    w: 5,
+                    h: 5
+                }
+            ))
+            .is_ok());
+        s.start_crop(
+            1,
+            pdf::CropRect {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 5,
+            },
+        );
+        assert!(token.is_cancelled(), "crop cancels the preview OCR job");
+        assert_eq!(s.jobs.len(), 1, "crop token replaces the OCR token");
+        assert_eq!(s.pages[0].status, PageStatus::Processing);
+        assert_eq!(s.pages[0].stage, Some(Stage::Crop));
+
+        // The preempted OCR completion arrives later (stale gen): dropped.
+        s.handle_job_done(ocr_ok(1, img.clone(), 1, "ghost")).await;
+        let p = &s.pages[0];
+        assert_eq!(p.status, PageStatus::Processing, "still cropping");
+        assert!(p.text.is_none(), "stale OCR result dropped");
+
+        // Crop completes normally.
+        s.handle_job_done(crop_done(1, false, Ok(None))).await;
+        assert_eq!(s.pages[0].status, PageStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn crop_blocked_while_rotate_job_runs() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+
+        // Simulate a running rotate job (token registered, page processing).
+        if let Some(p) = s.pages.iter_mut().find(|p| p.id == 1) {
+            p.status = PageStatus::Processing;
+            p.stage = Some(Stage::Clean);
+        }
+        s.jobs.insert(1, CancellationToken::new());
+        assert!(
+            s.guard(&cmd_crop(
+                1,
+                pdf::CropRect {
+                    x: 0,
+                    y: 0,
+                    w: 5,
+                    h: 5
+                }
+            ))
+            .is_err(),
+            "crop must not preempt a rotate job"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_delete_completes_on_crop_done() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img.clone())).await;
+        s.start_crop(
+            1,
+            pdf::CropRect {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 5,
+            },
+        );
+        // User deletes while the crop runs: deferred.
+        s.delete(1);
+        assert_eq!(s.pages[0].status, PageStatus::DeletePending);
+        s.handle_job_done(crop_done(1, false, Ok(None))).await;
+        assert!(s.pages.is_empty(), "deferred delete finished by crop done");
+        assert!(s.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn crop_failure_fails_the_page_and_cancelled_recovers() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+
+        s.start_crop(
+            1,
+            pdf::CropRect {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 5,
+            },
+        );
+        s.handle_job_done(crop_done(1, false, Err("crop failed: io".into())))
+            .await;
+        let p = &s.pages[0];
+        assert_eq!(p.status, PageStatus::Failed);
+        assert!(p.error.is_some());
+
+        // A cancelled crop (preempted delete race) leaves the page Ready.
+        s.start_scan(300, "gray".into(), Some(1));
+        // Rescan made it Scanning; fabricate Ready again for the next crop.
+        if let Some(p) = s.pages.iter_mut().find(|p| p.id == 1) {
+            p.status = PageStatus::Ready;
+            p.stage = None;
+            p.stage_started = None;
+            p.image = Some(s.dir.join("page_001.png"));
+        }
+        s.start_crop(
+            1,
+            pdf::CropRect {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 5,
+            },
+        );
+        s.handle_job_done(crop_done(1, false, Err("cancelled".into())))
+            .await;
+        let p = &s.pages[0];
+        assert_eq!(p.status, PageStatus::Ready, "cancelled != failed");
+        assert_eq!(p.stage, None);
+    }
+
+    #[tokio::test]
+    async fn finish_gating_rejects_cropping_stage() {
+        let (mut s, _dir) = test_session(PreviewOcr::Lazy);
+        s.start_scan(300, "gray".into(), None);
+        let img = s.dir.join("page_001.png");
+        std::fs::write(&img, b"x").unwrap();
+        s.handle_job_done(scan_ok(1, img)).await;
+        // Ready page: finish allowed.
+        assert!(s.guard(&Cmd::Finish).is_ok());
+        // Page in crop stage: finish rejected.
+        s.start_crop(
+            1,
+            pdf::CropRect {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 5,
+            },
+        );
+        assert!(s.guard(&Cmd::Finish).is_err());
+        // Completion unblocks finish again.
+        s.handle_job_done(crop_done(1, false, Ok(None))).await;
+        assert!(s.guard(&Cmd::Finish).is_ok());
     }
 
     #[test]
