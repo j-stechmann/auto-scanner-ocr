@@ -21,7 +21,7 @@ libc = "0.2"
 anyhow = "1.0"
 regex = "1"
 tempfile = "3"
-dirs = "6"
+dirs = "7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
 chrono = "0.4"
