@@ -403,13 +403,31 @@ const OUTLINE_THICKNESS: u32 = 2;
 /// `ThreadProtocol` is involved: ids/blanking are a threaded-widget concern
 /// this worker does not have.
 ///
-/// `epoch` invalidates everything: a decode completion bumps it, and
-/// stale encodes (old epoch) are dropped on arrival.
+/// `epoch` invalidates everything: a decode adoption or a different-page
+/// request bumps it, and stale encodes (old epoch) are dropped on arrival.
 pub struct EditorWorker {
     picker: Picker,
     /// Current (path, gen) the display protocol corresponds to.
     path: Option<PathBuf>,
     gen: u32,
+    /// Decode request currently in flight (at most one; results for
+    /// superseded requests are dropped as stale on arrival).
+    pending: Option<(PathBuf, u32)>,
+    /// Decodes that failed for a given (path, gen); never retried
+    /// silently (no per-frame retry-loop — same contract as
+    /// `PreviewWorker.failed`).
+    failed: HashSet<(PathBuf, u32)>,
+    /// The (path, gen) most recently REQUESTED (set on every `request`,
+    /// before any early return). `ready()` requires the adopted display
+    /// to match it, so a failed same-path re-decode cannot leave `ready`
+    /// true with a stale display (the failed cache would otherwise make
+    /// that state permanent).
+    requested: Option<(PathBuf, u32)>,
+    /// Last failure for the CURRENTLY requested content, consumed by the
+    /// UI via `take_failure` (surfaced as a status line; the failure is
+    /// terminal for that (path, gen), so silence would strand the editor
+    /// on "decoding…" with no explanation).
+    last_failure: Option<(PathBuf, u32, String)>,
     /// The DISPLAY protocol: always renderable (last completed encode).
     /// Never handed to the encode worker.
     display: Option<StatefulProtocol>,
@@ -452,6 +470,10 @@ impl EditorWorker {
             picker,
             path: None,
             gen: 0,
+            pending: None,
+            failed: HashSet::new(),
+            requested: None,
+            last_failure: None,
             display: None,
             orig_dims: (0, 0),
             base: None,
@@ -468,11 +490,37 @@ impl EditorWorker {
         }
     }
 
-    /// Is the editor image loaded (decode done for the current request)?
-    /// The display always holds the PREVIOUS image while a newer decode is
-    /// in flight; the caller decides whether that is acceptable to show.
+    /// Is the editor image loaded for the CURRENT request (the display
+    /// corresponds to the requested (path, gen) and no decode is in
+    /// flight)? Strict on purpose: callers must not build crop rects from
+    /// a stale display's dims while any decode is pending — including the
+    /// permanent pending-adjacent state after a failed same-path
+    /// re-decode (the failed cache stops retries, so the display's old
+    /// dims must not count as ready).
     pub fn ready(&self) -> bool {
         self.display.is_some()
+            && self.pending.is_none()
+            && self
+                .requested
+                .as_ref()
+                .is_some_and(|(rp, rg)| self.path.as_ref() == Some(rp) && self.gen == *rg)
+    }
+
+    /// Lenient display check: SOMETHING is decoded (possibly the previous
+    /// image while a same-path re-decode is in flight). Used by rendering
+    /// to keep the last image on screen (no blanking); rect creation and
+    /// hit-testing must use `ready()` instead.
+    pub fn has_display(&self) -> bool {
+        self.display.is_some()
+    }
+
+    /// Take the last decode failure for the currently requested content
+    /// (if any). The UI surfaces it as a status line: with the failed
+    /// cache, a failure is terminal for that (path, gen), so without
+    /// this the editor would sit on "decoding…" with no explanation.
+    /// None for content that never failed or after consumption.
+    pub fn take_failure(&mut self) -> Option<(PathBuf, u32, String)> {
+        self.last_failure.take()
     }
 
     /// Original image pixel dims ((0, 0) until the first decode lands).
@@ -503,13 +551,31 @@ impl EditorWorker {
     }
 
     /// Request (re-)decoding `path` at generation `gen`. Cheap per frame:
-    /// a decode is in flight iff (path, gen) differs from the current one
-    /// AND no result for it has landed yet — tracked by the display's
-    /// (path, gen), so a completed decode always ends the pending window.
+    /// a decode is spawned only when (path, gen) is neither the current
+    /// display's content, nor already in flight, nor previously failed.
     pub fn request(&mut self, path: PathBuf, gen: u32) {
-        if self.path.as_ref() == Some(&path) && self.gen == gen && self.display.is_some() {
+        self.requested = Some((path.clone(), gen));
+        if self.path.as_ref() == Some(&path) && self.gen == gen {
             return; // already current
         }
+        if self.pending.as_ref() == Some(&(path.clone(), gen)) {
+            return; // a decode for exactly this content is in flight
+        }
+        if self.failed.contains(&(path.clone(), gen)) {
+            return; // failed for this exact content; don't retry-loop
+        }
+        // Different content requested: the stale display must not survive
+        // into the pending window. Clear it (and the dims derived from it)
+        // so callers render "decoding…" and cannot shape a rect in the
+        // OLD page's pixel space and apply it to the NEW image.
+        if self.path.as_ref() != Some(&path) {
+            self.display = None;
+            self.base = None;
+            self.orig_dims = (0, 0);
+            self.encoded_size = None;
+            self.shown_outline = None;
+        }
+        self.pending = Some((path.clone(), gen));
         let picker = self.picker.clone();
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
@@ -553,6 +619,12 @@ impl EditorWorker {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 EditorLoaded::Protocol(proto, base, path, gen, orig) => {
+                    // Stale result (a newer request superseded it)? Drop.
+                    if self.pending.as_ref() != Some(&(path.clone(), gen)) {
+                        continue;
+                    }
+                    self.pending = None;
+                    self.failed.remove(&(path.clone(), gen));
                     self.path = Some(path);
                     self.gen = gen;
                     self.orig_dims = orig;
@@ -566,10 +638,27 @@ impl EditorWorker {
                     changed = true;
                 }
                 EditorLoaded::Failed(path, gen, err) => {
+                    // Same staleness rule as the Protocol arm: a result
+                    // for superseded content must not clear the marker
+                    // of the NEWER in-flight decode (e.g. editor closed
+                    // mid-decode on A, reopened on B; A's failure arrives
+                    // after B's request).
+                    if self.pending.as_ref() != Some(&(path.clone(), gen)) {
+                        continue;
+                    }
+                    self.pending = None;
                     tracing::warn!(
                         "editor decode failed for {} (gen {gen}): {err}",
                         path.display()
                     );
+                    // Cache the failure for this exact content so the
+                    // per-frame reconcile does not retry-loop.
+                    self.failed.insert((path.clone(), gen));
+                    // Surface to the UI (consumed via take_failure), but
+                    // only if this content is still the one requested.
+                    if self.requested.as_ref() == Some(&(path.clone(), gen)) {
+                        self.last_failure = Some((path, gen, err));
+                    }
                 }
             }
         }
@@ -1062,5 +1151,254 @@ mod editor_tests {
         w.flush_queue();
         assert!(!w.poll_encodes(), "stale-epoch encode must not adopt");
         assert!(w.encoded_size.is_none(), "fresh display has no encode yet");
+    }
+
+    /// A request for a DIFFERENT path must clear the stale display: the
+    /// previous page's image (and dims) must not survive into the pending
+    /// window (no wrong-header render, no rect shaped in the old space).
+    #[tokio::test]
+    async fn different_page_request_clears_stale_display() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let (png_a, png_b) = {
+            let mut a = Vec::new();
+            image::DynamicImage::new_rgb8(40, 30)
+                .write_to(&mut std::io::Cursor::new(&mut a), image::ImageFormat::Png)
+                .unwrap();
+            let mut b = Vec::new();
+            image::DynamicImage::new_rgb8(400, 300)
+                .write_to(&mut std::io::Cursor::new(&mut b), image::ImageFormat::Png)
+                .unwrap();
+            (a, b)
+        };
+        let path_a = dir.path().join("a.png");
+        let path_b = dir.path().join("b.png");
+        std::fs::write(&path_a, png_a).unwrap();
+        std::fs::write(&path_b, png_b).unwrap();
+
+        w.request(path_a.clone(), 0);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+
+        // Now request page B: the pending window must show NOT-ready
+        // (display cleared, dims zeroed) even though A's decode result
+        // is still held internally.
+        w.request(path_b.clone(), 0);
+        assert!(
+            !w.ready(),
+            "stale display must not count as ready for the new page"
+        );
+        assert_eq!(w.orig_dims(), (0, 0), "dims of the old page cleared");
+
+        // B's decode lands: ready again, with B's dims.
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+        assert_eq!(w.orig_dims(), (400, 300));
+    }
+
+    /// Same-path re-decode (crop completion): the display KEEPS showing
+    /// the old image while the decode is in flight (no blanking), but
+    /// `ready()` is false so no rect is built from stale dims.
+    #[tokio::test]
+    async fn same_path_redecode_keeps_display_but_not_ready() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+
+        w.request(path.clone(), 0);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+
+        // Same path, bumped gen (crop completion): decode in flight.
+        w.request(path.clone(), 1);
+        assert!(!w.ready(), "pending re-decode must gate rect creation");
+        assert!(
+            w.has_display(),
+            "same-path re-decode keeps the old image on screen"
+        );
+
+        // Completion: ready again.
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+        assert_eq!(w.gen, 1);
+    }
+
+    /// Failed decodes are cached per (path, gen): repeated `request` calls
+    /// must not re-spawn (no retry-loop), and a gen bump retries once.
+    #[tokio::test]
+    async fn failed_editor_decode_is_not_retried() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let path = std::path::PathBuf::from("/nonexistent/editor-page.png");
+
+        w.request(path.clone(), 0);
+        // Decode is in flight: a second request must not stack another.
+        w.request(path.clone(), 0);
+        assert_eq!(w.pending, Some((path.clone(), 0)));
+
+        // Failure lands: cached, nothing pending.
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.pending.is_none());
+        assert!(w.failed.contains(&(path.clone(), 0)));
+
+        // Per-frame reconcile must not re-spawn for the failed content.
+        w.request(path.clone(), 0);
+        assert!(w.pending.is_none());
+
+        // A gen bump (new content) retries.
+        w.request(path.clone(), 1);
+        assert_eq!(w.pending, Some((path.clone(), 1)));
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.failed.contains(&(path.clone(), 1)));
+    }
+
+    /// A failure result for SUPERSEDED content must not clear the marker
+    /// of the newer in-flight decode (close/reopen flow: A's failure
+    /// arrives after B's request) nor surface to the UI as B's failure.
+    #[tokio::test]
+    async fn stale_failure_does_not_clear_newer_pending() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a-missing.png");
+        let path_b = dir.path().join("b.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path_b, png).unwrap();
+
+        // A: file missing -> will fail. Request it and wait for the
+        // failure to land in the channel (poll drains it; pending clears).
+        w.request(path_a.clone(), 0);
+        for _ in 0..100 {
+            if w.failed.contains(&(path_a.clone(), 0)) {
+                break;
+            }
+            w.poll();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.failed.contains(&(path_a.clone(), 0)));
+        // Consume the surfaced failure (the UI does this every frame).
+        assert!(w.take_failure().is_some(), "first failure surfaced");
+        assert!(w.take_failure().is_none(), "consumed exactly once");
+        // Re-request A (fresh decode of the still-missing file), then B
+        // before A's failure lands: the race under test.
+        w.failed.clear();
+        w.request(path_a.clone(), 0);
+        // B requested before A's failure lands.
+        w.request(path_b.clone(), 0);
+        assert_eq!(w.pending, Some((path_b.clone(), 0)));
+
+        // Drain: A's failure arrives while B is pending. It must be
+        // dropped as stale (not clear B's pending marker, not cached,
+        // not surfaced). B's decode may complete first (tiny image); the
+        // end state is the same either way: B adopted, A's stale failure
+        // gone without a trace on B's state.
+        let mut b_ready = false;
+        for _ in 0..100 {
+            w.poll();
+            if w.ready() && w.orig_dims() == (40, 30) {
+                b_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(b_ready, "B's decode adopted");
+        assert!(
+            w.take_failure().is_none(),
+            "stale failure not surfaced for B"
+        );
+        // Re-requesting A retries for real (its stale failure was not
+        // cached as B's content took over).
+        w.failed.clear();
+        w.request(path_a.clone(), 0);
+        assert_eq!(w.pending, Some((path_a.clone(), 0)));
+    }
+
+    /// A failed same-path re-decode (crop completion) leaves the display
+    /// stale-but-shown (no blanking) while `ready()` stays false forever
+    /// (the failed cache stops retries) — rect creation must be gated.
+    #[tokio::test]
+    async fn same_path_failure_gates_ready_but_keeps_display() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+
+        w.request(path.clone(), 0);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+
+        // Gen bump whose decode fails: make the file disappear.
+        std::fs::remove_file(&path).unwrap();
+        w.request(path.clone(), 1);
+        for _ in 0..100 {
+            if w.failed.contains(&(path.clone(), 1)) {
+                break;
+            }
+            w.poll();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.failed.contains(&(path.clone(), 1)));
+        assert!(
+            !w.ready(),
+            "failed re-decode must not count the stale display as ready"
+        );
+        assert!(
+            w.has_display(),
+            "no blanking: the previous image stays on screen"
+        );
+        assert!(
+            w.take_failure().is_some(),
+            "failure surfaced for the requested content"
+        );
     }
 }

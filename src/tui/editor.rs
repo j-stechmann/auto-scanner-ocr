@@ -320,20 +320,63 @@ pub fn draw_editor(
         header,
     );
 
-    // Footer hint row (never over the image rect).
+    // Footer hint row (never over the image rect). The main view's status
+    // pane is not visible in editor mode, so the newest status message is
+    // mirrored here (right-aligned); an armed Esc-discard question takes
+    // priority and is styled as a warning so the double-Esc guard is
+    // observable.
     let footer = Rect::new(whole.x, whole.y + whole.height - 1, whole.width, 1);
     let hint = if app.editor_crop_rect().is_some() {
         " drag edge resize · inside move · outside redraw · hjkl move · Alt+hjkl shrink · HJKL grow · Enter apply · c done · Esc back "
     } else {
         " c crop (drag/keys shape the rect) · Esc back "
     };
+    let esc_pending = app.editor.as_ref().is_some_and(|e| e.esc_pending);
+    // The exact line `handle_key` pushes when arming the discard
+    // question; filtered from the mirror once disarmed so a stale
+    // prompt does not linger as a regular info badge after another
+    // path (nudge/drag/tool close) cleared `esc_pending`.
+    const DISCARD_PROMPT: &str = "discard crop? Esc again to discard, c to keep";
+    let status = if esc_pending {
+        Some(DISCARD_PROMPT.to_string())
+    } else {
+        app.status_lines
+            .last()
+            .cloned()
+            .filter(|s| !s.is_empty() && s.as_str() != DISCARD_PROMPT)
+    };
+    // The status takes priority: when both don't fit, the hint is
+    // truncated (it repeats every frame; a prompt must not be pushed
+    // off-screen by a long hint).
+    let avail = footer.width as usize;
+    let mut spans = Vec::with_capacity(3);
+    let hint_len = hint.chars().count();
+    let status_len = status.as_ref().map(|s| s.chars().count() + 2); // padding
+    let hint_len = match status_len {
+        Some(sl) if hint_len + sl > avail => avail.saturating_sub(sl),
+        _ => hint_len,
+    };
+    let hint: String = hint.chars().take(hint_len).collect();
+    spans.push(ratatui::text::Span::styled(hint, super::theme::MUTED));
+    if let Some(status) = status {
+        let used = hint_len + status.chars().count() + 2;
+        let filler = avail.saturating_sub(used);
+        if filler > 0 {
+            spans.push(ratatui::text::Span::raw(" ".repeat(filler)));
+        }
+        let style = if esc_pending {
+            super::theme::BADGE_WARN
+        } else {
+            super::theme::BADGE_INFO
+        };
+        spans.push(ratatui::text::Span::styled(format!(" {status} "), style));
+    }
     f.render_widget(
-        ratatui::widgets::Paragraph::new(ratatui::text::Line::from(hint))
-            .style(super::theme::MUTED),
+        ratatui::widgets::Paragraph::new(ratatui::text::Line::from(spans)),
         footer,
     );
 
-    if !editor.ready() || orig.0 == 0 {
+    if !editor.has_display() || orig.0 == 0 {
         return;
     }
     // Letterbox-tight render rect; encode for it with the crop outline
@@ -369,7 +412,7 @@ fn crop_percent(rect: ImageRect, orig: (u32, u32)) -> f64 {
 /// Editor key handling. Swallows everything except a deliberate set:
 /// - Esc / q: leave the editor (with the discard arm when a crop rect is
 ///   unapplied)
-/// - Ctrl-C: global quit
+/// - Ctrl-C: global quit (same confirm path as the main view)
 /// - c: toggle the crop tool
 /// - Enter: apply the crop (confirm dialog)
 /// - hjkl / HJKL: move / extend
@@ -385,7 +428,13 @@ pub async fn handle_key(
     use ratatui::crossterm::event::{KeyCode as K, KeyModifiers};
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == K::Char('c') {
-        app.quit_requested = true;
+        // Same route as the main view's Ctrl-C: confirm when un-built
+        // pages would be lost, else quit directly.
+        if app.needs_quit_confirm() {
+            app.overlay = Some(Overlay::Confirm(Confirm::quit()));
+        } else {
+            app.quit_requested = true;
+        }
         return Ok(());
     }
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -498,10 +547,13 @@ fn nudge_rect(app: &mut App, editor: &EditorWorker, c: char, shrink: bool) {
 /// never consulted). With the tool active:
 /// - down on a rect EDGE/corner starts a RESIZE of the grabbed edges
 /// - down in the rect interior starts a MOVE
-/// - down outside the rect starts a fresh DRAW
+/// - down outside the rect starts a fresh DRAW (anchor = press point);
+///   the previous rect is replaced on the first drag movement, so a
+///   plain click outside keeps the shaped rect
 ///
-/// Drag follows the cursor; Up finalizes. Without the tool, a drag draws
-/// a fresh rect (implicit tool start).
+/// Drag follows the cursor; Up finalizes. Without the tool, clicks do
+/// nothing (the crop tool is entered explicitly with `c`; a stray click
+/// must not conjure a rect that then arms the Esc-discard prompt).
 pub async fn handle_mouse(
     app: &mut App,
     editor: &EditorWorker,
@@ -538,7 +590,9 @@ pub async fn handle_mouse(
             match (crop, drag) {
                 (Some(rect), None) => {
                     // Edge hit (with a small pixel tolerance) -> resize;
-                    // interior -> move; outside -> draw fresh.
+                    // interior -> move; outside -> fresh draw (the anchor
+                    // is the press point; the rect is replaced as soon as
+                    // the drag moves, so a plain click outside keeps it).
                     let tol = drag_tolerance_px(&rects, app.editor_font_size, (w, h));
                     if let Some(edges) = hit_edges(rect, px, tol) {
                         start_drag(
@@ -550,7 +604,11 @@ pub async fn handle_mouse(
                                 bottom: edges.3,
                             },
                         );
-                    } else {
+                    } else if px.0 >= rect.x
+                        && px.0 <= rect.x + rect.w.saturating_sub(1)
+                        && px.1 >= rect.y
+                        && px.1 <= rect.y + rect.h.saturating_sub(1)
+                    {
                         // Interior grab: preserve the cursor offset within
                         // the rect so it doesn't jump under the cursor.
                         start_drag(
@@ -560,6 +618,8 @@ pub async fn handle_mouse(
                                 grab_dy: px.1 as i64 - rect.y as i64,
                             },
                         );
+                    } else {
+                        start_drag(app, Drag::Draw { anchor: px });
                     }
                 }
                 (Some(_), Some(d)) => {
@@ -580,7 +640,16 @@ pub async fn handle_mouse(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if let (Some(d), Some(px)) = (drag, geom.cell_to_px(pos)) {
-                apply_drag(app, d, px, geom);
+                // A fresh-draw drag that never moved (plain outside click)
+                // must NOT collapse the rect to 1x1: only apply when the
+                // cursor actually left the anchor.
+                let moved = match d {
+                    Drag::Draw { anchor } => px != anchor,
+                    _ => true,
+                };
+                if moved {
+                    apply_drag(app, d, px, geom);
+                }
             }
             end_drag(app);
         }
@@ -654,6 +723,42 @@ mod tests {
     use super::*;
 
     const FS: (u16, u16) = (10, 20); // classic 1:2 font
+
+    /// App with throwaway channels (mirrors the app.rs test helper).
+    fn test_app() -> App {
+        let (diag_tx, _diag_rx) = tokio::sync::mpsc::channel(4);
+        let (finish_tx, _finish_rx) = tokio::sync::mpsc::channel(1);
+        App::new(crate::config::Config::default(), diag_tx, finish_tx)
+    }
+
+    fn ready_page(id: u32) -> crate::session::PageView {
+        crate::session::PageView {
+            id,
+            status: crate::session::PageStatus::Ready,
+            stage: None,
+            stage_started: None,
+            image: Some(std::path::PathBuf::from(format!("/tmp/page_{id}.png"))),
+            image_gen: 1,
+            text: None,
+            text_pending: false,
+            ocr_failed_gen: None,
+            error: None,
+            dpi: 300,
+            mode: "gray".into(),
+            rotated: false,
+        }
+    }
+
+    fn meta(finished: bool) -> crate::session::SessionMeta {
+        crate::session::SessionMeta {
+            busy: crate::session::Busy::Idle,
+            busy_since: None,
+            jobs_running: 0,
+            output_path: "/tmp/out.pdf".into(),
+            dirty: !finished,
+            finished,
+        }
+    }
 
     #[test]
     fn scale_for_caps_at_one() {
@@ -858,5 +963,220 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!((moved.x, moved.y), (48, 59));
+    }
+
+    /// Down outside the rect starts a fresh DRAW that REPLACES the rect
+    /// when the drag moves (documented "outside redraw" behavior), while a
+    /// plain outside click (no movement) keeps the shaped rect.
+    #[tokio::test]
+    async fn outside_down_draws_fresh_rect_click_keeps_rect() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+        let rect = ImageRect {
+            x: 10,
+            y: 10,
+            w: 50,
+            h: 40,
+        };
+        app.editor.as_mut().unwrap().crop = Some(rect);
+        // Real decode so handle_mouse's mapping has non-degenerate dims:
+        // a 100x100 PNG renders 1:1 (k=1) in the fake geometry below.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(100, 100)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+        editor.request(path, 0);
+        for _ in 0..100 {
+            if editor.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(editor.ready());
+        // Geometry: image at (0,0), 100x100 image px per k=1 mapping.
+        app.editor_rects = Some(EditorRects {
+            area: Rect::new(0, 0, 100, 100),
+            image: Rect::new(0, 0, 100, 100),
+        });
+        app.editor_font_size = FS;
+        let mouse = |kind| ratatui::crossterm::event::MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        };
+        let cell = |c, r| {
+            let mut m = mouse(MouseEventKind::Drag(MouseButton::Left));
+            m.column = c;
+            m.row = r;
+            m
+        };
+
+        // Grid math: 100x100 image, font (10,20), k=1 -> 10x5 cells; cell
+        // (cx, cy) -> px (cx*10, cy*20). Rect px 10..59 x 10..49. Cell
+        // (7,2) -> px (70,40): OUTSIDE the rect; cell (2,2) -> (20,40):
+        // interior. Cell (9,4) -> px (90,80).
+        let mut down = mouse(MouseEventKind::Down(MouseButton::Left));
+        down.column = 7;
+        down.row = 2;
+        handle_mouse(&mut app, &editor, down, &mpsc::channel(4).0).await;
+        assert!(
+            app.editor.as_ref().unwrap().drag.is_some(),
+            "outside down starts a drag"
+        );
+        // Drag to cell (9,4): fresh rect anchored at px (70,40).
+        handle_mouse(&mut app, &editor, cell(9, 4), &mpsc::channel(4).0).await;
+        let cropped = app.editor.as_ref().unwrap().crop.unwrap();
+        assert_eq!(
+            (cropped.x, cropped.y, cropped.w, cropped.h),
+            (70, 40, 21, 41),
+            "outside drag draws a fresh rect"
+        );
+        end_drag(&mut app);
+
+        // Plain outside click (down + up, no movement): rect unchanged.
+        let mut click = mouse(MouseEventKind::Down(MouseButton::Left));
+        click.column = 7;
+        click.row = 2;
+        app.editor.as_mut().unwrap().crop = Some(rect);
+        handle_mouse(&mut app, &editor, click, &mpsc::channel(4).0).await;
+        let mut up = mouse(MouseEventKind::Up(MouseButton::Left));
+        up.column = 7;
+        up.row = 2;
+        handle_mouse(&mut app, &editor, up, &mpsc::channel(4).0).await;
+        assert_eq!(
+            app.editor.as_ref().unwrap().crop,
+            Some(rect),
+            "outside click without drag keeps the rect"
+        );
+    }
+
+    /// Ctrl-C inside the editor routes through the quit confirmation when
+    /// un-built pages would be lost (parity with the main view).
+    #[tokio::test]
+    async fn editor_ctrl_c_confirms_when_pages_pending() {
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+
+        let key = ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('c'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(&mut app, &mut editor, key, &mpsc::channel(4).0)
+            .await
+            .unwrap();
+        assert!(
+            !app.quit_requested,
+            "quit confirm must intercept the direct quit"
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::Confirm(_))),
+            "quit confirm opened"
+        );
+
+        // Finished session (nothing to lose): quits directly.
+        app.overlay = None;
+        app.meta = Some(meta(true));
+        handle_key(&mut app, &mut editor, key, &mpsc::channel(4).0)
+            .await
+            .unwrap();
+        assert!(app.quit_requested, "nothing to lose quits directly");
+    }
+
+    /// The editor footer mirrors the newest status line (the main view's
+    /// status pane is hidden in editor mode): an armed Esc-discard prompt
+    /// renders on the footer row; with nothing pending, the latest status
+    /// message does.
+    #[test]
+    fn editor_footer_shows_status_and_esc_prompt() {
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        app.editor.as_mut().unwrap().crop = Some(ImageRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        });
+        app.editor.as_mut().unwrap().esc_pending = true;
+        app.set_status("discard crop? Esc again to discard, c to keep");
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+        terminal
+            .draw(|f| draw_editor(f, &mut app, &mut editor))
+            .unwrap();
+
+        let footer_y = 23; // whole.height - 1
+        let mut row = String::new();
+        for x in 0..80 {
+            row.push(
+                terminal.backend().buffer()[(x, footer_y)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
+        }
+        assert!(
+            row.contains("discard crop? Esc again to discard"),
+            "esc prompt visible in editor footer: {row:?}"
+        );
+    }
+
+    /// Once `esc_pending` disarmed (e.g. via a nudge), the stale discard
+    /// prompt must NOT keep showing as a regular info badge in the footer.
+    #[test]
+    fn editor_footer_hides_stale_discard_prompt_after_disarm() {
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        app.editor.as_mut().unwrap().crop = Some(ImageRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        });
+        app.editor.as_mut().unwrap().esc_pending = true;
+        app.set_status("discard crop? Esc again to discard, c to keep");
+        // Disarm without pushing a new status (the nudge path does this).
+        app.editor.as_mut().unwrap().esc_pending = false;
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+        terminal
+            .draw(|f| draw_editor(f, &mut app, &mut editor))
+            .unwrap();
+
+        let footer_y = 23;
+        let mut row = String::new();
+        for x in 0..80 {
+            row.push(
+                terminal.backend().buffer()[(x, footer_y)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
+        }
+        assert!(
+            !row.contains("discard crop?"),
+            "stale discard prompt filtered after disarm: {row:?}"
+        );
     }
 }

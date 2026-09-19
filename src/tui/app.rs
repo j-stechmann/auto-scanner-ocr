@@ -786,8 +786,19 @@ async fn fire_pending_scan(app: &mut App, cmd_tx: &mpsc::Sender<session::Cmd>) {
 
 /// Per-frame editor reconcile: point the worker at the pinned page's
 /// current (image, gen) — a crop completion's gen bump re-decodes here,
-/// same mechanism as the thumbnails' `on_pages_changed`.
+/// same mechanism as the thumbnails' `on_pages_changed`. A terminal
+/// decode failure for the requested content is surfaced as a status line
+/// (with the failed cache it would otherwise strand the editor on
+/// "decoding image…" with no explanation).
 fn sync_editor(app: &mut App, editor: &mut super::preview::EditorWorker) {
+    let failure = editor
+        .take_failure()
+        .map(|(path, gen, err)| (path.display().to_string(), gen, err));
+    if let Some((path, gen, err)) = failure {
+        app.set_status(format!(
+            "editor image decode failed: {path} (gen {gen}): {err}"
+        ));
+    }
     let Some(e) = app.editor.as_ref() else {
         return;
     };
