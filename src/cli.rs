@@ -18,7 +18,7 @@ pub struct Cli {
     #[arg(short = 'd', long)]
     pub dpi: Option<u16>,
 
-    /// Scan mode: gray, color or lineart (default gray)
+    /// Scan mode: gray, color or lineart (default color)
     #[arg(short = 'M', long)]
     pub mode: Option<String>,
 

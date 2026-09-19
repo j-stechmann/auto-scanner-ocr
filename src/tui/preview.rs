@@ -41,6 +41,34 @@ enum Loaded {
     Failed(PageId, PathBuf, u32, String),
 }
 
+/// Messages editor worker -> UI.
+enum EditorLoaded {
+    /// Fresh protocol for (path, gen): the protocol, the downscaled base
+    /// image (kept for outline re-compositing), and the ORIGINAL pixel
+    /// dims (captured pre-downscale; the protocol only knows downscaled
+    /// dims and no public crate API exposes them).
+    Protocol(
+        Box<StatefulProtocol>,
+        image::DynamicImage,
+        PathBuf,
+        u32,
+        (u32, u32),
+    ),
+    Failed(PathBuf, u32, String),
+}
+
+/// A completed off-thread encode of a cloned StatefulProtocol: swap it in
+/// as the new display. `epoch` invalidates stale results after a decode.
+struct EditorEncoded {
+    epoch: u64,
+    proto: Box<StatefulProtocol>,
+    /// Cells the encode targeted (the render rect's size).
+    size: ratatui::layout::Size,
+    /// Outline baked in (downscaled px, None = none).
+    outline: Option<(u32, u32, u32, u32)>,
+    ok: bool,
+}
+
 /// Per-page thumbnail state.
 struct Thumb {
     /// Path + generation the current/pending protocol corresponds to.
@@ -60,6 +88,10 @@ struct Thumb {
 /// display more than their cell area in font-size pixels, so keeping the
 /// full-resolution DynamicImage (33 MB at 300dpi) per page resident is waste.
 const MAX_THUMB_PIXELS: u32 = 1600;
+
+/// Same cap for the editor's large single-page view (still far below the
+/// 300-dpi scan size; crop coordinates are scaled back to original pixels).
+const MAX_EDITOR_PIXELS: u32 = 3200;
 
 /// Max encode kicks issued per frame (stagger terminal-resize bursts).
 const MAX_SYNC_KICKS_PER_FRAME: usize = 4;
@@ -348,6 +380,493 @@ impl PreviewWorker {
     }
 }
 
+/// Crop outline style for the editor's composited overlay: opaque cyan,
+/// visible on light and dark page content alike. Drawn into the DOWNSCALED
+/// pixels before encoding (text drawn over sixel/kitty cells can erase the
+/// image — see the ratatui-image buffer model), so it survives every
+/// protocol and needs no theme registry entry.
+const OUTLINE_RGBA: image::Rgba<u8> = image::Rgba([0, 255, 255, 255]);
+/// Outline thickness in downscaled pixels.
+const OUTLINE_THICKNESS: u32 = 2;
+
+/// Single-page editor worker: decodes the edited page at a higher cap than
+/// thumbnails and encodes the (outline-composited) image OFF the UI thread.
+///
+/// Display/work split (fixes the blank-while-encoding bug): the DISPLAY
+/// protocol is a plain `StatefulProtocol` that is NEVER encoded in place —
+/// `render` always draws its last completed encode. Each `request_encode`
+/// builds a fresh protocol from the composited image, encodes a CLONE of it
+/// on spawn_blocking, and the completed clone is swapped in as the new
+/// display. While an encode is in flight the display keeps rendering the
+/// previous image (the crop outline lags behind the cursor during a drag
+/// and converges on release; the header readout is instant). No
+/// `ThreadProtocol` is involved: ids/blanking are a threaded-widget concern
+/// this worker does not have.
+///
+/// `epoch` invalidates everything: a decode adoption or a different-page
+/// request bumps it, and stale encodes (old epoch) are dropped on arrival.
+pub struct EditorWorker {
+    picker: Picker,
+    /// Current (path, gen) the display protocol corresponds to.
+    path: Option<PathBuf>,
+    gen: u32,
+    /// Decode request currently in flight (at most one; results for
+    /// superseded requests are dropped as stale on arrival).
+    pending: Option<(PathBuf, u32)>,
+    /// Decodes that failed for a given (path, gen); never retried
+    /// silently (no per-frame retry-loop — same contract as
+    /// `PreviewWorker.failed`).
+    failed: HashSet<(PathBuf, u32)>,
+    /// The (path, gen) most recently REQUESTED (set on every `request`,
+    /// before any early return). `ready()` requires the adopted display
+    /// to match it, so a failed same-path re-decode cannot leave `ready`
+    /// true with a stale display (the failed cache would otherwise make
+    /// that state permanent).
+    requested: Option<(PathBuf, u32)>,
+    /// Last failure for the CURRENTLY requested content, consumed by the
+    /// UI via `take_failure` (surfaced as a status line; the failure is
+    /// terminal for that (path, gen), so silence would strand the editor
+    /// on "decoding…" with no explanation).
+    last_failure: Option<(PathBuf, u32, String)>,
+    /// The DISPLAY protocol: always renderable (last completed encode).
+    /// Never handed to the encode worker.
+    display: Option<StatefulProtocol>,
+    /// ORIGINAL image pixel dims (pre-downscale), for coordinate mapping
+    /// and the crop command. No public crate API exposes them (the
+    /// protocol only knows the downscaled image), so the decode reports
+    /// them alongside.
+    orig_dims: (u32, u32),
+    /// Downscaled base image (no outline), kept for re-compositing.
+    base: Option<image::DynamicImage>,
+    rx: mpsc::UnboundedReceiver<EditorLoaded>,
+    enc_rx: mpsc::UnboundedReceiver<EditorEncoded>,
+    tx: mpsc::UnboundedSender<EditorLoaded>,
+    enc_tx: mpsc::UnboundedSender<EditorEncoded>,
+    /// Bumped on every decode adoption; invalidates in-flight encodes.
+    epoch: u64,
+    /// Font size (cached from the picker) for size_for math.
+    font_size: (u16, u16),
+    /// Cells of the displayed encode (None until the first lands).
+    encoded_size: Option<ratatui::layout::Size>,
+    /// Outline baked into the currently displayed image (downscaled px).
+    shown_outline: Option<(u32, u32, u32, u32)>,
+    /// Encode bookkeeping (single in-flight encode, last request wins).
+    in_flight: bool,
+    queued: Option<QueuedEncode>,
+}
+
+/// What the next encode should target once the current one drains.
+struct QueuedEncode {
+    cells: ratatui::layout::Size,
+    outline: Option<(u32, u32, u32, u32)>,
+}
+
+impl EditorWorker {
+    pub fn new(picker: Picker) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (enc_tx, enc_rx) = mpsc::unbounded_channel();
+        let fs = picker.font_size();
+        Self {
+            picker,
+            path: None,
+            gen: 0,
+            pending: None,
+            failed: HashSet::new(),
+            requested: None,
+            last_failure: None,
+            display: None,
+            orig_dims: (0, 0),
+            base: None,
+            rx,
+            enc_rx,
+            tx,
+            enc_tx,
+            epoch: 0,
+            font_size: (fs.width, fs.height),
+            encoded_size: None,
+            shown_outline: None,
+            in_flight: false,
+            queued: None,
+        }
+    }
+
+    /// Is the editor image loaded for the CURRENT request (the display
+    /// corresponds to the requested (path, gen) and no decode is in
+    /// flight)? Strict on purpose: callers must not build crop rects from
+    /// a stale display's dims while any decode is pending — including the
+    /// permanent pending-adjacent state after a failed same-path
+    /// re-decode (the failed cache stops retries, so the display's old
+    /// dims must not count as ready).
+    pub fn ready(&self) -> bool {
+        self.display.is_some()
+            && self.pending.is_none()
+            && self
+                .requested
+                .as_ref()
+                .is_some_and(|(rp, rg)| self.path.as_ref() == Some(rp) && self.gen == *rg)
+    }
+
+    /// Lenient display check: SOMETHING is decoded (possibly the previous
+    /// image while a same-path re-decode is in flight). Used by rendering
+    /// to keep the last image on screen (no blanking); rect creation and
+    /// hit-testing must use `ready()` instead.
+    pub fn has_display(&self) -> bool {
+        self.display.is_some()
+    }
+
+    /// Take the last decode failure for the currently requested content
+    /// (if any). The UI surfaces it as a status line: with the failed
+    /// cache, a failure is terminal for that (path, gen), so without
+    /// this the editor would sit on "decoding…" with no explanation.
+    /// None for content that never failed or after consumption.
+    pub fn take_failure(&mut self) -> Option<(PathBuf, u32, String)> {
+        self.last_failure.take()
+    }
+
+    /// Original image pixel dims ((0, 0) until the first decode lands).
+    pub fn orig_dims(&self) -> (u32, u32) {
+        self.orig_dims
+    }
+
+    /// ORIGINAL / downscaled scale factor (>1 when the image was
+    /// downscaled); 1.0 before the first decode. Used to map terminal
+    /// coords -> image pixels and crop rects between coordinate spaces.
+    pub fn downscale_factor(&self) -> f64 {
+        match (self.orig_dims.0, self.base.as_ref()) {
+            (ow, Some(base)) if base.width() > 0 => ow as f64 / base.width() as f64,
+            _ => 1.0,
+        }
+    }
+
+    /// Convert a rect from ORIGINAL image pixels to the downscaled space
+    /// the outline is composited in.
+    pub fn to_downscaled(&self, rect: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+        let k = self.downscale_factor();
+        (
+            (rect.0 as f64 / k).round() as u32,
+            (rect.1 as f64 / k).round() as u32,
+            (rect.2 as f64 / k).round() as u32,
+            (rect.3 as f64 / k).round() as u32,
+        )
+    }
+
+    /// Request (re-)decoding `path` at generation `gen`. Cheap per frame:
+    /// a decode is spawned only when (path, gen) is neither the current
+    /// display's content, nor already in flight, nor previously failed.
+    pub fn request(&mut self, path: PathBuf, gen: u32) {
+        self.requested = Some((path.clone(), gen));
+        if self.path.as_ref() == Some(&path) && self.gen == gen {
+            return; // already current
+        }
+        if self.pending.as_ref() == Some(&(path.clone(), gen)) {
+            return; // a decode for exactly this content is in flight
+        }
+        if self.failed.contains(&(path.clone(), gen)) {
+            return; // failed for this exact content; don't retry-loop
+        }
+        // Different content requested: the stale display must not survive
+        // into the pending window. Clear it (and the dims derived from it)
+        // so callers render "decoding…" and cannot shape a rect in the
+        // OLD page's pixel space and apply it to the NEW image.
+        if self.path.as_ref() != Some(&path) {
+            self.display = None;
+            self.base = None;
+            self.orig_dims = (0, 0);
+            self.encoded_size = None;
+            self.shown_outline = None;
+        }
+        self.pending = Some((path.clone(), gen));
+        let picker = self.picker.clone();
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = (|| {
+                anyhow::Result::<(StatefulProtocol, image::DynamicImage, (u32, u32))>::Ok({
+                    let img: image::DynamicImage = image::ImageReader::open(&path)?
+                        .with_guessed_format()?
+                        .decode()?
+                        .to_rgba8()
+                        .into();
+                    let orig = (img.width(), img.height());
+                    let small = downscale(img, MAX_EDITOR_PIXELS);
+                    let proto = picker.new_resize_protocol(small.clone());
+                    (proto, small, orig)
+                })
+            })();
+            match result {
+                Ok((proto, base, orig)) => {
+                    let _ = tx.send(EditorLoaded::Protocol(
+                        Box::new(proto),
+                        base,
+                        path.clone(),
+                        gen,
+                        orig,
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send(EditorLoaded::Failed(path.clone(), gen, format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    /// Poll decode completions and adopt results. Returns true when the
+    /// image content changed (a draw is due). A fresh decode resets the
+    /// display to the freshly-decoded (unencoded) protocol: the first
+    /// frame renders nothing until the first encode is adopted — same
+    /// behavior as the thumbnails' first appearance.
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                EditorLoaded::Protocol(proto, base, path, gen, orig) => {
+                    // Stale result (a newer request superseded it)? Drop.
+                    if self.pending.as_ref() != Some(&(path.clone(), gen)) {
+                        continue;
+                    }
+                    self.pending = None;
+                    self.failed.remove(&(path.clone(), gen));
+                    self.path = Some(path);
+                    self.gen = gen;
+                    self.orig_dims = orig;
+                    self.base = Some(base);
+                    self.epoch = self.epoch.wrapping_add(1);
+                    self.display = Some(*proto);
+                    self.encoded_size = None;
+                    self.shown_outline = None;
+                    self.in_flight = false;
+                    self.queued = None;
+                    changed = true;
+                }
+                EditorLoaded::Failed(path, gen, err) => {
+                    // Same staleness rule as the Protocol arm: a result
+                    // for superseded content must not clear the marker
+                    // of the NEWER in-flight decode (e.g. editor closed
+                    // mid-decode on A, reopened on B; A's failure arrives
+                    // after B's request).
+                    if self.pending.as_ref() != Some(&(path.clone(), gen)) {
+                        continue;
+                    }
+                    self.pending = None;
+                    tracing::warn!(
+                        "editor decode failed for {} (gen {gen}): {err}",
+                        path.display()
+                    );
+                    // Cache the failure for this exact content so the
+                    // per-frame reconcile does not retry-loop.
+                    self.failed.insert((path.clone(), gen));
+                    // Surface to the UI (consumed via take_failure), but
+                    // only if this content is still the one requested.
+                    if self.requested.as_ref() == Some(&(path.clone(), gen)) {
+                        self.last_failure = Some((path, gen, err));
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Poll completed off-thread encodes and swap the newest valid one in
+    /// as the display. Returns true when content changed (draw due).
+    pub fn poll_encodes(&mut self) -> bool {
+        let mut newest: Option<EditorEncoded> = None;
+        while let Ok(msg) = self.enc_rx.try_recv() {
+            if msg.epoch != self.epoch {
+                continue; // stale epoch (decode landed meanwhile)
+            }
+            newest = Some(msg); // channel order: later sends overwrite
+        }
+        let Some(msg) = newest else {
+            return false;
+        };
+        self.in_flight = false;
+        if !msg.ok {
+            return false;
+        }
+        self.display = Some(*msg.proto);
+        self.encoded_size = Some(msg.size);
+        self.shown_outline = msg.outline;
+        true
+    }
+
+    /// Adopt any queued encode once the in-flight one drains (call right
+    /// after poll_encodes; drag convergence: the last request wins).
+    pub fn flush_queue(&mut self) {
+        if !self.in_flight {
+            if let Some(q) = self.queued.take() {
+                self.spawn_encode(q.cells, q.outline);
+            }
+        }
+    }
+
+    /// Queue an encode for `cells` with `outline` (downscaled px, None =
+    /// none) composited. Never touches the display: it keeps rendering the
+    /// previous encode until the new one is swapped in.
+    pub fn request_encode(
+        &mut self,
+        cells: ratatui::layout::Size,
+        outline: Option<(u32, u32, u32, u32)>,
+    ) {
+        if cells.width == 0 || cells.height == 0 {
+            return;
+        }
+        // Already displayed exactly this (or queued for it)? Skip.
+        let queued_same = self
+            .queued
+            .as_ref()
+            .is_some_and(|q| q.cells == cells && q.outline == outline);
+        if queued_same {
+            return;
+        }
+        if self.shown_matches(cells, outline) {
+            return;
+        }
+        if self.in_flight {
+            self.queued = Some(QueuedEncode { cells, outline });
+            return;
+        }
+        self.spawn_encode(cells, outline);
+    }
+
+    fn spawn_encode(
+        &mut self,
+        cells: ratatui::layout::Size,
+        outline: Option<(u32, u32, u32, u32)>,
+    ) {
+        let Some(base) = self.base.as_ref() else {
+            return;
+        };
+        // Fresh protocol from the composited image; the DISPLAY is never
+        // touched. Encode a clone off-thread and swap it in on completion.
+        let img = composited(base, outline);
+        let proto = self.picker.new_resize_protocol(img);
+        let epoch = self.epoch;
+        self.in_flight = true;
+        let tx = self.enc_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut proto = proto;
+            proto.resize_encode(&Resize::Fit(Some(FilterType::Triangle)), cells);
+            let ok = proto.last_encoding_result().is_some_and(|r| r.is_ok());
+            let _ = tx.send(EditorEncoded {
+                epoch,
+                proto: Box::new(proto),
+                size: cells,
+                outline,
+                ok,
+            });
+        });
+    }
+
+    /// The letterbox-tight cell size the image encodes to for `area`
+    /// (Resize::Fit math, same rounding as the crate's size_for; derived
+    /// from the SOURCE dims so it is stable across outline changes).
+    pub fn size_for(&self, area: Rect) -> Option<ratatui::layout::Size> {
+        let b = self.base.as_ref()?;
+        let (fw, fh) = (u32::from(self.font_size.0), u32::from(self.font_size.1));
+        let avail_px_w = u32::from(area.width) * fw;
+        let avail_px_h = u32::from(area.height) * fh;
+        let (pw, ph) = fit_area_proportionally(b.width(), b.height(), avail_px_w, avail_px_h);
+        Some(ratatui::layout::Size::new(
+            (pw as f32 / fw as f32).ceil() as u16,
+            (ph as f32 / fh as f32).ceil() as u16,
+        ))
+    }
+
+    /// Render the editor image into `rect` (the size_for rect). Renders
+    /// the display protocol's last completed encode; never blanks.
+    pub fn render(&mut self, rect: Rect, buf: &mut ratatui::buffer::Buffer) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        if let Some(d) = self.display.as_mut() {
+            d.render(rect, buf);
+        }
+    }
+
+    /// True when the displayed image already matches (cells, outline).
+    pub fn shown_matches(
+        &self,
+        cells: ratatui::layout::Size,
+        outline: Option<(u32, u32, u32, u32)>,
+    ) -> bool {
+        self.encoded_size == Some(cells) && self.shown_outline == outline
+    }
+
+    #[cfg(test)]
+    /// Emulate a decode adoption's dims change without a real decode
+    /// (sync_editor's stale-rect invalidation keys off this).
+    pub fn orig_dims_set_for_test(&mut self, dims: (u32, u32)) {
+        self.orig_dims = dims;
+    }
+}
+
+/// The downscaled image with `outline` composited (or a plain clone).
+fn composited(
+    base: &image::DynamicImage,
+    outline: Option<(u32, u32, u32, u32)>,
+) -> image::DynamicImage {
+    match outline {
+        None => base.clone(),
+        Some(rect) => {
+            let mut img = base.clone();
+            draw_rect_outline(&mut img, rect, OUTLINE_THICKNESS, OUTLINE_RGBA);
+            img
+        }
+    }
+}
+
+/// `Resize::Fit` pixel math (lib.rs fit_area_proportionally, private
+/// there): aspect-preserving fit, capped at the source size, min 1px.
+fn fit_area_proportionally(width: u32, height: u32, nwidth: u32, nheight: u32) -> (u32, u32) {
+    let wratio = f64::from(nwidth) / f64::from(width);
+    let hratio = f64::from(nheight) / f64::from(height);
+    let ratio = wratio.min(hratio);
+    let nw = ((f64::from(width) * ratio).round() as u32).max(1);
+    let nh = ((f64::from(height) * ratio).round() as u32).max(1);
+    (nw.min(width), nh.min(height))
+}
+
+/// Draw a rect outline into `img` (downscaled space), clamped to bounds.
+/// Four edge bands, inclusive of the rect's boundary pixels: the outline
+/// marks exactly the crop rect's edges in the preview.
+fn draw_rect_outline(
+    img: &mut image::DynamicImage,
+    (x, y, w, h): (u32, u32, u32, u32),
+    thickness: u32,
+    color: image::Rgba<u8>,
+) {
+    use image::GenericImage;
+    let (iw, ih) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return;
+    }
+    let x2 = x
+        .saturating_add(w)
+        .saturating_sub(1)
+        .min(iw.saturating_sub(1));
+    let y2 = y
+        .saturating_add(h)
+        .saturating_sub(1)
+        .min(ih.saturating_sub(1));
+    let x = x.min(x2);
+    let y = y.min(y2);
+    let t = thickness.max(1);
+    let fill_h = |img: &mut image::DynamicImage, x0: u32, x1: u32, y0: u32, y1: u32| {
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                img.put_pixel(xx, yy, color);
+            }
+        }
+    };
+    fill_h(img, x, x2, y, (y + t - 1).min(y2)); // top
+    if y2 > y + t - 1 {
+        fill_h(img, x, x2, (y2 + 1).saturating_sub(t), y2); // bottom
+    }
+    fill_h(img, x, (x + t - 1).min(x2), y, y2); // left
+    if x2 > x + t - 1 {
+        fill_h(img, (x2 + 1).saturating_sub(t), x2, y, y2); // right
+    }
+}
+
 /// Dedicated encode loop for one thumbnail: drains the protocol's resize
 /// requests and encodes each OFF the UI thread (sixel-encoding can take
 /// hundreds of ms). Exits when the protocol side is dropped (thumb gone).
@@ -510,5 +1029,439 @@ mod tests {
         let same = downscale(img, 1600);
         assert_eq!(same.width(), 800);
         assert_eq!(same.height(), 600);
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+
+    /// The core no-blanking guarantee: while an encode is in flight the
+    /// display still renders the PREVIOUS image, and the completed encode
+    /// swap-in renders the new one. Uses halfblocks (synchronous encode).
+    #[tokio::test]
+    async fn display_never_blanks_during_outline_changes() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        // A real 40x30 PNG on disk (decode runs off-thread).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+
+        w.request(path.clone(), 0);
+        // Decode is off-thread: yield until the result arrives.
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+
+        // Request the first encode; display renders nothing yet (no
+        // completed encode) but the API must not panic.
+        let cells = w
+            .size_for(ratatui::layout::Rect::new(0, 0, 80, 40))
+            .unwrap();
+        w.request_encode(cells, None);
+        // Tiny image: the off-thread encode may complete instantly; wait
+        // for it (the in-flight bookkeeping is what the assertions cover).
+        let mut adopted = false;
+        for _ in 0..100 {
+            w.flush_queue();
+            if w.poll_encodes() {
+                adopted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(adopted, "first encode adopted");
+        assert!(w.shown_matches(cells, None));
+
+        // Now an outline change while the display shows the plain image:
+        // request a NEW encode with an outline. Until it lands, the
+        // display still matches the old (None outline) state.
+        w.request_encode(cells, Some((2, 2, 20, 20)));
+        assert!(
+            w.shown_matches(cells, None),
+            "display keeps the previous encode while the new one encodes"
+        );
+        let mut adopted2 = false;
+        for _ in 0..100 {
+            w.flush_queue();
+            if w.poll_encodes() {
+                adopted2 = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(adopted2, "second encode adopted");
+        assert!(w.shown_matches(cells, Some((2, 2, 20, 20))));
+
+        // Render must not panic at every stage and the buffer gets
+        // non-default cells once an encode is displayed.
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 40));
+        let area = ratatui::layout::Rect::new(0, 0, cells.width, cells.height);
+        w.render(area, &mut buf);
+    }
+
+    /// Stale-epoch drop: an encode that started before a decode adoption
+    /// must NOT be swapped into the new display.
+    #[tokio::test]
+    async fn stale_encode_dropped_after_redecode() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut buf = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, buf).unwrap();
+
+        w.request(path.clone(), 0);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+        let cells = w
+            .size_for(ratatui::layout::Rect::new(0, 0, 80, 40))
+            .unwrap();
+        w.request_encode(cells, None);
+
+        // A "re-decode" adoption lands (epoch bump) BEFORE the encode
+        // completes: the encode result must be dropped as stale.
+        let mut buf2 = Vec::new();
+        image::DynamicImage::new_rgb8(50, 40)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf2),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        std::fs::write(&path, buf2).unwrap();
+        w.request(path.clone(), 1);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(w.epoch, 2, "decode adoption bumped the epoch");
+        // The in-flight encode (epoch 0) completes now: dropped.
+        w.flush_queue();
+        assert!(!w.poll_encodes(), "stale-epoch encode must not adopt");
+        assert!(w.encoded_size.is_none(), "fresh display has no encode yet");
+    }
+
+    /// A request for a DIFFERENT path must clear the stale display: the
+    /// previous page's image (and dims) must not survive into the pending
+    /// window (no wrong-header render, no rect shaped in the old space).
+    #[tokio::test]
+    async fn different_page_request_clears_stale_display() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let (png_a, png_b) = {
+            let mut a = Vec::new();
+            image::DynamicImage::new_rgb8(40, 30)
+                .write_to(&mut std::io::Cursor::new(&mut a), image::ImageFormat::Png)
+                .unwrap();
+            let mut b = Vec::new();
+            image::DynamicImage::new_rgb8(400, 300)
+                .write_to(&mut std::io::Cursor::new(&mut b), image::ImageFormat::Png)
+                .unwrap();
+            (a, b)
+        };
+        let path_a = dir.path().join("a.png");
+        let path_b = dir.path().join("b.png");
+        std::fs::write(&path_a, png_a).unwrap();
+        std::fs::write(&path_b, png_b).unwrap();
+
+        w.request(path_a.clone(), 0);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+
+        // Now request page B: the pending window must show NOT-ready
+        // (display cleared, dims zeroed) even though A's decode result
+        // is still held internally.
+        w.request(path_b.clone(), 0);
+        assert!(
+            !w.ready(),
+            "stale display must not count as ready for the new page"
+        );
+        assert_eq!(w.orig_dims(), (0, 0), "dims of the old page cleared");
+
+        // B's decode lands: ready again, with B's dims.
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+        assert_eq!(w.orig_dims(), (400, 300));
+    }
+
+    /// Same-path re-decode (crop completion): the display KEEPS showing
+    /// the old image while the decode is in flight (no blanking), but
+    /// `ready()` is false so no rect is built from stale dims.
+    #[tokio::test]
+    async fn same_path_redecode_keeps_display_but_not_ready() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+
+        w.request(path.clone(), 0);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+
+        // Same path, bumped gen (crop completion): decode in flight.
+        w.request(path.clone(), 1);
+        assert!(!w.ready(), "pending re-decode must gate rect creation");
+        assert!(
+            w.has_display(),
+            "same-path re-decode keeps the old image on screen"
+        );
+
+        // Completion: ready again.
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+        assert_eq!(w.gen, 1);
+    }
+
+    /// A crop rect shaped against the OLD display's dims (shaped during
+    /// the re-decode pending window after an applied crop) is invalidated
+    /// when the adoption lands with DIFFERENT dims: the same pixel rect
+    /// would mean a different region on the new image. `sync_editor`'s
+    /// invalidation (app.rs) keys off `orig_dims` changing; this test
+    /// pins the worker-side contract it relies on: a same-path
+    /// re-decode keeps the old dims until adoption, then flips them.
+    #[tokio::test]
+    async fn crop_rect_dims_binding_survives_pending_flip_on_adopt() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+
+        w.request(path.clone(), 0);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+        let old_dims = w.orig_dims();
+        assert_eq!(old_dims, (40, 30));
+
+        // Apply-crop flow: gen bump -> re-decode pending (dims stay the
+        // OLD ones while not ready — the display keeps the old image).
+        let mut png2 = Vec::new();
+        image::DynamicImage::new_rgb8(60, 50)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png2),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        std::fs::write(&path, png2).unwrap();
+        w.request(path.clone(), 1);
+        assert!(!w.ready());
+        assert_eq!(w.orig_dims(), old_dims, "pending window keeps old dims");
+
+        // Adoption: dims change -> a rect shaped under (40, 30) is stale.
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+        assert_eq!(w.orig_dims(), (60, 50), "adoption flips the dims");
+        assert_ne!(w.orig_dims(), old_dims);
+    }
+
+    /// Failed decodes are cached per (path, gen): repeated `request` calls
+    /// must not re-spawn (no retry-loop), and a gen bump retries once.
+    #[tokio::test]
+    async fn failed_editor_decode_is_not_retried() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let path = std::path::PathBuf::from("/nonexistent/editor-page.png");
+
+        w.request(path.clone(), 0);
+        // Decode is in flight: a second request must not stack another.
+        w.request(path.clone(), 0);
+        assert_eq!(w.pending, Some((path.clone(), 0)));
+
+        // Failure lands: cached, nothing pending.
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.pending.is_none());
+        assert!(w.failed.contains(&(path.clone(), 0)));
+
+        // Per-frame reconcile must not re-spawn for the failed content.
+        w.request(path.clone(), 0);
+        assert!(w.pending.is_none());
+
+        // A gen bump (new content) retries.
+        w.request(path.clone(), 1);
+        assert_eq!(w.pending, Some((path.clone(), 1)));
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.failed.contains(&(path.clone(), 1)));
+    }
+
+    /// A failure result for SUPERSEDED content must not clear the marker
+    /// of the newer in-flight decode (close/reopen flow: A's failure
+    /// arrives after B's request) nor surface to the UI as B's failure.
+    #[tokio::test]
+    async fn stale_failure_does_not_clear_newer_pending() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a-missing.png");
+        let path_b = dir.path().join("b.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path_b, png).unwrap();
+
+        // A: file missing -> will fail. Request it and wait for the
+        // failure to land in the channel (poll drains it; pending clears).
+        w.request(path_a.clone(), 0);
+        for _ in 0..100 {
+            if w.failed.contains(&(path_a.clone(), 0)) {
+                break;
+            }
+            w.poll();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.failed.contains(&(path_a.clone(), 0)));
+        // Consume the surfaced failure (the UI does this every frame).
+        assert!(w.take_failure().is_some(), "first failure surfaced");
+        assert!(w.take_failure().is_none(), "consumed exactly once");
+        // Re-request A (fresh decode of the still-missing file), then B
+        // before A's failure lands: the race under test.
+        w.failed.clear();
+        w.request(path_a.clone(), 0);
+        // B requested before A's failure lands.
+        w.request(path_b.clone(), 0);
+        assert_eq!(w.pending, Some((path_b.clone(), 0)));
+
+        // Drain: A's failure arrives while B is pending. It must be
+        // dropped as stale (not clear B's pending marker, not cached,
+        // not surfaced). B's decode may complete first (tiny image); the
+        // end state is the same either way: B adopted, A's stale failure
+        // gone without a trace on B's state.
+        let mut b_ready = false;
+        for _ in 0..100 {
+            w.poll();
+            if w.ready() && w.orig_dims() == (40, 30) {
+                b_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(b_ready, "B's decode adopted");
+        assert!(
+            w.take_failure().is_none(),
+            "stale failure not surfaced for B"
+        );
+        // Re-requesting A retries for real (its stale failure was not
+        // cached as B's content took over).
+        w.failed.clear();
+        w.request(path_a.clone(), 0);
+        assert_eq!(w.pending, Some((path_a.clone(), 0)));
+    }
+
+    /// A failed same-path re-decode (crop completion) leaves the display
+    /// stale-but-shown (no blanking) while `ready()` stays false forever
+    /// (the failed cache stops retries) — rect creation must be gated.
+    #[tokio::test]
+    async fn same_path_failure_gates_ready_but_keeps_display() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+
+        w.request(path.clone(), 0);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+
+        // Gen bump whose decode fails: make the file disappear.
+        std::fs::remove_file(&path).unwrap();
+        w.request(path.clone(), 1);
+        for _ in 0..100 {
+            if w.failed.contains(&(path.clone(), 1)) {
+                break;
+            }
+            w.poll();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.failed.contains(&(path.clone(), 1)));
+        assert!(
+            !w.ready(),
+            "failed re-decode must not count the stale display as ready"
+        );
+        assert!(
+            w.has_display(),
+            "no blanking: the previous image stays on screen"
+        );
+        assert!(
+            w.take_failure().is_some(),
+            "failure surfaced for the requested content"
+        );
     }
 }

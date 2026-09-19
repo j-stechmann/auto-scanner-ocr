@@ -5,7 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] - 2026-09-19
+
+### Added
+
+- **Page editor with cropping** (`e` or `Enter` on a ready page): a
+  full-screen editing view showing the page as large as the terminal
+  allows. The `c` key activates the crop tool (clicks do nothing before
+  it) — the selection rectangle is drawn directly into the image (it stays
+  visible on every image protocol, including kitty and sixel) and can be
+  shaped with the mouse (drag an edge/corner to resize, the interior to
+  move) or the keyboard (`hjkl` moves it, `HJKL` grows it, `Alt+hjkl`
+  shrinks it, arrows move). Enter shows a confirm dialog and
+  then crops the page image; the crop is applied to the actual scan, so
+  the final PDF contains exactly the kept region (page size derives from
+  the image pixels + DPI as before). Two safety rails: leaving the editor
+  with an unapplied selection asks for confirmation (Esc twice), and
+  applying a crop confirms first since the removed pixels are gone (a
+  rescan restores them). A crop cancels an in-flight preview-OCR
+  extraction for that page and the text is re-extracted from the cropped
+  image on demand. While an outline update is being encoded (kitty/sixel
+  can take a moment) the previous frame keeps rendering — the outline
+  lags behind a fast drag and converges on release; the readout is
+  instant. After an applied crop the freshly decoded image renders once
+  its first frame is encoded (a brief blank for kitty/sixel while that
+  first encode runs). Note:
+  ocrmypdf's finish-time auto-deskew (as on every page) can still apply a
+  sub-degree rotation to slightly skewed scans — cropping itself is
+  honored exactly
+
+### Fixed
+
+- **Dialogs no longer close when the mouse pointer moves**: mouse capture
+  delivers an event for every pointer step over the terminal, and while a
+  modal overlay (help, diagnostics, language picker, confirmations) was
+  open any such event silently discarded the dialog — it vanished as soon
+  as the pointer crossed the window. The overlay now survives all mouse
+  traffic; a left click inside the dialog is swallowed, and a left click
+  outside dismisses (except diagnostics, which stay open against
+  accidental clicks and close via Esc as before)
+
+## [0.3.1] - 2026-09-05
 
 ### Fixed
 
@@ -19,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Default scan mode is now `color`**: new scans and the shipped
+  `config.toml` default to color instead of gray, so photographs and other
+  non-text content come out right without editing the config. Note for
+  existing setups: color mode skips the unpaper cleanup pass (gray mode
+  still runs it), so upgrades that relied on the old gray default with
+  `cleanup = "conservative"`/`"legacy"` will no longer get unpaper —
+  deskew/clean at finish via ocrmypdf still applies. OCR quality is
+  unchanged (tesseract binarizes to grayscale internally, so color and
+   gray input OCR identically). Set `mode = "gray"` to keep the old
+   behavior
 - **Text contrast pass for the TUI**: unreadable color pairs fixed and now
   CI-enforced. The page-list selection and language-picker cursor pin an
   explicit white foreground on their dark-navy background (previously the
@@ -190,6 +240,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - TOML config file with per-run CLI overrides
 - Desktop notifications via libnotify, logs in the XDG state dir
 
+[0.4.0]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/j-stechmann/auto-scanner-ocr/compare/773e405...v0.2.0
 [0.1.0]: https://github.com/j-stechmann/auto-scanner-ocr/tree/773e405

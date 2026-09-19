@@ -141,7 +141,7 @@ mid-pass.
 | Flag | Meaning | Default |
 |---|---|---|
 | `-d, --dpi N` | scan resolution | 300 |
-| `-M, --mode` | `gray`, `color` or `lineart` | gray |
+| `-M, --mode` | `gray`, `color` or `lineart` | color |
 | `-l, --langs A+B` | OCR languages, plus-separated | deu+Latin |
 | `-o, --output DIR` | where PDFs are written | ~/Documents/scans |
 | `-e, --device NAME` | SANE device name or substring | first found |
@@ -166,7 +166,7 @@ the command line. Same format as before:
 ```toml
 [scan]
 dpi = 300              # OCR sweet spot; 600 for dense small print
-mode = "gray"          # gray | color | lineart
+mode = "color"         # gray | color | lineart
 langs = "deu+Latin"
 device = "auto"
 output = "~/Documents/scans"
