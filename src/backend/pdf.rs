@@ -59,8 +59,10 @@ impl CropRect {
 
 /// Crop a PNG in place (pure Rust, no external tool). The rect is clamped
 /// to the image bounds by the image crate; zero-area crops are rejected
-/// (imageops::crop would otherwise emit a 0x0 PNG that breaks preview
-/// decode and img2pdf). Same atomic .part+rename write as rotate_png.
+/// (imageops::crop clamps OOB origins to the edge, so a rect fully outside
+/// the image would otherwise emit a 0x0 PNG that breaks preview decode and
+/// img2pdf — the check runs on the CLAMPED result). Same atomic
+/// .part+rename write as rotate_png.
 pub async fn crop_png(path: &Path, rect: CropRect) -> Result<()> {
     if rect.is_zero_area() {
         anyhow::bail!("empty crop rect");
@@ -69,7 +71,19 @@ pub async fn crop_png(path: &Path, rect: CropRect) -> Result<()> {
     let img = tokio::task::spawn_blocking(move || -> Result<image::DynamicImage> {
         let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
         let img = reader.decode()?;
-        Ok(img.crop_imm(rect.x, rect.y, rect.w, rect.h))
+        let cropped = img.crop_imm(rect.x, rect.y, rect.w, rect.h);
+        if cropped.width() == 0 || cropped.height() == 0 {
+            anyhow::bail!(
+                "crop rect {}x{} at ({}, {}) outside the {}x{} image",
+                rect.w,
+                rect.h,
+                rect.x,
+                rect.y,
+                img.width(),
+                img.height()
+            );
+        }
+        Ok(cropped)
     })
     .await??;
 
@@ -674,6 +688,69 @@ pub fn parse_ocrmypdf_progress(stderr: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rect fully outside the image (clamped origin) must fail the job
+    /// instead of installing a 0x0 PNG: imageops::crop clamps x/y to the
+    /// image edge first, so `imageops::crop_dimms` alone would emit a
+    /// zero-area image that breaks preview decode and img2pdf.
+    #[tokio::test]
+    async fn crop_png_rejects_rect_fully_outside_the_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // Origin beyond the right/bottom edge: clamped crop is 0x0.
+        let oob = crop_png(
+            &path,
+            CropRect {
+                x: 40,
+                y: 10,
+                w: 5,
+                h: 5,
+            },
+        )
+        .await;
+        assert!(oob.is_err(), "rect at x == width must be rejected");
+        let oob = crop_png(
+            &path,
+            CropRect {
+                x: 10,
+                y: 30,
+                w: 5,
+                h: 5,
+            },
+        )
+        .await;
+        assert!(oob.is_err(), "rect at y == height must be rejected");
+        // The original file is untouched on failure (no .part installed).
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("png.part").exists());
+
+        // A boundary rect that clamps to exactly 1x1 still works.
+        crop_png(
+            &path,
+            CropRect {
+                x: 39,
+                y: 29,
+                w: 5,
+                h: 5,
+            },
+        )
+        .await
+        .unwrap();
+        let img = image::ImageReader::open(&path)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert_eq!((img.width(), img.height()), (1, 1));
+    }
 
     #[test]
     fn reserve_output_path_collisions_and_release() {

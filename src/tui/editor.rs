@@ -17,17 +17,18 @@
 //! (imageops::overlay at 0,0 — lib.rs). Therefore a screen cell (cx, cy)
 //! inside the render rect maps to original pixel
 //! `((cx - rx) * fw / k, (cy - ry) * fh / k)` with
-//! `k = min(1, area_px_w/orig_w, area_px_h/orig_h)` — no centering offset,
-//! and the mapping is exact within the sub-cell rounding of the ceil.
+//! `k = min(area_px_w/orig_w, area_px_h/orig_h, base_w/orig_w)` — no
+//! centering offset, and the mapping is exact within the sub-cell rounding
+//! of the ceil. The third term is the downscale cap: the encode's source is
+//! the DOWNSCALED base, so the display never scales beyond 1:1 base pixels
+//! (one screen px = 1/`downscale_factor` original px there).
 
 use ratatui::layout::{Rect, Size};
-use tokio::sync::mpsc;
 
 use super::app::App;
 use super::overlays::{Confirm, Overlay};
 use super::preview::EditorWorker;
 use crate::backend::pdf::CropRect;
-use crate::session::Cmd;
 
 /// A crop rect in original image pixels (alias for readability in the TUI
 /// layer; the session actor's guard does the actual validation).
@@ -49,7 +50,7 @@ pub struct EditorRects {
 /// inside the image bounds. `image` is the render rect, `font_size` the
 /// terminal font size in pixels, `orig` the original image dims, `k` the
 /// scale factor from image pixels to screen pixels
-/// (min(1, area_px_w/orig_w, area_px_h/orig_h)).
+/// (`Geometry::scale_for`: min of the fit scale and the downscale cap).
 ///
 /// Returns None when the cell is outside the render rect or the geometry
 /// is degenerate.
@@ -263,13 +264,27 @@ impl Geometry {
     }
 
     /// The image area's scale factor k for the given content area
-    /// (area_px = cells * font px): how many screen pixels one image
-    /// pixel occupies under Resize::Fit.
-    pub fn scale_for(area: Size, font_size: (u16, u16), orig: (u32, u32)) -> f64 {
+    /// (area_px = cells * font px): how many screen pixels one ORIGINAL
+    /// image pixel occupies in the display.
+    ///
+    /// The encode's source is the DOWNSCALED base, so the effective scale
+    /// is the min of the Resize::Fit scale for the original dims and the
+    /// base's own pixel scale (base_w/orig_w = 1/downscale_factor): the
+    /// display never scales the base beyond 1:1, and computing `k` from
+    /// the original dims alone would overstate it on huge terminals
+    /// (mouse mapping would diverge from the rendered image).
+    pub fn scale_for(
+        area: Size,
+        font_size: (u16, u16),
+        orig: (u32, u32),
+        downscale_factor: f64,
+    ) -> f64 {
         let area_px_w = f64::from(area.width) * f64::from(font_size.0);
         let area_px_h = f64::from(area.height) * f64::from(font_size.1);
         let (ow, oh) = (f64::from(orig.0.max(1)), f64::from(orig.1.max(1)));
-        (area_px_w / ow).min(area_px_h / oh).min(1.0)
+        let fit = (area_px_w / ow).min(area_px_h / oh).min(1.0);
+        let ds = downscale_factor.max(1.0);
+        fit.min(1.0 / ds)
     }
 }
 
@@ -408,7 +423,6 @@ pub async fn handle_key(
     app: &mut App,
     editor: &mut EditorWorker,
     key: ratatui::crossterm::event::KeyEvent,
-    cmd_tx: &mpsc::Sender<Cmd>,
 ) -> anyhow::Result<()> {
     use ratatui::crossterm::event::{KeyCode as K, KeyModifiers};
 
@@ -506,7 +520,6 @@ pub async fn handle_key(
         K::Down => nudge_rect(app, editor, 'j', false),
         _ => {}
     }
-    let _ = cmd_tx;
     Ok(())
 }
 
@@ -565,7 +578,6 @@ pub async fn handle_mouse(
     app: &mut App,
     editor: &EditorWorker,
     mouse: ratatui::crossterm::event::MouseEvent,
-    cmd_tx: &mpsc::Sender<Cmd>,
 ) {
     use ratatui::crossterm::event::{MouseButton, MouseEventKind};
     // Not ready = no display for the CURRENT request (decode pending or
@@ -589,6 +601,7 @@ pub async fn handle_mouse(
             Size::new(rects.area.width, rects.area.height),
             app.editor_font_size,
             (w, h),
+            editor.downscale_factor(),
         ),
     };
     let drag = e.drag;
@@ -605,7 +618,12 @@ pub async fn handle_mouse(
                     // interior -> move; outside -> fresh draw (the anchor
                     // is the press point; the rect is replaced as soon as
                     // the drag moves, so a plain click outside keeps it).
-                    let tol = drag_tolerance_px(&rects, app.editor_font_size, (w, h));
+                    let tol = drag_tolerance_px(
+                        &rects,
+                        app.editor_font_size,
+                        (w, h),
+                        editor.downscale_factor(),
+                    );
                     if let Some(edges) = hit_edges(rect, px, tol) {
                         start_drag(
                             app,
@@ -667,7 +685,6 @@ pub async fn handle_mouse(
         }
         _ => {}
     }
-    let _ = cmd_tx;
 }
 
 /// Pixel tolerance for edge grabbing: a comfortable band is ~half a cell
@@ -675,11 +692,17 @@ pub async fn handle_mouse(
 /// (For rects narrower than the band, `hit_edges`'s per-axis
 /// `band = min(tol, rect.w/h)` cap makes the WHOLE rect an edge handle —
 /// deliberate: a tiny rect must stay grabbable for resize.)
-fn drag_tolerance_px(rects: &EditorRects, font_size: (u16, u16), orig: (u32, u32)) -> u32 {
+fn drag_tolerance_px(
+    rects: &EditorRects,
+    font_size: (u16, u16),
+    orig: (u32, u32),
+    downscale_factor: f64,
+) -> u32 {
     let k = Geometry::scale_for(
         Size::new(rects.area.width, rects.area.height),
         font_size,
         orig,
+        downscale_factor,
     );
     // Half a cell in image pixels, at least 8 image px. The
     // narrower-than-interior cap lives in `hit_edges` (band = min(tol,
@@ -787,13 +810,33 @@ mod tests {
     #[test]
     fn scale_for_caps_at_one() {
         // Small image in a huge terminal: k stays 1 (no upscale).
-        let k = Geometry::scale_for(Size::new(100, 50), FS, (50, 50));
+        let k = Geometry::scale_for(Size::new(100, 50), FS, (50, 50), 1.0);
         assert!((k - 1.0).abs() < 1e-9);
         // Big image: k scales down to fit.
-        let k = Geometry::scale_for(Size::new(100, 50), FS, (10000, 10000));
+        let k = Geometry::scale_for(Size::new(100, 50), FS, (10000, 10000), 1.0);
         let area_px_w = 100.0f64 * 10.0;
         let area_px_h = 50.0f64 * 20.0;
         assert!((k - (area_px_w / 10000.0).min(area_px_h / 10000.0)).abs() < 1e-9);
+    }
+
+    /// A downscaled base (longer side above MAX_EDITOR_PIXELS) caps the
+    /// display at 1:1 base pixels even on huge terminals: the mapping must
+    /// use that cap, not the original dims' fit scale (which clamps to 1.0
+    /// there), or mouse coords diverge from the rendered image.
+    #[test]
+    fn scale_for_caps_at_downscale() {
+        // 3000x4000 orig downscaled to 2400x3200 (factor 1.25): on a huge
+        // terminal the fit scale would be 1.0, but the base pixel scale is
+        // 1/1.25 = 0.8 — the effective cap.
+        let k = Geometry::scale_for(Size::new(400, 300), FS, (3000, 4000), 1.25);
+        assert!((k - 0.8).abs() < 1e-9);
+        // Without downscaling the cap is inert.
+        let k = Geometry::scale_for(Size::new(400, 300), FS, (3000, 4000), 1.0);
+        assert!((k - 1.0).abs() < 1e-9);
+        // A fit scale below the cap still wins.
+        let k = Geometry::scale_for(Size::new(80, 25), FS, (3000, 4000), 1.25);
+        let area_px_h = 25.0f64 * 20.0;
+        assert!((k - area_px_h / 4000.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1051,13 +1094,13 @@ mod tests {
         let mut down = mouse(MouseEventKind::Down(MouseButton::Left));
         down.column = 7;
         down.row = 2;
-        handle_mouse(&mut app, &editor, down, &mpsc::channel(4).0).await;
+        handle_mouse(&mut app, &editor, down).await;
         assert!(
             app.editor.as_ref().unwrap().drag.is_some(),
             "outside down starts a drag"
         );
         // Drag to cell (9,4): fresh rect anchored at px (70,40).
-        handle_mouse(&mut app, &editor, cell(9, 4), &mpsc::channel(4).0).await;
+        handle_mouse(&mut app, &editor, cell(9, 4)).await;
         let cropped = app.editor.as_ref().unwrap().crop.unwrap();
         assert_eq!(
             (cropped.x, cropped.y, cropped.w, cropped.h),
@@ -1071,11 +1114,11 @@ mod tests {
         click.column = 7;
         click.row = 2;
         app.editor.as_mut().unwrap().crop = Some(rect);
-        handle_mouse(&mut app, &editor, click, &mpsc::channel(4).0).await;
+        handle_mouse(&mut app, &editor, click).await;
         let mut up = mouse(MouseEventKind::Up(MouseButton::Left));
         up.column = 7;
         up.row = 2;
-        handle_mouse(&mut app, &editor, up, &mpsc::channel(4).0).await;
+        handle_mouse(&mut app, &editor, up).await;
         assert_eq!(
             app.editor.as_ref().unwrap().crop,
             Some(rect),
@@ -1097,9 +1140,7 @@ mod tests {
             ratatui::crossterm::event::KeyCode::Char('c'),
             ratatui::crossterm::event::KeyModifiers::CONTROL,
         );
-        handle_key(&mut app, &mut editor, key, &mpsc::channel(4).0)
-            .await
-            .unwrap();
+        handle_key(&mut app, &mut editor, key).await.unwrap();
         assert!(
             !app.quit_requested,
             "quit confirm must intercept the direct quit"
@@ -1112,9 +1153,7 @@ mod tests {
         // Finished session (nothing to lose): quits directly.
         app.overlay = None;
         app.meta = Some(meta(true));
-        handle_key(&mut app, &mut editor, key, &mpsc::channel(4).0)
-            .await
-            .unwrap();
+        handle_key(&mut app, &mut editor, key).await.unwrap();
         assert!(app.quit_requested, "nothing to lose quits directly");
     }
 

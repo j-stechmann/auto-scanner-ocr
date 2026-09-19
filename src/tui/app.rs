@@ -886,22 +886,15 @@ async fn handle_event(
 
     // Modal routing, layer two: the editor swallows everything (its own
     // key/mouse semantics; ? / ! overlays still open from inside).
+    // Overlays never reach this branch: they are routed at the top of the
+    // function before the editor layer runs.
     if app.mode == UiMode::Editor {
         match ev {
             CtEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                return editor::handle_key(app, editor, key, cmd_tx).await;
+                return editor::handle_key(app, editor, key).await;
             }
             CtEvent::Mouse(mouse) => {
-                // Overlays opened from the editor (?) / ! / crop confirm)
-                // route first, mirroring the main view's modal order.
-                if app.overlay.is_some() {
-                    let mut overlay = app.overlay.take().expect("overlay present");
-                    if overlays::handle_mouse(app, &mut overlay, mouse) {
-                        app.overlay = Some(overlay);
-                    }
-                    return Ok(());
-                }
-                editor::handle_mouse(app, editor, mouse, cmd_tx).await;
+                editor::handle_mouse(app, editor, mouse).await;
                 return Ok(());
             }
             _ => return Ok(()),
@@ -1460,7 +1453,7 @@ mod tests {
 
         // With no crop rect, Esc leaves immediately.
         let key = ratatui::crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        editor::handle_key(&mut app, &mut editor, key, &mpsc::channel(4).0)
+        editor::handle_key(&mut app, &mut editor, key)
             .await
             .unwrap();
         assert!(app.editor.is_none(), "clean Esc exits immediately");
@@ -1474,14 +1467,14 @@ mod tests {
             w: 10,
             h: 10,
         });
-        editor::handle_key(&mut app, &mut editor, key, &mpsc::channel(4).0)
+        editor::handle_key(&mut app, &mut editor, key)
             .await
             .unwrap();
         assert!(
             app.editor.as_ref().is_some_and(|e| e.esc_pending),
             "first Esc arms the discard question"
         );
-        editor::handle_key(&mut app, &mut editor, key, &mpsc::channel(4).0)
+        editor::handle_key(&mut app, &mut editor, key)
             .await
             .unwrap();
         assert!(app.editor.is_none(), "second Esc exits");
@@ -1507,18 +1500,14 @@ mod tests {
         });
 
         let q = ratatui::crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
-        editor::handle_key(&mut app, &mut editor, q, &mpsc::channel(4).0)
-            .await
-            .unwrap();
+        editor::handle_key(&mut app, &mut editor, q).await.unwrap();
         assert!(
             app.editor.as_ref().is_some_and(|e| e.esc_pending),
             "first q arms the discard question"
         );
         assert!(app.editor.is_some(), "editor stays open while armed");
 
-        editor::handle_key(&mut app, &mut editor, q, &mpsc::channel(4).0)
-            .await
-            .unwrap();
+        editor::handle_key(&mut app, &mut editor, q).await.unwrap();
         assert!(app.editor.is_none(), "second q discards and exits");
     }
 
