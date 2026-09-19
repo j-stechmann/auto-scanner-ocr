@@ -76,6 +76,11 @@ pub struct EditorState {
     pub gen: u32,
     /// Crop rect in ORIGINAL image pixels while the tool is active.
     pub crop: Option<ImageRect>,
+    /// ORIGINAL dims the current `crop` rect was shaped against (Some iff
+    /// `crop` is Some). A decode adoption with different dims (crop
+    /// completion) makes the same pixel rect mean a different region, so
+    /// `sync_editor` drops the rect in that case.
+    pub crop_dims: Option<(u32, u32)>,
     /// In-progress mouse drag (draw / move / resize).
     pub drag: Option<editor::Drag>,
     /// Esc-confirmation arm: a crop rect is unapplied; the first Esc asks
@@ -348,6 +353,7 @@ impl App {
             image: image.clone(),
             gen: page.image_gen,
             crop: None,
+            crop_dims: None,
             drag: None,
             esc_pending: false,
         });
@@ -367,6 +373,24 @@ impl App {
 
     pub fn editor_crop_rect(&self) -> Option<ImageRect> {
         self.editor.as_ref().and_then(|e| e.crop)
+    }
+
+    /// Set the crop rect, recording the dims it was shaped against.
+    pub fn set_editor_crop(&mut self, rect: Option<ImageRect>, dims: (u32, u32)) {
+        if let Some(e) = self.editor.as_mut() {
+            e.crop = rect;
+            e.crop_dims = rect.map(|_| dims);
+        }
+    }
+
+    /// Clear the crop rect and its dims (tool close / apply).
+    pub fn clear_editor_crop(&mut self) {
+        if let Some(e) = self.editor.as_mut() {
+            e.crop = None;
+            e.crop_dims = None;
+            e.drag = None;
+            e.esc_pending = false;
+        }
     }
 
     pub fn editor_page_label(&self) -> String {
@@ -790,6 +814,13 @@ async fn fire_pending_scan(app: &mut App, cmd_tx: &mpsc::Sender<session::Cmd>) {
 /// decode failure for the requested content is surfaced as a status line
 /// (with the failed cache it would otherwise strand the editor on
 /// "decoding image…" with no explanation).
+///
+/// Crop-rect currency: rects are raw pixel coords shaped against the
+/// ORIGINAL dims of the image on screen. When a decode adopts with
+/// DIFFERENT dims than the rect was shaped under (the crop-completion
+/// flow: the rect tool re-opens against the OLD display during the
+/// re-decode pending window), the same pixel rect now means a different
+/// region — drop it instead of letting it apply to the new pixels.
 fn sync_editor(app: &mut App, editor: &mut super::preview::EditorWorker) {
     let failure = editor
         .take_failure()
@@ -798,6 +829,22 @@ fn sync_editor(app: &mut App, editor: &mut super::preview::EditorWorker) {
         app.set_status(format!(
             "editor image decode failed: {path} (gen {gen}): {err}"
         ));
+    }
+    // Invalidate a rect shaped against other dims than the current display
+    // (checked even when not ready: the dims the rect was shaped under
+    // only match right after adoption).
+    if let Some(e) = app.editor.as_mut() {
+        if e.crop.is_some() && e.crop_dims.is_some() {
+            let dims = editor.orig_dims();
+            let shaped = e.crop_dims.expect("checked Some above");
+            if dims != shaped && dims != (0, 0) {
+                e.crop = None;
+                e.crop_dims = None;
+                e.drag = None;
+                e.esc_pending = false;
+                app.set_status("crop discarded: image changed (crop applied?)");
+            }
+        }
     }
     let Some(e) = app.editor.as_ref() else {
         return;
@@ -1438,6 +1485,95 @@ mod tests {
             .await
             .unwrap();
         assert!(app.editor.is_none(), "second Esc exits");
+    }
+
+    /// `q` shares Esc's leave path INCLUDING the discard arm: with an
+    /// unapplied rect the first `q` arms the prompt instead of silently
+    /// discarding (it's the main view's quit reflex, an easy mistake).
+    #[tokio::test]
+    async fn editor_q_arms_discard_like_esc() {
+        use super::super::preview::EditorWorker;
+
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+        app.editor.as_mut().unwrap().crop = Some(editor::ImageRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        });
+
+        let q = ratatui::crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        editor::handle_key(&mut app, &mut editor, q, &mpsc::channel(4).0)
+            .await
+            .unwrap();
+        assert!(
+            app.editor.as_ref().is_some_and(|e| e.esc_pending),
+            "first q arms the discard question"
+        );
+        assert!(app.editor.is_some(), "editor stays open while armed");
+
+        editor::handle_key(&mut app, &mut editor, q, &mpsc::channel(4).0)
+            .await
+            .unwrap();
+        assert!(app.editor.is_none(), "second q discards and exits");
+    }
+
+    /// A crop rect shaped against OLD dims (crop_dims) is dropped by
+    /// sync_editor once the worker adopts dims that differ (the applied
+    /// crop's re-decode): the same pixel rect would target a different
+    /// region on the new image.
+    #[tokio::test]
+    async fn sync_editor_discards_rect_shaped_against_old_dims() {
+        use super::super::preview::EditorWorker;
+
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+        let (w, h) = editor.orig_dims();
+        app.set_editor_crop(
+            Some(editor::ImageRect {
+                x: 2,
+                y: 2,
+                w: 10,
+                h: 10,
+            }),
+            (w, h),
+        );
+        assert!(app.editor_crop_rect().is_some());
+
+        // Same dims: the rect survives (normal reconcile, no decode ran).
+        sync_editor(&mut app, &mut editor);
+        assert!(
+            app.editor_crop_rect().is_some(),
+            "rect survives while dims match"
+        );
+
+        // Dims change (adoption with different content): rect dropped.
+        // The worker's dims are emulated via orig_dims_set_for_test (a
+        // real decode isn't needed — sync_editor's invalidation only
+        // compares the rect's binding to the worker's current dims).
+        let e = app.editor.as_mut().unwrap();
+        e.crop = Some(editor::ImageRect {
+            x: 2,
+            y: 2,
+            w: 10,
+            h: 10,
+        });
+        e.crop_dims = Some((40, 30)); // shaped under the OLD image's dims
+        editor.orig_dims_set_for_test((60, 50)); // adopted different dims
+        sync_editor(&mut app, &mut editor);
+        assert!(
+            app.editor_crop_rect().is_none(),
+            "rect shaped under other dims is dropped on adoption"
+        );
+        // And the discard disarms the prompt too (no stale prompt badge).
+        assert!(!app.editor.as_ref().unwrap().esc_pending);
     }
 
     #[tokio::test]

@@ -276,13 +276,10 @@ pub(crate) async fn accept_confirm(
                 .await;
             // The actor bumps image_gen on completion; the editor stays
             // open and its worker re-decodes from the same (path, gen)
-            // reconcile the thumbnails use. The tool closes; a rejected
-            // command (guard) surfaces as a status line.
-            if let Some(e) = app.editor.as_mut() {
-                e.crop = None;
-                e.drag = None;
-                e.esc_pending = false;
-            }
+            // reconcile the thumbnails use. The tool closes (and the
+            // shaped dims go with it); a rejected command (guard)
+            // surfaces as a status line.
+            app.clear_editor_crop();
         }
     }
 }

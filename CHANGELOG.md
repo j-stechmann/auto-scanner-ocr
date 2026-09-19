@@ -24,9 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   applying a crop confirms first since the removed pixels are gone (a
   rescan restores them). A crop cancels an in-flight preview-OCR
   extraction for that page and the text is re-extracted from the cropped
-  image on demand. While a new frame is encoded (kitty/sixel can take a
-  moment) the previous view keeps rendering — the outline lags behind a
-  fast drag and converges on release; the readout is instant. Note:
+  image on demand. While an outline update is being encoded (kitty/sixel
+  can take a moment) the previous frame keeps rendering — the outline
+  lags behind a fast drag and converges on release; the readout is
+  instant. After an applied crop the freshly decoded image renders once
+  its first frame is encoded (a brief blank for kitty/sixel while that
+  first encode runs). Note:
   ocrmypdf's finish-time auto-deskew (as on every page) can still apply a
   sub-degree rotation to slightly skewed scans — cropping itself is
   honored exactly

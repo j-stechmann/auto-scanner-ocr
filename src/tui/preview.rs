@@ -790,6 +790,13 @@ impl EditorWorker {
     ) -> bool {
         self.encoded_size == Some(cells) && self.shown_outline == outline
     }
+
+    #[cfg(test)]
+    /// Emulate a decode adoption's dims change without a real decode
+    /// (sync_editor's stale-rect invalidation keys off this).
+    pub fn orig_dims_set_for_test(&mut self, dims: (u32, u32)) {
+        self.orig_dims = dims;
+    }
 }
 
 /// The downscaled image with `outline` composited (or a plain clone).
@@ -1248,6 +1255,62 @@ mod editor_tests {
         }
         assert!(w.ready());
         assert_eq!(w.gen, 1);
+    }
+
+    /// A crop rect shaped against the OLD display's dims (shaped during
+    /// the re-decode pending window after an applied crop) is invalidated
+    /// when the adoption lands with DIFFERENT dims: the same pixel rect
+    /// would mean a different region on the new image. `sync_editor`'s
+    /// invalidation (app.rs) keys off `orig_dims` changing; this test
+    /// pins the worker-side contract it relies on: a same-path
+    /// re-decode keeps the old dims until adoption, then flips them.
+    #[tokio::test]
+    async fn crop_rect_dims_binding_survives_pending_flip_on_adopt() {
+        let picker = crate::tui::halfblocks_picker();
+        let mut w = EditorWorker::new(picker.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+
+        w.request(path.clone(), 0);
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+        let old_dims = w.orig_dims();
+        assert_eq!(old_dims, (40, 30));
+
+        // Apply-crop flow: gen bump -> re-decode pending (dims stay the
+        // OLD ones while not ready — the display keeps the old image).
+        let mut png2 = Vec::new();
+        image::DynamicImage::new_rgb8(60, 50)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png2),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        std::fs::write(&path, png2).unwrap();
+        w.request(path.clone(), 1);
+        assert!(!w.ready());
+        assert_eq!(w.orig_dims(), old_dims, "pending window keeps old dims");
+
+        // Adoption: dims change -> a rect shaped under (40, 30) is stale.
+        for _ in 0..100 {
+            if w.poll() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(w.ready());
+        assert_eq!(w.orig_dims(), (60, 50), "adoption flips the dims");
+        assert_ne!(w.orig_dims(), old_dims);
     }
 
     /// Failed decodes are cached per (path, gen): repeated `request` calls

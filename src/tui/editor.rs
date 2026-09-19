@@ -200,21 +200,6 @@ pub enum Drag {
     },
 }
 
-impl Drag {
-    /// Which edges does this drag move? (Resize only.)
-    pub fn edges(self) -> (bool, bool, bool, bool) {
-        match self {
-            Drag::Draw { .. } | Drag::Move { .. } => (false, false, false, false),
-            Drag::Resize {
-                left,
-                top,
-                right,
-                bottom,
-            } => (left, top, right, bottom),
-        }
-    }
-}
-
 /// Edge-band hit test in ORIGINAL image pixels: which rect edges is this
 /// point on? Bands are `tolerance` px wide (a tiny rect's whole edge is a
 /// handle since the band is capped at the rect size). Corners set both
@@ -336,7 +321,7 @@ pub fn draw_editor(
     // question; filtered from the mirror once disarmed so a stale
     // prompt does not linger as a regular info badge after another
     // path (nudge/drag/tool close) cleared `esc_pending`.
-    const DISCARD_PROMPT: &str = "discard crop? Esc again to discard, c to keep";
+    const DISCARD_PROMPT: &str = "discard crop? Esc/q again to discard, c to keep";
     let status = if esc_pending {
         Some(DISCARD_PROMPT.to_string())
     } else {
@@ -410,8 +395,8 @@ fn crop_percent(rect: ImageRect, orig: (u32, u32)) -> f64 {
 // ------------------------------------------------------------- input
 
 /// Editor key handling. Swallows everything except a deliberate set:
-/// - Esc / q: leave the editor (with the discard arm when a crop rect is
-///   unapplied)
+/// - Esc / q: leave the editor (both arm the discard question when a
+///   crop rect is unapplied; the second press discards and leaves)
 /// - Ctrl-C: global quit (same confirm path as the main view)
 /// - c: toggle the crop tool
 /// - Enter: apply the crop (confirm dialog)
@@ -440,19 +425,19 @@ pub async fn handle_key(
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
-        K::Esc => {
+        // Esc and q share the leave path, INCLUDING the discard arm: `q`
+        // is the main view's quit reflex, so it must not silently discard
+        // a shaped rect (parity with the documented Esc behavior).
+        K::Esc | K::Char('q') => {
             let Some(e) = app.editor.as_mut() else {
                 return Ok(());
             };
             if e.crop.is_some() && !e.esc_pending {
-                // First Esc: arm the discard question (status line).
+                // First press: arm the discard question (status line).
                 e.esc_pending = true;
-                app.set_status("discard crop? Esc again to discard, c to keep");
+                app.set_status("discard crop? Esc/q again to discard, c to keep");
                 return Ok(());
             }
-            app.close_editor();
-        }
-        K::Char('q') => {
             app.close_editor();
         }
         K::Char('?') => app.overlay = Some(Overlay::Help),
@@ -464,33 +449,49 @@ pub async fn handle_key(
             if e.crop.is_some() {
                 // Done with the tool; the rect is discarded (kept only via
                 // the Esc arm or the apply dialog).
-                e.crop = None;
-                e.drag = None;
-                e.esc_pending = false;
+                app.clear_editor_crop();
             } else if editor.ready() {
                 // Start with the middle 80% as the initial rect: a big,
                 // obvious starting point that is easy to shrink.
                 let (w, h) = editor.orig_dims();
                 let (w, h) = (w.max(1), h.max(1));
                 let (iw, ih) = (w / 5, h / 5);
-                e.crop = Some(ImageRect {
+                let rect = ImageRect {
                     x: iw,
                     y: ih,
                     w: w - 2 * iw,
                     h: h - 2 * ih,
-                });
-                e.esc_pending = false;
+                };
+                app.set_editor_crop(Some(rect), (w, h));
             } else {
                 app.set_status("image still decoding");
             }
         }
         K::Enter => {
             // Apply the crop: confirm first (destructive). The rect
-            // survives an Esc'd confirm (overlays route first).
+            // survives an Esc'd confirm (overlays route first). Gated on
+            // ready() AND the rect's dims binding: a rect must never apply
+            // from a stale display — `ready()` alone still has a
+            // one-event window (the adoption lands inside poll() before
+            // sync_editor's invalidation has run), so the binding check
+            // makes a stale-dims capture impossible here outright.
+            if !editor.ready() {
+                app.set_status("image still decoding");
+                return Ok(());
+            }
             let Some(rect) = app.editor.as_ref().and_then(|e| e.crop) else {
                 app.set_status("no crop rect - press c to start cropping");
                 return Ok(());
             };
+            if app
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.crop_dims != Some(editor.orig_dims()))
+            {
+                app.set_status("crop discarded: image changed (crop applied?)");
+                app.clear_editor_crop();
+                return Ok(());
+            }
             let id = app.editor.as_ref().expect("editor open").page_id;
             app.overlay = Some(Overlay::Confirm(Confirm::crop(id, rect)));
         }
@@ -526,6 +527,8 @@ fn nudge_rect(app: &mut App, editor: &EditorWorker, c: char, shrink: bool) {
     let step = key_step((w, h)) as i64;
     let max = (w, h);
     e.esc_pending = false;
+    // Nudges reshape in the CURRENT dims: re-record the shaped dims.
+    e.crop_dims = Some(max);
     e.crop = Some(match c {
         'h' if shrink => extend_rect(rect, Edge::Left, -step, max),
         'h' => move_rect(rect, -step, 0, max),
@@ -544,7 +547,11 @@ fn nudge_rect(app: &mut App, editor: &EditorWorker, c: char, shrink: bool) {
 }
 
 /// Editor mouse handling: fully intercepted (stale main-view geometry is
-/// never consulted). With the tool active:
+/// never consulted). Hit-testing uses `ready()` (not `has_display()`):
+/// during a same-path re-decode pending window the OLD image is still on
+/// screen, and drags in the stale coordinate space would corrupt the rect
+/// (and the clamp bounds flip mid-drag when the new dims arrive).
+/// With the tool active:
 /// - down on a rect EDGE/corner starts a RESIZE of the grabbed edges
 /// - down in the rect interior starts a MOVE
 /// - down outside the rect starts a fresh DRAW (anchor = press point);
@@ -561,6 +568,11 @@ pub async fn handle_mouse(
     cmd_tx: &mpsc::Sender<Cmd>,
 ) {
     use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    // Not ready = no display for the CURRENT request (decode pending or
+    // failed): shape nothing, drag nothing (stale coords).
+    if !editor.ready() {
+        return;
+    }
     let pos = (mouse.column, mouse.row);
     let Some(rects) = app.editor_rects else {
         return;
@@ -660,14 +672,18 @@ pub async fn handle_mouse(
 
 /// Pixel tolerance for edge grabbing: a comfortable band is ~half a cell
 /// in image pixels (at least 8), so edges stay grabbable at any zoom.
+/// (For rects narrower than the band, `hit_edges`'s per-axis
+/// `band = min(tol, rect.w/h)` cap makes the WHOLE rect an edge handle —
+/// deliberate: a tiny rect must stay grabbable for resize.)
 fn drag_tolerance_px(rects: &EditorRects, font_size: (u16, u16), orig: (u32, u32)) -> u32 {
     let k = Geometry::scale_for(
         Size::new(rects.area.width, rects.area.height),
         font_size,
         orig,
     );
-    // Half a cell in image pixels, at least 8 image px, capped so the band
-    // stays narrower than the rect's interior.
+    // Half a cell in image pixels, at least 8 image px. The
+    // narrower-than-interior cap lives in `hit_edges` (band = min(tol,
+    // rect size)), not here.
     let half_cell = (f64::from(font_size.0) / k.max(1e-6) / 2.0) as u32;
     half_cell.max(8)
 }
@@ -685,8 +701,13 @@ fn apply_drag(app: &mut App, d: Drag, px: (u32, u32), geom: Geometry) {
         None => return,
     };
     e.esc_pending = false;
+    // The rect keeps its ORIGINAL meaning (recorded dims) until a drag
+    // actually reshapes it in the CURRENT dims.
     e.crop = Some(match d {
-        Drag::Draw { anchor } => normalize_rect(anchor, px, max),
+        Drag::Draw { anchor } => {
+            e.crop_dims = Some(max);
+            normalize_rect(anchor, px, max)
+        }
         Drag::Move { grab_dx, grab_dy } => {
             let nx = (px.0 as i64 - grab_dx).clamp(0, (max.0 - rect.w) as i64) as u32;
             let ny = (px.1 as i64 - grab_dy).clamp(0, (max.1 - rect.h) as i64) as u32;
@@ -701,7 +722,10 @@ fn apply_drag(app: &mut App, d: Drag, px: (u32, u32), geom: Geometry) {
             top,
             right,
             bottom,
-        } => drag_resize(rect, px, (left, top, right, bottom), max),
+        } => {
+            e.crop_dims = Some(max);
+            drag_resize(rect, px, (left, top, right, bottom), max)
+        }
     });
 }
 
@@ -1132,7 +1156,7 @@ mod tests {
             );
         }
         assert!(
-            row.contains("discard crop? Esc again to discard"),
+            row.contains("discard crop? Esc/q again to discard"),
             "esc prompt visible in editor footer: {row:?}"
         );
     }
@@ -1152,7 +1176,7 @@ mod tests {
             h: 10,
         });
         app.editor.as_mut().unwrap().esc_pending = true;
-        app.set_status("discard crop? Esc again to discard, c to keep");
+        app.set_status("discard crop? Esc/q again to discard, c to keep");
         // Disarm without pushing a new status (the nudge path does this).
         app.editor.as_mut().unwrap().esc_pending = false;
 
