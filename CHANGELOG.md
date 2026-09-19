@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Page editor with cropping** (`e` or `Enter` on a ready page): a
+  full-screen editing view showing the page as large as the terminal
+  allows. The `c` key activates the crop tool (clicks do nothing before
+  it) — the selection rectangle is drawn directly into the image (it stays
+  visible on every image protocol, including kitty and sixel) and can be
+  shaped with the mouse (drag an edge/corner to resize, the interior to
+  move) or the keyboard (`hjkl` moves it, `HJKL` grows it, `Alt+hjkl`
+  shrinks it, arrows move). Enter shows a confirm dialog and
+  then crops the page image; the crop is applied to the actual scan, so
+  the final PDF contains exactly the kept region (page size derives from
+  the image pixels + DPI as before). Two safety rails: leaving the editor
+  with an unapplied selection asks for confirmation (Esc twice), and
+  applying a crop confirms first since the removed pixels are gone (a
+  rescan restores them). A crop cancels an in-flight preview-OCR
+  extraction for that page and the text is re-extracted from the cropped
+  image on demand. While an outline update is being encoded (kitty/sixel
+  can take a moment) the previous frame keeps rendering — the outline
+  lags behind a fast drag and converges on release; the readout is
+  instant. After an applied crop the freshly decoded image renders once
+  its first frame is encoded (a brief blank for kitty/sixel while that
+  first encode runs). Note:
+  ocrmypdf's finish-time auto-deskew (as on every page) can still apply a
+  sub-degree rotation to slightly skewed scans — cropping itself is
+  honored exactly
+
 ### Fixed
 
 - **Dialogs no longer close when the mouse pointer moves**: mouse capture

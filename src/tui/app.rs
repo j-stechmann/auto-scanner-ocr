@@ -18,6 +18,8 @@ use crate::config::{Config, PreviewOcr};
 use crate::notify::{self, Urgency};
 use crate::session::{self, Busy, Event, PageStatus, PageView, SessionMeta};
 
+pub use super::editor::EditorRects;
+use super::editor::{self, ImageRect};
 use super::overlays::{self, Confirm, ConfirmKind, Overlay};
 use super::preview::PreviewWorker;
 use super::ui;
@@ -55,6 +57,35 @@ impl Pane {
 pub struct Settings {
     pub dpi: u16,
     pub mode: String,
+}
+
+/// Top-level UI mode. The editor is a modal layer between the overlays
+/// (which always route first) and the main view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiMode {
+    Main,
+    Editor,
+}
+
+/// State for the page editor (UiMode::Editor). `page_id` pins one page per
+/// editor visit (n/p deferred by design).
+#[derive(Debug, Clone)]
+pub struct EditorState {
+    pub page_id: crate::session::PageId,
+    pub image: std::path::PathBuf,
+    pub gen: u32,
+    /// Crop rect in ORIGINAL image pixels while the tool is active.
+    pub crop: Option<ImageRect>,
+    /// ORIGINAL dims the current `crop` rect was shaped against (Some iff
+    /// `crop` is Some). A decode adoption with different dims (crop
+    /// completion) makes the same pixel rect mean a different region, so
+    /// `sync_editor` drops the rect in that case.
+    pub crop_dims: Option<(u32, u32)>,
+    /// In-progress mouse drag (draw / move / resize).
+    pub drag: Option<editor::Drag>,
+    /// Esc-confirmation arm: a crop rect is unapplied; the first Esc asks
+    /// "discard?", the second leaves the editor.
+    pub esc_pending: bool,
 }
 
 /// Status lines kept in the status pane (newest at bottom).
@@ -118,6 +149,14 @@ pub struct App {
     /// (zenity/kdialog/yad) and it reports the outcome here — see
     /// `SaveChoice`. Consumed by the run_tui select loop.
     pub finish_tx: mpsc::Sender<crate::backend::filedialog::SaveChoice>,
+    /// Top-level UI mode (main view vs. page editor).
+    pub mode: UiMode,
+    /// State while in editor mode (Some iff mode == Editor).
+    pub editor: Option<EditorState>,
+    /// Editor geometry from the last frame (mouse hit-testing).
+    pub editor_rects: Option<EditorRects>,
+    /// Terminal font size cached from the preview picker (editor mapping).
+    pub editor_font_size: (u16, u16),
 }
 
 impl App {
@@ -172,6 +211,10 @@ impl App {
             tick: 0,
             dialog_in_flight: false,
             finish_tx,
+            mode: UiMode::Main,
+            editor: None,
+            editor_rects: None,
+            editor_font_size: (8, 16),
         }
     }
 
@@ -282,7 +325,80 @@ impl App {
             Action::Open => self.last_result.is_some(),
             Action::Cancel => busy == Busy::Scanning,
             Action::Settings => busy != Busy::Finishing,
+            // Same preconditions as Rotate: the editor views/crops what
+            // rotate would transform (ready page with an image).
+            Action::Edit => {
+                !finished
+                    && self.selected_page().is_some_and(|p| {
+                        matches!(p.status, PageStatus::Ready)
+                            && p.image.is_some()
+                            && !p.text_pending
+                    })
+            }
         }
+    }
+
+    // ------------------------------------------------------------ editor
+
+    /// Open the editor for the selected page (guarded like Rotate).
+    pub fn open_editor(&mut self) {
+        if !self.action_allowed(Action::Edit) {
+            self.set_status("edit blocked: page busy or no image");
+            return;
+        }
+        let page = &self.pages[self.selected];
+        let image = page.image.clone().expect("edit guard checked image");
+        self.editor = Some(EditorState {
+            page_id: page.id,
+            image: image.clone(),
+            gen: page.image_gen,
+            crop: None,
+            crop_dims: None,
+            drag: None,
+            esc_pending: false,
+        });
+        self.mode = UiMode::Editor;
+        // Stale main-view geometry must not survive into editor mode (the
+        // editor mouse handler never consults it, but keep state honest).
+        self.preview_cells.clear();
+        self.editor_rects = None;
+    }
+
+    /// Close the editor (unconditional; caller handles the Esc arm).
+    pub fn close_editor(&mut self) {
+        self.mode = UiMode::Main;
+        self.editor = None;
+        self.editor_rects = None;
+    }
+
+    pub fn editor_crop_rect(&self) -> Option<ImageRect> {
+        self.editor.as_ref().and_then(|e| e.crop)
+    }
+
+    /// Set the crop rect, recording the dims it was shaped against.
+    pub fn set_editor_crop(&mut self, rect: Option<ImageRect>, dims: (u32, u32)) {
+        if let Some(e) = self.editor.as_mut() {
+            e.crop = rect;
+            e.crop_dims = rect.map(|_| dims);
+        }
+    }
+
+    /// Clear the crop rect and its dims (tool close / apply).
+    pub fn clear_editor_crop(&mut self) {
+        if let Some(e) = self.editor.as_mut() {
+            e.crop = None;
+            e.crop_dims = None;
+            e.drag = None;
+            e.esc_pending = false;
+        }
+    }
+
+    pub fn editor_page_label(&self) -> String {
+        self.editor
+            .as_ref()
+            .and_then(|e| self.pages.iter().find(|p| p.id == e.page_id))
+            .map(|p| format!("{}", p.id))
+            .unwrap_or_else(|| "?".into())
     }
 }
 
@@ -297,6 +413,7 @@ pub enum Action {
     Open,
     Cancel,
     Settings,
+    Edit,
 }
 
 /// Commands the app sends to the session actor.
@@ -369,7 +486,7 @@ pub async fn run_tui(
     let mut app = App::new(cfg.clone(), diag_tx, finish_tx);
     app.picker_available = picker_available;
 
-    let mut preview = PreviewWorker::new(picker);
+    let mut preview = PreviewWorker::new(picker.clone());
     tracing::info!(
         "image preview protocol: {}",
         if app.picker_available {
@@ -378,6 +495,10 @@ pub async fn run_tui(
             "halfblocks"
         }
     );
+    // Font size for editor coordinate mapping (same picker, cached once).
+    let fs = picker.font_size();
+    app.editor_font_size = (fs.width, fs.height);
+    let mut editor = super::preview::EditorWorker::new(picker);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -390,9 +511,18 @@ pub async fn run_tui(
         preview.on_pages_changed(&app);
         let _preview_changed = preview.poll() | preview.poll_resizes();
 
+        // Editor reconcile: keep the edited page's image decoding at the
+        // current (path, gen), poll completions, and detect session events
+        // that must close the editor (page gone / deleted-pending / failed
+        // / finished). Runs every frame like the thumbnail reconcile.
+        sync_editor(&mut app, &mut editor);
+        let _editor_changed = editor.poll() | editor.poll_encodes();
+        editor.flush_queue();
+
         // Draw.
-        terminal.draw(|f| ui::draw(f, &mut app, &mut preview))?;
+        terminal.draw(|f| ui::draw(f, &mut app, &mut preview, &mut editor))?;
         // Post-draw: kick per-cell re-encodes for the current grid geometry.
+        // In editor mode the contact sheet was not drawn (stale cells).
         if !app.preview_cells.is_empty() {
             preview.sync_cells(&app.preview_cells);
         }
@@ -402,7 +532,7 @@ pub async fn run_tui(
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(ev)) => {
-                        handle_event(&mut app, &cmd_tx, ev).await?;
+                        handle_event(&mut app, &mut preview, &mut editor, &cmd_tx, ev).await?;
                     }
                     Some(Err(e)) => return Err(anyhow::anyhow!("terminal event error: {e}")),
                     None => return Ok(app.startup_report_ok.unwrap_or(true)),
@@ -462,6 +592,43 @@ pub async fn run_tui(
 async fn handle_session_event(app: &mut App, ev: Event) {
     match ev {
         Event::Pages { pages, meta } => {
+            // Editor lifecycle: close when the PINNED page is gone,
+            // mid-deletion, failed, or the session finished (post-finish
+            // the dir is gone). Other pages' transitions (e.g. a
+            // background scan of the next page) do not close it — only
+            // this page's own states do. A crop completion (new gen)
+            // intentionally KEEPS the editor open; sync_editor re-decodes.
+            if app.mode == UiMode::Editor {
+                let pinned = app.editor.as_ref().map(|e| e.page_id);
+                let should_close = match pinned.and_then(|id| pages.iter().find(|p| p.id == id)) {
+                    None => true,
+                    Some(p) => {
+                        matches!(p.status, PageStatus::DeletePending | PageStatus::Failed)
+                            || meta.finished
+                    }
+                };
+                if should_close {
+                    app.close_editor();
+                    app.set_status("editor closed: page changed");
+                } else {
+                    // Track the pinned page's current image identity: a
+                    // crop completion's gen bump re-decodes via sync_editor
+                    // AND updates the editor's (image, gen) so the next
+                    // snapshot is current again. Only applied to Ready
+                    // pages — mid-processing bumps (start_crop) are
+                    // deferred to the completion snapshot, so the editor
+                    // never decodes a half-written state.
+                    if let (Some(e), Some(p)) = (
+                        app.editor.as_mut(),
+                        pages.iter().find(|p| Some(p.id) == pinned),
+                    ) {
+                        if p.status == PageStatus::Ready {
+                            e.image = p.image.clone().unwrap_or_else(|| e.image.clone());
+                            e.gen = p.image_gen;
+                        }
+                    }
+                }
+            }
             let selection_was_valid = app.selected < pages.len();
             let old_selected_id = app.pages.get(app.selected).map(|p| p.id);
             app.pages = pages;
@@ -641,6 +808,50 @@ async fn fire_pending_scan(app: &mut App, cmd_tx: &mpsc::Sender<session::Cmd>) {
     let _ = cmd_tx.send(session::Cmd::ScanNext { dpi, mode }).await;
 }
 
+/// Per-frame editor reconcile: point the worker at the pinned page's
+/// current (image, gen) — a crop completion's gen bump re-decodes here,
+/// same mechanism as the thumbnails' `on_pages_changed`. A terminal
+/// decode failure for the requested content is surfaced as a status line
+/// (with the failed cache it would otherwise strand the editor on
+/// "decoding image…" with no explanation).
+///
+/// Crop-rect currency: rects are raw pixel coords shaped against the
+/// ORIGINAL dims of the image on screen. When a decode adopts with
+/// DIFFERENT dims than the rect was shaped under (the crop-completion
+/// flow: the rect tool re-opens against the OLD display during the
+/// re-decode pending window), the same pixel rect now means a different
+/// region — drop it instead of letting it apply to the new pixels.
+fn sync_editor(app: &mut App, editor: &mut super::preview::EditorWorker) {
+    let failure = editor
+        .take_failure()
+        .map(|(path, gen, err)| (path.display().to_string(), gen, err));
+    if let Some((path, gen, err)) = failure {
+        app.set_status(format!(
+            "editor image decode failed: {path} (gen {gen}): {err}"
+        ));
+    }
+    // Invalidate a rect shaped against other dims than the current display
+    // (checked even when not ready: the dims the rect was shaped under
+    // only match right after adoption).
+    if let Some(e) = app.editor.as_mut() {
+        if e.crop.is_some() && e.crop_dims.is_some() {
+            let dims = editor.orig_dims();
+            let shaped = e.crop_dims.expect("checked Some above");
+            if dims != shaped && dims != (0, 0) {
+                e.crop = None;
+                e.crop_dims = None;
+                e.drag = None;
+                e.esc_pending = false;
+                app.set_status("crop discarded: image changed (crop applied?)");
+            }
+        }
+    }
+    let Some(e) = app.editor.as_ref() else {
+        return;
+    };
+    editor.request(e.image.clone(), e.gen);
+}
+
 #[derive(Debug)]
 enum UiAction {
     None,
@@ -649,6 +860,8 @@ enum UiAction {
 
 async fn handle_event(
     app: &mut App,
+    _preview: &mut PreviewWorker,
+    editor: &mut super::preview::EditorWorker,
     cmd_tx: &mpsc::Sender<session::Cmd>,
     ev: CtEvent,
 ) -> Result<()> {
@@ -669,6 +882,23 @@ async fn handle_event(
             _ => app.overlay = Some(overlay),
         }
         return Ok(());
+    }
+
+    // Modal routing, layer two: the editor swallows everything (its own
+    // key/mouse semantics; ? / ! overlays still open from inside).
+    // Overlays never reach this branch: they are routed at the top of the
+    // function before the editor layer runs.
+    if app.mode == UiMode::Editor {
+        match ev {
+            CtEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                return editor::handle_key(app, editor, key).await;
+            }
+            CtEvent::Mouse(mouse) => {
+                editor::handle_mouse(app, editor, mouse).await;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
     }
 
     match ev {
@@ -760,6 +990,13 @@ async fn handle_key(
         Char('R') => {
             if let Some(p) = app.selected_page() {
                 send(app, cmd_tx, CommandAction::Rotate(p.id as usize, true)).await;
+            }
+        }
+        Char('e') | Enter => {
+            if app.action_allowed(Action::Edit) {
+                app.open_editor();
+            } else {
+                app.set_status("edit blocked: page busy or no image");
             }
         }
         Char('<') => {
@@ -1114,6 +1351,265 @@ mod tests {
         assert_eq!(Pane::Preview.next(), Pane::Text);
         assert_eq!(Pane::Text.next(), Pane::Sidebar);
         assert_eq!(Pane::Sidebar.prev(), Pane::Text);
+    }
+
+    // ------------------------------------------------------------ editor
+
+    #[test]
+    fn editor_open_close_rules() {
+        let mut app = test_app();
+
+        // No pages: edit blocked.
+        assert!(!app.action_allowed(Action::Edit));
+
+        // Ready page with an image: allowed, opens, closes.
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        assert!(app.action_allowed(Action::Edit));
+        app.open_editor();
+        assert_eq!(app.mode, UiMode::Editor);
+        assert_eq!(app.editor.as_ref().map(|e| e.page_id), Some(1));
+        assert_eq!(app.editor.as_ref().map(|e| e.gen), Some(1));
+        app.close_editor();
+        assert_eq!(app.mode, UiMode::Main);
+        assert!(app.editor.is_none());
+
+        // text_pending (lazy OCR running): blocked.
+        let mut busy_page = ready_page(1);
+        busy_page.text_pending = true;
+        app.pages = vec![busy_page];
+        assert!(!app.action_allowed(Action::Edit), "OCR job blocks edit");
+
+        // Failed page: blocked.
+        let mut failed = ready_page(1);
+        failed.status = PageStatus::Failed;
+        app.pages = vec![failed];
+        assert!(!app.action_allowed(Action::Edit));
+
+        // Finished session: blocked (post-finish stubs).
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(true));
+        assert!(!app.action_allowed(Action::Edit));
+    }
+
+    #[tokio::test]
+    async fn editor_closes_on_page_vanish_and_finish() {
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+
+        // Crop completes (gen bump, still Ready): editor STAYS open and
+        // tracks the new gen (sync_editor re-decodes).
+        let mut cropped = ready_page(1);
+        cropped.image_gen = 3; // start_crop + completion bumps
+        handle_session_event(
+            &mut app,
+            Event::Pages {
+                pages: vec![cropped],
+                meta: meta(false),
+            },
+        )
+        .await;
+        assert!(app.editor.is_some(), "gen bump keeps the editor open");
+        assert_eq!(app.editor.as_ref().map(|e| e.gen), Some(3));
+
+        // Page deleted: editor closes.
+        handle_session_event(
+            &mut app,
+            Event::Pages {
+                pages: vec![],
+                meta: meta(false),
+            },
+        )
+        .await;
+        assert!(app.editor.is_none(), "vanish closes the editor");
+        assert_eq!(app.mode, UiMode::Main);
+
+        // Finished session closes it too.
+        app.pages = vec![ready_page(2)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        handle_session_event(
+            &mut app,
+            Event::Pages {
+                pages: vec![ready_page(2)],
+                meta: meta(true),
+            },
+        )
+        .await;
+        assert!(app.editor.is_none(), "finish closes the editor");
+    }
+
+    #[tokio::test]
+    async fn editor_esc_arm_discards_rect() {
+        use super::super::preview::EditorWorker;
+
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+
+        // With no crop rect, Esc leaves immediately.
+        let key = ratatui::crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        editor::handle_key(&mut app, &mut editor, key)
+            .await
+            .unwrap();
+        assert!(app.editor.is_none(), "clean Esc exits immediately");
+
+        // Re-open, arm a crop rect via 'c' (not ready -> status only, no
+        // rect), set the rect directly, then Esc arms, Esc again discards.
+        app.open_editor();
+        app.editor.as_mut().unwrap().crop = Some(editor::ImageRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        });
+        editor::handle_key(&mut app, &mut editor, key)
+            .await
+            .unwrap();
+        assert!(
+            app.editor.as_ref().is_some_and(|e| e.esc_pending),
+            "first Esc arms the discard question"
+        );
+        editor::handle_key(&mut app, &mut editor, key)
+            .await
+            .unwrap();
+        assert!(app.editor.is_none(), "second Esc exits");
+    }
+
+    /// `q` shares Esc's leave path INCLUDING the discard arm: with an
+    /// unapplied rect the first `q` arms the prompt instead of silently
+    /// discarding (it's the main view's quit reflex, an easy mistake).
+    #[tokio::test]
+    async fn editor_q_arms_discard_like_esc() {
+        use super::super::preview::EditorWorker;
+
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+        app.editor.as_mut().unwrap().crop = Some(editor::ImageRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        });
+
+        let q = ratatui::crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        editor::handle_key(&mut app, &mut editor, q).await.unwrap();
+        assert!(
+            app.editor.as_ref().is_some_and(|e| e.esc_pending),
+            "first q arms the discard question"
+        );
+        assert!(app.editor.is_some(), "editor stays open while armed");
+
+        editor::handle_key(&mut app, &mut editor, q).await.unwrap();
+        assert!(app.editor.is_none(), "second q discards and exits");
+    }
+
+    /// A crop rect shaped against OLD dims (crop_dims) is dropped by
+    /// sync_editor once the worker adopts dims that differ (the applied
+    /// crop's re-decode): the same pixel rect would target a different
+    /// region on the new image.
+    #[tokio::test]
+    async fn sync_editor_discards_rect_shaped_against_old_dims() {
+        use super::super::preview::EditorWorker;
+
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+        let (w, h) = editor.orig_dims();
+        app.set_editor_crop(
+            Some(editor::ImageRect {
+                x: 2,
+                y: 2,
+                w: 10,
+                h: 10,
+            }),
+            (w, h),
+        );
+        assert!(app.editor_crop_rect().is_some());
+
+        // Same dims: the rect survives (normal reconcile, no decode ran).
+        sync_editor(&mut app, &mut editor);
+        assert!(
+            app.editor_crop_rect().is_some(),
+            "rect survives while dims match"
+        );
+
+        // Dims change (adoption with different content): rect dropped.
+        // The worker's dims are emulated via orig_dims_set_for_test (a
+        // real decode isn't needed — sync_editor's invalidation only
+        // compares the rect's binding to the worker's current dims).
+        let e = app.editor.as_mut().unwrap();
+        e.crop = Some(editor::ImageRect {
+            x: 2,
+            y: 2,
+            w: 10,
+            h: 10,
+        });
+        e.crop_dims = Some((40, 30)); // shaped under the OLD image's dims
+        editor.orig_dims_set_for_test((60, 50)); // adopted different dims
+        sync_editor(&mut app, &mut editor);
+        assert!(
+            app.editor_crop_rect().is_none(),
+            "rect shaped under other dims is dropped on adoption"
+        );
+        // And the discard disarms the prompt too (no stale prompt badge).
+        assert!(!app.editor.as_ref().unwrap().esc_pending);
+    }
+
+    #[tokio::test]
+    async fn editor_crop_apply_sends_cmd_and_closes_tool() {
+        use crate::session::Cmd;
+
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        app.editor.as_mut().unwrap().crop = Some(editor::ImageRect {
+            x: 5,
+            y: 6,
+            w: 100,
+            h: 200,
+        });
+
+        // Accept the confirm dialog: Cmd::Crop goes out, tool closes,
+        // editor stays open.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let overlay = app.overlay.take().unwrap_or_else(|| {
+            Overlay::Confirm(Confirm::crop(
+                1,
+                editor::ImageRect {
+                    x: 5,
+                    y: 6,
+                    w: 100,
+                    h: 100,
+                },
+            ))
+        });
+        app.overlay = Some(overlay);
+        if let Some(Overlay::Confirm(confirm)) = app.overlay.take() {
+            let kind = confirm.kind.clone();
+            super::overlays::accept_confirm(&mut app, &kind, &cmd_tx).await;
+        }
+        match cmd_rx.try_recv() {
+            Ok(Cmd::Crop { id, x, y, w, h }) => {
+                assert_eq!(id, 1);
+                assert_eq!((x, y, w, h), (5, 6, 100, 100));
+            }
+            other => panic!("expected Cmd::Crop, got {other:?}"),
+        }
+        assert!(
+            app.editor.as_ref().is_some_and(|e| e.crop.is_none()),
+            "tool closes after apply, editor stays"
+        );
     }
 
     /// App with throwaway channels; meta/pages are set per-test.
@@ -1724,8 +2220,12 @@ mod tests {
     async fn mouse_moved_preserves_open_overlay() {
         let mut app = test_app();
         app.overlay = Some(Overlay::Help);
+        let mut preview = crate::tui::preview::PreviewWorker::new(crate::tui::halfblocks_picker());
+        let mut editor = crate::tui::preview::EditorWorker::new(crate::tui::halfblocks_picker());
         handle_event(
             &mut app,
+            &mut preview,
+            &mut editor,
             &mpsc::channel(1).0,
             CtEvent::Mouse(ratatui::crossterm::event::MouseEvent {
                 kind: MouseEventKind::Moved,
@@ -1746,6 +2246,8 @@ mod tests {
         app.overlay_rect = Some(Rect::new(10, 5, 20, 6));
         handle_event(
             &mut app,
+            &mut preview,
+            &mut editor,
             &mpsc::channel(1).0,
             CtEvent::Mouse(ratatui::crossterm::event::MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
