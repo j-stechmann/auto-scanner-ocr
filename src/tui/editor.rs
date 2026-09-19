@@ -460,6 +460,13 @@ pub async fn handle_key(
             let Some(e) = app.editor.as_mut() else {
                 return Ok(());
             };
+            if e.esc_pending {
+                // While the discard question is armed, `c` is the documented
+                // "keep" answer (the prompt says so): disarm WITHOUT
+                // discarding the rect.
+                e.esc_pending = false;
+                return Ok(());
+            }
             if e.crop.is_some() {
                 // Done with the tool; the rect is discarded (kept only via
                 // the Esc arm or the apply dialog).
@@ -1124,6 +1131,41 @@ mod tests {
             Some(rect),
             "outside click without drag keeps the rect"
         );
+    }
+
+    /// While the discard question is armed, `c` is the prompt's documented
+    /// "keep" answer: it disarms the prompt WITHOUT discarding the rect
+    /// (the tool-close `c` still discards when the prompt is not armed).
+    #[tokio::test]
+    async fn editor_c_keeps_rect_while_discard_prompt_armed() {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut app = test_app();
+        app.pages = vec![ready_page(1)];
+        app.meta = Some(meta(false));
+        app.open_editor();
+        let mut editor = EditorWorker::new(crate::tui::halfblocks_picker());
+        let rect = ImageRect {
+            x: 2,
+            y: 3,
+            w: 10,
+            h: 10,
+        };
+        app.editor.as_mut().unwrap().crop = Some(rect);
+        app.editor.as_mut().unwrap().esc_pending = true;
+        app.set_status("discard crop? Esc/q again to discard, c to keep");
+
+        let c = ratatui::crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        handle_key(&mut app, &mut editor, c).await.unwrap();
+        let e = app.editor.as_ref().unwrap();
+        assert!(!e.esc_pending, "prompt disarmed");
+        assert_eq!(e.crop, Some(rect), "rect kept: c is the keep answer");
+
+        // Prompt not armed: tool-close `c` still discards the rect.
+        handle_key(&mut app, &mut editor, c).await.unwrap();
+        let e = app.editor.as_ref().unwrap();
+        assert!(e.crop.is_none(), "tool close discards the rect");
+        assert!(!e.esc_pending);
     }
 
     /// Ctrl-C inside the editor routes through the quit confirmation when
