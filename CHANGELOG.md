@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-09-23
+
+### Changed
+
+- Dependency bumps (all verified by CI and local build): `dirs` 6 → 7 (major
+  bump, no API-relevant change for this codebase), `clap` 4.6.6 → 4.6.7,
+  `ratatui-image` 11.0.6 → 11.0.8, `toml` 1.1.5+spec-1.1.0 →
+  1.1.6+spec-1.1.0
+
 ## [0.4.0] - 2026-09-19
 
 ### Added
@@ -240,6 +249,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - TOML config file with per-run CLI overrides
 - Desktop notifications via libnotify, logs in the XDG state dir
 
+[0.4.1]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/j-stechmann/auto-scanner-ocr/compare/v0.2.1...v0.3.0
