@@ -250,7 +250,9 @@ runs in an isolated child process.
 - The TUI runs the same checks at startup (in the background); if something
   is missing you'll see the diagnostics screen automatically instead of a
   mid-scan failure. The `r` re-run inside diagnostics is non-blocking — the
-  UI stays responsive while checks execute.
+  UI stays responsive while checks execute. A dismissed diagnostics screen
+  is not re-opened for the same ongoing problem, but a new, different one
+  (e.g. another tool disappears mid-session) pops it up again.
 - **Wrong umlauts in the OCR text (`fiir` instead of `für`)?** Your `langs`
   mixes two language models — pick the document's language alone with `L`
   (or set `langs = "deu"` in the config). Mixed-language OCR reliably garbles

@@ -417,8 +417,8 @@ mod tests {
                 click
             ));
             // Diagnostics never mouse-closes (accidental dismissal hurts):
-            // the user must close it with a key, which clears the
-            // auto-opened marker.
+            // the user must close it with a key. Closing does NOT clear the
+            // auto-opened marker (see handle_key above and App).
             assert!(handle_mouse(
                 &mut app,
                 &mut Overlay::Diagnostics { auto_opened: false },

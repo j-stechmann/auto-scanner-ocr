@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   action. Recovery clears the app-opened diagnostics screen by itself
   (user-opened ones stay), unlocks scanning, and fires a buffered scan
   intent; the status line reports what happened.
+- **Per-condition diagnostics auto-open**: after the user dismisses an
+  auto-opened diagnostics screen, the same ongoing condition does not
+  re-open it (no screen re-stealing) — but a NEW genuine failure (a
+  different check starts failing mid-session) is surfaced automatically
+  again, and a check that recovered and re-fails is surfaced too.
 
 ### Changed
 

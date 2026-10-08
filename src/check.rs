@@ -159,8 +159,11 @@ pub async fn run_checks(cfg: &Config) -> Report {
 /// [`run_checks`] labeled with an explicit source: the automatic
 /// no-scanner re-check runs the same suite but must not be told apart
 /// from a manual re-run by name alone — the TUI treats both as "newer
-/// than startup preflight", and only the automatic variant drives the
-/// countdown for dropping a buffered scan intent.
+/// than startup preflight". The source still matters for the exit-code
+/// verdict (only the startup final report decides it) and the stale-
+/// report rule; the buffered-scan drop countdown is driven by the TUI's
+/// failed-re-check counter, which counts every settled no-scanner
+/// report regardless of source.
 pub async fn run_checks_as(cfg: &Config, source: ReportSource) -> Report {
     let mut items = Vec::new();
 
