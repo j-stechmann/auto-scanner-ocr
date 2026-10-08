@@ -155,7 +155,11 @@ mid-pass.
 
 Exit code: `0` on a healthy session and also when quitting while the
 background scanner detection was still running (neutral); `1` only when the
-startup checks finished with failures or no scanner found.
+machine was still unhealthy at quit time (failed checks or no scanner).
+While no scanner is found, the app keeps re-checking in the background
+(every few seconds) — plug one in and it is picked up automatically: the
+error screen closes by itself and scanning unlocks. If a scanner arrives
+later and everything is healthy, a normal quit still exits `0`.
 
 ### Configuration
 
@@ -246,7 +250,9 @@ runs in an isolated child process.
 - The TUI runs the same checks at startup (in the background); if something
   is missing you'll see the diagnostics screen automatically instead of a
   mid-scan failure. The `r` re-run inside diagnostics is non-blocking — the
-  UI stays responsive while checks execute.
+  UI stays responsive while checks execute. A dismissed diagnostics screen
+  is not re-opened for the same ongoing problem, but a new, different one
+  (e.g. another tool disappears mid-session) pops it up again.
 - **Wrong umlauts in the OCR text (`fiir` instead of `für`)?** Your `langs`
   mixes two language models — pick the document's language alone with `L`
   (or set `langs = "deu"` in the config). Mixed-language OCR reliably garbles

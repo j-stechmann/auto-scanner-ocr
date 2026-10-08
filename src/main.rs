@@ -127,13 +127,7 @@ async fn async_tui(cfg: auto_scanner_ocr::config::Config) -> Result<i32> {
     let terminal = ratatui::try_init().context("initializing terminal")?;
     execute!(std::io::stdout(), EnableMouseCapture)?;
 
-    let init = tui::TuiInit {
-        cfg: cfg.clone(),
-        picker,
-        picker_available,
-        report_tx,
-        report_rx,
-    };
+    let init = tui::TuiInit::new(cfg.clone(), picker, picker_available, report_tx, report_rx);
 
     // One session actor, always spawned up front with an empty device; the
     // background detection delivers the resolved device via Cmd::SetDevice

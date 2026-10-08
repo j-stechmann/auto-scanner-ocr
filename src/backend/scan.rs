@@ -33,7 +33,7 @@ pub fn scanimage_mode(mode: &str) -> Option<&'static str> {
 }
 
 /// Parse `scanimage -L` output for ``device `name' is <label>`` lines
-/// (parity regex: device `([^']+)').
+/// (parity regex: ``device `([^']+)'``).
 pub fn parse_devices(out: &str) -> Vec<Device> {
     let re = Regex::new(r"device `([^']+)' (.*)").expect("static regex");
     out.lines()

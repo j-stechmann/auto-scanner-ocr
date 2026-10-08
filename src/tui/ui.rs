@@ -205,7 +205,7 @@ pub fn draw(
             // keeps, click outside dismisses (see the main branch below).
             let rect = match overlay {
                 Overlay::Help => draw_help(f, whole),
-                Overlay::Diagnostics => draw_diagnostics(f, app, whole),
+                Overlay::Diagnostics { .. } => draw_diagnostics(f, app, whole),
                 Overlay::LangPicker(picker) => draw_lang_picker(f, picker, whole),
                 Overlay::Confirm(confirm) => draw_confirm(f, confirm, whole),
             };
@@ -230,7 +230,7 @@ pub fn draw(
         // click outside dismisses); recomputed every frame like pane_rects.
         let rect = match overlay {
             Overlay::Help => draw_help(f, rects.whole),
-            Overlay::Diagnostics => draw_diagnostics(f, app, rects.whole),
+            Overlay::Diagnostics { .. } => draw_diagnostics(f, app, rects.whole),
             Overlay::LangPicker(picker) => draw_lang_picker(f, picker, rects.whole),
             Overlay::Confirm(confirm) => draw_confirm(f, confirm, rects.whole),
         };

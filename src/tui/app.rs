@@ -1,5 +1,6 @@
 //! TUI application state and event loop.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,6 +18,25 @@ use crate::check::{self, Report};
 use crate::config::{Config, PreviewOcr};
 use crate::notify::{self, Urgency};
 use crate::session::{self, Busy, Event, PageStatus, PageView, SessionMeta};
+
+/// Runs the full check suite, labeled with the given report source (the
+/// automatic re-check and the manual diagnostics re-run share this
+/// plumbing). A boxed async factory so it can be spawned per attempt.
+pub type CheckRunner = std::sync::Arc<
+    dyn Fn(
+            Config,
+            check::ReportSource,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Report> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The real runner (production): run the suite as configured.
+fn default_check_runner() -> CheckRunner {
+    std::sync::Arc::new(|cfg: Config, source| {
+        Box::pin(async move { check::run_checks_as(&cfg, source).await })
+    })
+}
 
 pub use super::editor::EditorRects;
 use super::editor::{self, ImageRect};
@@ -58,6 +78,18 @@ pub struct Settings {
     pub dpi: u16,
     pub mode: String,
 }
+
+/// Pause between automatic scanner re-checks. Detection itself dominates
+/// the cycle time (scanimage -L runs up to 30s); this only throttles the
+/// path where it fails instantly (e.g. a broken SANE config).
+const AUTO_REDETECT_PAUSE: Duration = Duration::from_secs(2);
+
+/// A buffered scan intent is dropped once this many checks fail AFTER it
+/// was buffered (its own grace period — see `pending_scan_anchor`): the
+/// "scanner appears on attempt N" scenario is bounded while the user
+/// keeps full feedback, including intents buffered after earlier checks
+/// already failed (those get a fresh grace period instead of none).
+const DROP_BUFFERED_SCAN_AFTER: u32 = 3;
 
 /// Top-level UI mode. The editor is a modal layer between the overlays
 /// (which always route first) and the main view.
@@ -121,6 +153,13 @@ pub struct App {
     /// A scan intent buffered while detection was still running; fired by
     /// the tick once the device is known (never re-fired afterwards).
     pub pending_scan: bool,
+    /// Value of `failed_rechecks` when the intent was buffered: the
+    /// drop-countdown is per-intent (attempts = current - anchor, see
+    /// `apply_report`), so an intent buffered long after the countdown
+    /// "ran out" gets its own full grace period instead of being kept
+    /// forever (or dropped instantly). None = no intent (or a legacy
+    /// direct set, which then counts from the current value).
+    pub pending_scan_anchor: Option<u32>,
     /// True while an async check run is in flight (guards double-`r`).
     pub checks_in_flight: bool,
     /// True once a manual diagnostics re-run's report has been applied.
@@ -128,6 +167,33 @@ pub struct App {
     /// data is strictly newer — and are ignored wholesale (see
     /// `apply_report`).
     pub rerun_seen: bool,
+    /// Consecutive settled check reports that found no scanner (startup
+    /// final + each automatic re-check + failed manual re-runs — a failed
+    /// detection is a failed detection, whatever triggered it); reset to
+    /// zero whenever a scanner is found. Feeds the per-intent drop
+    /// countdown (the countdown compares this counter against the value
+    /// at buffer time — see `pending_scan_anchor`).
+    pub failed_rechecks: u32,
+    /// The set of failing check names the diagnostics dialog has already
+    /// been auto-opened for and that the user has not seen resolved yet:
+    /// each name is added when the app auto-opens (auto-open adds ALL
+    /// currently failing names, since one dialog shows them together) and
+    /// removed only when a later report shows that check healthy.
+    ///
+    /// This replaces the old all-or-nothing sticky marker: the SAME
+    /// ongoing condition must not re-steal the screen on every automatic
+    /// re-check, but a NEW genuine failure (e.g. ocrmypdf disappears mid-
+    /// session) must be surfaced even if the user dismissed an earlier
+    /// auto-opened dialog. User-opened dialogs (`!`, `r`) never auto-
+    /// close; auto-close still requires an otherwise-healthy report.
+    pub surfaced_failures: BTreeSet<String>,
+    /// Earliest instant the automatic re-check may spawn the next
+    /// detection run (throttle for fast-failing scanimage -L, e.g. a
+    /// broken SANE config erroring out in milliseconds).
+    pub next_redetect_at: std::time::Instant,
+    /// Whether scanimage exists in PATH — the automatic re-check only
+    /// makes sense while it might find something (cached once).
+    pub scanimage_available: Option<bool>,
     pub langs_cache: Vec<String>,
     pub picker_available: bool,
     /// Pane geometry from the last frame (hit-testing + preview sync).
@@ -201,8 +267,13 @@ impl App {
             startup_report_ok: None,
             device_known: false,
             pending_scan: false,
+            pending_scan_anchor: None,
             checks_in_flight: false,
             rerun_seen: false,
+            failed_rechecks: 0,
+            surfaced_failures: BTreeSet::new(),
+            next_redetect_at: std::time::Instant::now() + AUTO_REDETECT_PAUSE,
+            scanimage_available: None,
             langs_cache: Vec::new(),
             picker_available: false,
             pane_rects: None,
@@ -463,6 +534,32 @@ pub struct TuiInit {
     /// too. One consumer branch keeps the ordering rules in one place.
     pub report_tx: mpsc::Sender<Report>,
     pub report_rx: mpsc::Receiver<Report>,
+    /// The check-suite runner (injectable for tests; production uses
+    /// `check::run_checks_as`). Shared by the manual diagnostics re-run
+    /// and the automatic scanner re-check.
+    #[allow(clippy::type_complexity)]
+    pub check_runner: CheckRunner,
+}
+
+impl TuiInit {
+    /// Production constructor: the default (real) check runner.
+    #[allow(clippy::type_complexity)]
+    pub fn new(
+        cfg: Config,
+        picker: ratatui_image::picker::Picker,
+        picker_available: bool,
+        report_tx: mpsc::Sender<Report>,
+        report_rx: mpsc::Receiver<Report>,
+    ) -> Self {
+        Self {
+            cfg,
+            picker,
+            picker_available,
+            report_tx,
+            report_rx,
+            check_runner: default_check_runner(),
+        }
+    }
 }
 
 pub async fn run_tui(
@@ -477,6 +574,7 @@ pub async fn run_tui(
         picker_available,
         report_tx,
         report_rx,
+        check_runner,
     } = init;
     let mut report_rx = report_rx;
     let (diag_tx, mut diag_rx) = mpsc::channel::<()>(4);
@@ -555,24 +653,26 @@ pub async fn run_tui(
                 if !app.checks_in_flight {
                     app.checks_in_flight = true;
                     app.set_status("re-running checks...");
-                    let cfg = app.cfg.clone();
-                    let report_tx = report_tx.clone();
-                    tokio::spawn(async move {
-                        let report = check::run_checks(&cfg).await;
-                        let _ = report_tx.send(report).await;
-                    });
+                    maybe_run_checks(
+                        &mut app,
+                        &report_tx,
+                        &check_runner,
+                        check::ReportSource::ReRun,
+                    );
                 }
             }
             // System save-dialog result for the finish flow (f key).
             Some(chosen) = finish_rx.recv() => {
                 handle_dialog_result(&mut app, chosen, &cmd_tx).await;
             }
-            // Periodic tick: elapsed timers, spinner frames, and the lazy
-            // preview-OCR request for the selected page.
+            // Periodic tick: elapsed timers, spinner frames, the lazy
+            // preview-OCR request for the selected page and the automatic
+            // scanner re-check while no scanner is present.
             _ = tick.tick() => {
                 app.tick = app.tick.wrapping_add(1);
                 fire_pending_scan(&mut app, &cmd_tx).await;
                 request_text_if_needed(&app, &cmd_tx).await;
+                maybe_auto_redetect(&mut app, &report_tx, &check_runner).await;
             }
         }
 
@@ -707,29 +807,47 @@ async fn handle_session_event(app: &mut App, ev: Event) {
     }
 }
 
-/// A report arrived (startup fast/final or a manual diagnostics re-run).
-/// Ordering matters: store -> header label -> actor device -> exit-code
-/// flag -> auto-open overlay -> fire a buffered scan.
+/// A report arrived (startup fast/final, a manual diagnostics re-run, or
+/// an automatic no-scanner re-check). Ordering matters: store -> header
+/// label -> actor device -> exit-code flag -> auto-open overlay -> fire a
+/// buffered scan.
 ///
-/// Staleness rule: a manual re-run is strictly newer than anything the
-/// startup preflight produced (it re-checks the same environment later).
-/// So once a re-run report has been applied, a later-arriving startup
-/// report (e.g. a slow startup `scanimage -L` final landing after the
-/// re-run delivered its device) is out-of-order and ignored wholesale —
-/// otherwise it could clobber `device_known`, re-lock scanning and drop
-/// a buffered scan on a healthy machine. Re-run reports never arrive out
-/// of order among themselves: `checks_in_flight` serializes them.
+/// Staleness rule: a manual re-run or automatic re-check is strictly
+/// newer than anything the startup preflight produced (it re-checks the
+/// same environment later). So once one of those has been applied, a
+/// later-arriving startup report (e.g. a slow startup `scanimage -L`
+/// final landing after the re-run delivered its device) is out-of-order
+/// and ignored wholesale — otherwise it could clobber `device_known`,
+/// re-lock scanning and drop a buffered scan on a healthy machine.
+/// Re-run/re-check reports never arrive out of order among themselves:
+/// `checks_in_flight` serializes them (the automatic re-check's next
+/// attempt waits for both the report AND the in-flight guard).
 ///
 /// Exit-code exception: if the verdict is still undecided and a stale
 /// StartupFinal is dropped, the re-run's data decides it instead — the
 /// machine state it measured IS the startup outcome by then. Without
 /// this, a quit after both startup detection and re-run failed would
 /// exit 0 (neutral) instead of 1.
+///
+/// Recovery: the verdict may also flip from Some(false) to Some(true)
+/// after the fact — a scanner plugged in later (automatic re-check or
+/// manual `r`) with no other failing checks means quitting normally
+/// should exit 0, not 1. The initial decision keeps its startup
+/// semantics (failed startup = exit 1) until recovery actually happens.
+///
+/// Auto-open policy: each distinct failure condition (failing check name)
+/// auto-opens the diagnostics dialog exactly once. A dismissed dialog is
+/// not re-stolen by the SAME ongoing condition (automatic re-checks keep
+/// the screen clear), but a NEW failure is always surfaced, even if the
+/// user dismissed an earlier auto-opened one. Checks that become healthy
+/// are unmarked (re-failing them later auto-opens again). User-opened
+/// dialogs (`!`, `r`) are never auto-closed; auto-close additionally
+/// requires an otherwise-healthy report (see below).
 async fn apply_report(app: &mut App, report: Report, cmd_tx: &mpsc::Sender<session::Cmd>) {
     let settled = report.settled();
     let device = report.device.clone();
     let source = report.source;
-    if source == check::ReportSource::ReRun {
+    if source != check::ReportSource::StartupFast && source != check::ReportSource::StartupFinal {
         app.checks_in_flight = false;
         app.rerun_seen = true;
     } else if app.rerun_seen {
@@ -749,51 +867,156 @@ async fn apply_report(app: &mut App, report: Report, cmd_tx: &mpsc::Sender<sessi
         // binaries etc.) are worth surfacing immediately, but never steal
         // focus from a dialog the user opened meanwhile.
         if !app.report.as_ref().is_some_and(|r| r.ok()) && app.overlay.is_none() {
-            app.overlay = Some(Overlay::Diagnostics);
+            auto_open_diagnostics(app);
         }
         return;
     }
 
     // Final/settled report: the scanner question is answered.
     if let Some(d) = &device {
+        app.failed_rechecks = 0;
         app.device_label = check::device_label(Some(d));
         app.device_known = true;
+        // Recovery: if startup had failed (e.g. no scanner at launch) and
+        // the machine is healthy NOW, a normal quit should exit 0. Any
+        // later healthy report (re-run or automatic re-check) may upgrade
+        // a decided-failure verdict; it never downgrades Some(true).
+        if app.startup_report_ok == Some(false) && app.report.as_ref().is_some_and(|r| r.ok()) {
+            app.startup_report_ok = Some(true);
+            app.set_status("scanner recovered - exit code will be 0");
+        }
+        if app.report.as_ref().is_some_and(|r| r.ok()) {
+            // Full recovery: auto-close only targets the dialog the APP
+            // auto-opened (its own `auto_opened` flag); user-opened ones
+            // stay.
+            if matches!(
+                app.overlay,
+                Some(Overlay::Diagnostics { auto_opened: true })
+            ) {
+                app.overlay = None;
+            }
+            app.set_status(format!(
+                "scanner found: {} - starting up",
+                check::device_label(Some(d))
+            ));
+        }
         // Delivery to the actor (it ignores empty/duplicate names).
         let _ = cmd_tx.send(session::Cmd::SetDevice(d.name.clone())).await;
     } else {
         app.device_label = "no scanner".to_string();
         app.device_known = false;
+        app.failed_rechecks = app.failed_rechecks.saturating_add(1);
     }
+
+    // Resolve surfaced conditions: a settled report answers ALL check
+    // questions (the scanner one included), so each condition that is
+    // over — its check healthy again, or the scanner found — is unmarked
+    // and a LATER re-failure can auto-open again. The retain also covers
+    // a partly recovered report (scanner arrives while other checks still
+    // fail): only the resolved condition is unmarked then.
+    app.surfaced_failures.retain(|name| {
+        failing_names(app.report.as_ref().unwrap()).contains(&name.as_str())
+            || (name == SCANNER_ITEM && device.is_none())
+    });
 
     // Startup exit-code semantics: the verdict starts as None (quit while
     // still detecting -> neutral exit 0) and is decided exactly once, by
     // the startup final report: ok (device + no failures) -> Some(true),
-    // else Some(false). Manual re-runs and fast reports never touch it.
+    // else Some(false). Manual re-runs and fast reports never touch it
+    // (the recovery upgrade above happens after the decision).
     if app.startup_report_ok.is_none() && source == check::ReportSource::StartupFinal {
         app.startup_report_ok =
             Some(device.is_some() && app.report.as_ref().is_some_and(|r| r.ok()));
     }
 
-    // Auto-open diagnostics on failure (final reports AND fast reports
-    // with real fails), guarded so a user-opened overlay is preserved.
-    if !app.report.as_ref().is_some_and(|r| r.ok()) && app.overlay.is_none() {
-        app.overlay = Some(Overlay::Diagnostics);
+    // Auto-open diagnostics for failures (final reports AND fast reports
+    // with real fails): once per distinct failing check — a dismissed
+    // dialog is not re-stolen by the same ongoing condition, but a NEW
+    // failure is always surfaced (see the function doc).
+    if !app.report.as_ref().is_some_and(|r| r.ok())
+        && app.overlay.is_none()
+        && failing_names(app.report.as_ref().unwrap())
+            .iter()
+            .any(|name| !app.surfaced_failures.contains(*name))
+    {
+        auto_open_diagnostics(app);
         if device.is_none() {
             app.set_status("no scanner found - see diagnostics (press ! to reopen)");
         }
     }
 
-    // A scan intent buffered during detection: fire it now that the device
-    // is known, or drop it with a hint when detection found nothing.
-    if app.pending_scan {
-        if device.is_some() {
-            app.set_status("scanner ready - starting buffered scan");
-            // The tick fires it (re-checks guards); keep the buffer set.
-        } else {
-            app.pending_scan = false;
-            app.set_status("no scanner found - buffered scan dropped");
+    // A scan intent buffered during detection: fired by the tick the
+    // moment a device arrives. While the scanner is missing, the
+    // automatic re-checks keep it buffered for a few attempts before
+    // giving up (see DROP_BUFFERED_SCAN_AFTER) so the intent isn't lost
+    // to a single flaky detection run.
+    //
+    // The countdown is per-intent: anchored to the counter AT buffer time
+    // (`s` press). Otherwise an intent buffered while the counter was
+    // already at or past the threshold would be kept forever (the Greater
+    // branch would drop nothing, contradicting the documented bound) —
+    // each new intent gets its own full grace period.
+    if app.pending_scan && device.is_none() {
+        if app.pending_scan_anchor.is_none() {
+            app.pending_scan_anchor = Some(app.failed_rechecks.saturating_sub(1));
+        }
+        let attempts = app
+            .failed_rechecks
+            .saturating_sub(app.pending_scan_anchor.unwrap_or_default())
+            .max(1);
+        match attempts.cmp(&DROP_BUFFERED_SCAN_AFTER) {
+            std::cmp::Ordering::Less => {
+                app.set_status(format!(
+                    "still no scanner (check {attempts}) - scan stays buffered"
+                ));
+            }
+            _ => {
+                // Threshold reached: drop the intent (silently on later
+                // failing reports — the drop happened once).
+                app.pending_scan = false;
+                app.pending_scan_anchor = None;
+                if attempts == DROP_BUFFERED_SCAN_AFTER {
+                    app.set_status(format!(
+                        "no scanner found after {DROP_BUFFERED_SCAN_AFTER} checks - buffered scan dropped"
+                    ));
+                }
+            }
         }
     }
+}
+
+/// The `what` name of the scanner-detection item (dedicated status line +
+/// header label handling; the only check that is not binary presence).
+const SCANNER_ITEM: &str = "scanner";
+
+/// Names of the report's failing checks (`Status::Fail`), used as the
+/// identity of distinct failure conditions for auto-open tracking.
+fn failing_names(report: &Report) -> Vec<&str> {
+    report
+        .items
+        .iter()
+        .filter(|i| i.status == check::Status::Fail)
+        .map(|i| i.what.as_str())
+        .collect()
+}
+
+/// Auto-open the (still-absent) diagnostics dialog and mark every
+/// currently failing check as surfaced: one dialog shows all of them
+/// together, so a repeat report of the same condition must not re-open
+/// (the screen must not be re-stolen) — while each check is unmarked on
+/// recovery, so a NEW failure always auto-opens (see `apply_report`).
+fn auto_open_diagnostics(app: &mut App) {
+    let report = app.report.as_ref().expect("stored report");
+    for name in failing_names(report) {
+        app.surfaced_failures.insert(name.to_string());
+    }
+    if report.device.is_none() && report.settled() {
+        // The scanner question was answered with "no" — treat the absent
+        // device as a surfaced condition too (it may have no Fail item,
+        // but it is exactly what the dialog is about).
+        app.surfaced_failures.insert(SCANNER_ITEM.to_string());
+    }
+    app.overlay = Some(Overlay::Diagnostics { auto_opened: true });
 }
 
 /// Tick-driven buffered-scan fire: self-healing (unlike an event-triggered
@@ -803,9 +1026,80 @@ async fn fire_pending_scan(app: &mut App, cmd_tx: &mpsc::Sender<session::Cmd>) {
         return;
     }
     app.pending_scan = false;
+    app.pending_scan_anchor = None;
     let dpi = app.settings.dpi;
     let mode = app.settings.mode.clone();
     let _ = cmd_tx.send(session::Cmd::ScanNext { dpi, mode }).await;
+}
+
+/// Arm/spawn helper shared by the manual diagnostics re-run and the
+/// automatic re-check: requires the caller to have armed
+/// `checks_in_flight`, spawns the suite in the background and routes the
+/// report through `report_tx` (never awaited in the select loop).
+fn maybe_run_checks(
+    app: &mut App,
+    report_tx: &mpsc::Sender<Report>,
+    runner: &CheckRunner,
+    source: check::ReportSource,
+) {
+    let cfg = app.cfg.clone();
+    let runner = runner.clone();
+    let report_tx = report_tx.clone();
+    tokio::spawn(async move {
+        let report = runner(cfg, source).await;
+        let _ = report_tx.send(report).await;
+    });
+}
+
+/// Tick-driven automatic scanner re-check: while the (settled) stored
+/// report says "no device", run the full check suite again in the
+/// background so a scanner plugged in later is picked up without user
+/// action. Self-heals like the buffered-scan fire: only the tick spawns,
+/// and it is naturally serialized by `checks_in_flight` (the next attempt
+/// waits for the previous report + a short pause).
+///
+/// Stopped by: a scanner arriving (device_known), a manual re-run owning
+/// the in-flight guard, or `scanimage` not being in PATH at all (re-runs
+/// cannot discover anything then; the diagnostics stay open with the
+/// install hint).
+async fn maybe_auto_redetect(
+    app: &mut App,
+    report_tx: &mpsc::Sender<Report>,
+    runner: &CheckRunner,
+) {
+    if app.device_known
+        || app.checks_in_flight
+        || !app
+            .report
+            .as_ref()
+            .is_some_and(|r| r.settled() && r.device.is_none())
+        || app.scanimage_available == Some(false)
+        || std::time::Instant::now() < app.next_redetect_at
+    {
+        return;
+    }
+    app.checks_in_flight = true;
+    app.next_redetect_at = std::time::Instant::now() + AUTO_REDETECT_PAUSE;
+    // First tick that passes the guards decides whether re-checks can
+    // find anything at all: without scanimage in PATH no report can ever
+    // deliver a device, so stop before announcing a re-check that will
+    // never happen.
+    if app.scanimage_available.is_none() {
+        app.scanimage_available = Some(crate::backend::which("scanimage").is_some());
+        if app.scanimage_available == Some(false) {
+            app.checks_in_flight = false;
+            app.set_status("scanimage not in PATH - automatic re-check disabled");
+            return;
+        }
+    }
+    app.set_status("no scanner yet - looking again...");
+    let runner = runner.clone();
+    let report_tx = report_tx.clone();
+    let cfg = app.cfg.clone();
+    tokio::spawn(async move {
+        let report = runner(cfg, check::ReportSource::AutoRecheck).await;
+        let _ = report_tx.send(report).await;
+    });
 }
 
 /// Per-frame editor reconcile: point the worker at the pinned page's
@@ -938,7 +1232,7 @@ async fn handle_key(
             app.overlay = Some(Overlay::Help);
         }
         Char('!') => {
-            app.overlay = Some(Overlay::Diagnostics);
+            app.overlay = Some(Overlay::diagnostics_user());
         }
         Char('q') => return UiAction::Quit,
         Tab => {
@@ -959,6 +1253,7 @@ async fn handle_key(
                 // tick once the device arrives) instead of a doomed scan.
                 if !app.pending_scan {
                     app.pending_scan = true;
+                    app.pending_scan_anchor = Some(app.failed_rechecks);
                     app.set_status("waiting for scanner - scan will start when detected");
                 }
             } else if app.busy() == Busy::Finishing {
@@ -1612,11 +1907,19 @@ mod tests {
         );
     }
 
-    /// App with throwaway channels; meta/pages are set per-test.
+    /// App with throwaway channels; meta/pages are set per-test. The
+    /// automatic re-check timer is armed immediately so tick-driven tests
+    /// don't have to model the 2s throttle, and `scanimage_available` is
+    /// pre-seeded so tests don't depend on the running machine's PATH
+    /// (CI has no scanimage — the lazy `which()` probe would disable the
+    /// re-check there and spawn-less assertions would fail).
     fn test_app() -> App {
         let (diag_tx, _diag_rx) = mpsc::channel(4);
         let (finish_tx, _finish_rx) = mpsc::channel(1);
-        App::new(Config::default(), diag_tx, finish_tx)
+        let mut app = App::new(Config::default(), diag_tx, finish_tx);
+        app.next_redetect_at = std::time::Instant::now();
+        app.scanimage_available = Some(true);
+        app
     }
 
     fn ready_page(id: u32) -> PageView {
@@ -1752,6 +2055,22 @@ mod tests {
         r
     }
 
+    /// A CheckRunner whose report is pre-baked: `finds` delivers a healthy
+    /// scanner (Status Ok + device), `!finds` a failed empty one. Lets the
+    /// tick-driven re-check tests run without spawning scanimage.
+    fn fake_runner(finds: bool) -> crate::tui::CheckRunner {
+        std::sync::Arc::new(move |_cfg: Config, source: crate::check::ReportSource| {
+            let report = if finds {
+                report_with(Some(device("hpaio:/usb/fake")), crate::check::Status::Ok)
+            } else {
+                report_with(None, crate::check::Status::Fail)
+            };
+            let report = Report { source, ..report };
+            Box::pin(async move { report })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Report> + Send>>
+        })
+    }
+
     #[tokio::test]
     async fn report_arrival_sets_device_and_exit_flag() {
         let mut app = test_app();
@@ -1786,8 +2105,9 @@ mod tests {
         }
     }
 
-    /// A failing startup report (e.g. no scanner) decides the verdict as
-    /// Some(false) -> exit 1; quit-during-detection (None) stays neutral.
+    /// A failed startup report (e.g. no scanner) decides the verdict as
+    /// Some(false) -> exit 1 initially; quitting during detection (None)
+    /// stays neutral.
     #[tokio::test]
     async fn failed_startup_report_sets_failing_verdict() {
         let mut app = test_app();
@@ -1799,16 +2119,21 @@ mod tests {
         .await;
         assert_eq!(app.startup_report_ok, Some(false));
 
-        // A later report must not flip the decided verdict; in reality a
-        // late plug-in arrives via a ReRun report, which never touches the
-        // flag. (The is_none() guard holds for any source.)
+        // A later report must not flip the decided verdict... except that
+        // recovery DOES upgrade it now (see rerun_recovery_upgrades_verdict
+        // and auto_recheck_recovery*: a healthy later report means a normal
+        // quit exits 0).
         apply_report(
             &mut app,
             report_with(Some(device("hpaio:/usb/x")), crate::check::Status::Ok),
             &mpsc::channel(1).0,
         )
         .await;
-        assert_eq!(app.startup_report_ok, Some(false));
+        assert_eq!(
+            app.startup_report_ok,
+            Some(true),
+            "later healthy report upgrades the verdict (recovery)"
+        );
     }
 
     #[tokio::test]
@@ -1868,18 +2193,594 @@ mod tests {
         }
     }
 
+    /// With automatic re-checks the buffered intent is NOT dropped on the
+    /// first failed startup detection: the tick keeps re-checking and the
+    /// intent fires the moment a scanner appears.
     #[tokio::test]
-    async fn buffered_scan_dropped_when_detection_fails() {
+    async fn buffered_scan_survives_failed_startup_detection() {
         let mut app = test_app();
-        app.pending_scan = true;
+        let (report_tx, mut report_rx) = mpsc::channel(8);
         apply_report(
             &mut app,
             report_with(None, crate::check::Status::Fail),
             &mpsc::channel(1).0,
         )
         .await;
-        assert!(!app.pending_scan, "no device -> buffered intent dropped");
+        app.pending_scan = true;
+        // The tick's spawn path: guards pass (failed settled report, no
+        // device yet), re-check armed. The fake runner "finds" the scanner
+        // (any healthy device report) instantly.
+        maybe_auto_redetect(&mut app, &report_tx, &fake_runner(true)).await;
+        assert!(app.checks_in_flight, "re-check in flight");
+        // The re-check finds the scanner: device delivered and the
+        // buffered intent fires on the next tick.
+        let report = report_rx.recv().await.expect("re-check report");
+        apply_report(&mut app, report, &mpsc::channel(1).0).await;
+        assert!(app.device_known, "scanner found by the re-check");
+        assert!(app.pending_scan, "buffered intent survives");
+        fire_pending_scan(&mut app, &mpsc::channel(8).0).await;
+        assert!(!app.pending_scan, "tick fired the buffered scan");
+    }
+
+    /// The buffered intent is not kept forever: it is dropped once 3
+    /// failed checks have occurred AFTER it was buffered (its own grace
+    /// period). Here it was pressed after the startup failure, so re-check
+    /// failures 1-2 keep it and the 3rd drops it.
+    #[tokio::test]
+    async fn buffered_scan_dropped_after_three_failed_checks() {
+        let mut app = test_app();
+        // 1st check: startup final fail.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        app.pending_scan = true;
+        app.pending_scan_anchor = Some(app.failed_rechecks);
+        // 2nd check: automatic re-check also fails (1st after buffering).
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            app.pending_scan,
+            "1 failed check after buffering keeps the intent"
+        );
+        // 3rd check: fails too (2nd after buffering) -> still kept.
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(app.pending_scan, "2 failed checks keep the intent");
         assert!(!app.device_known);
+        // 4th check: 3rd failure after buffering -> drop.
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(!app.pending_scan, "3 failed checks -> intent dropped");
+        assert_eq!(app.pending_scan_anchor, None);
+    }
+
+    /// The failed-recheck counter counts EVERY settled no-scanner report,
+    /// including a failed MANUAL re-run: a failed detection is a failed
+    /// detection, whatever triggered it (docs pinned; manual `r` advances
+    /// the per-intent drop countdown the same way an automatic re-check).
+    #[tokio::test]
+    async fn failed_manual_rerun_counts_toward_drop_countdown() {
+        let mut app = test_app();
+        // 1st check: startup final fail.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        app.pending_scan = true;
+        app.pending_scan_anchor = Some(app.failed_rechecks);
+        // 2nd check: a FAILED manual re-run (user pressed `r`, nothing
+        // found) — counted like an automatic re-check.
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::ReRun,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert_eq!(
+            app.failed_rechecks, 2,
+            "failed manual re-run advances the counter"
+        );
+        assert!(app.pending_scan, "1 failed check after buffering keeps it");
+        // 3rd + 4th checks (automatic): the 3rd failure after buffering
+        // drops the intent.
+        for expected in [2, 3] {
+            apply_report(
+                &mut app,
+                report_with_source(
+                    None,
+                    crate::check::Status::Fail,
+                    crate::check::ReportSource::AutoRecheck,
+                ),
+                &mpsc::channel(1).0,
+            )
+            .await;
+            assert_eq!(app.failed_rechecks, 1 + expected);
+        }
+        assert!(!app.pending_scan, "3 failed checks -> intent dropped");
+    }
+
+    /// An intent buffered while the global counter is ALREADY past the
+    /// threshold (the machine has been scanner-less for a while) still
+    /// gets its own full grace period instead of being kept forever.
+    #[tokio::test]
+    async fn intent_buffered_after_countdown_ran_out_gets_fresh_grace() {
+        let mut app = test_app();
+        // Scanner-less for a while: startup + 3 re-checks failed.
+        for _ in 0..4 {
+            apply_report(
+                &mut app,
+                report_with_source(
+                    None,
+                    crate::check::Status::Fail,
+                    crate::check::ReportSource::AutoRecheck,
+                ),
+                &mpsc::channel(1).0,
+            )
+            .await;
+        }
+        assert_eq!(app.failed_rechecks, 4);
+        // The user buffers an intent NOW (old behavior: kept forever).
+        app.pending_scan = true;
+        app.pending_scan_anchor = Some(app.failed_rechecks);
+        // Three more failed re-checks pass without a drop...
+        for n in 1..=2 {
+            apply_report(
+                &mut app,
+                report_with_source(
+                    None,
+                    crate::check::Status::Fail,
+                    crate::check::ReportSource::AutoRecheck,
+                ),
+                &mpsc::channel(1).0,
+            )
+            .await;
+            assert!(
+                app.pending_scan,
+                "intent survives failed check {n} of its own grace period"
+            );
+        }
+        // ...the third one after buffering drops it.
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(!app.pending_scan, "fresh grace period ran out -> dropped");
+    }
+
+    /// An arriving AutoRecheck report is treated as a (manual-style)
+    /// re-run: it clears the in-flight guard so the next re-check can go
+    /// out, without touching the startup exit verdict.
+    #[tokio::test]
+    async fn auto_recheck_report_clears_in_flight_guard() {
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            !app.checks_in_flight,
+            "auto-recheck arrival clears the guard"
+        );
+        assert_eq!(
+            app.startup_report_ok, None,
+            "auto re-check must not set the startup flag"
+        );
+        assert_eq!(app.failed_rechecks, 1, "counted as a failed check");
+    }
+
+    /// A scanner arriving via the automatic re-check recovers the session:
+    /// device delivered, scanning unlocked, verdict upgraded to exit 0,
+    /// and the app-opened diagnostics dialog auto-closed.
+    #[tokio::test]
+    async fn auto_recheck_recovery_delivers_device_and_closes_dialog() {
+        let mut app = test_app();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+
+        // Startup: no scanner -> verdict Some(false), app-opened dialog.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &cmd_tx,
+        )
+        .await;
+        assert_eq!(app.startup_report_ok, Some(false));
+        assert!(
+            app.surfaced_failures.contains(SCANNER_ITEM),
+            "the absent scanner is tracked as a surfaced condition"
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Diagnostics { .. })));
+
+        // The scanner is plugged in; the automatic re-check finds it.
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Ok,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &cmd_tx,
+        )
+        .await;
+        assert!(app.device_known, "device known after recovery");
+        assert!(app.scan_allowed(), "scanning unlocked");
+        assert_eq!(
+            app.startup_report_ok,
+            Some(true),
+            "verdict upgraded: a later normal quit exits 0"
+        );
+        assert!(
+            app.overlay.is_none(),
+            "app-opened diagnostics auto-closed on recovery"
+        );
+        assert!(
+            app.surfaced_failures.is_empty(),
+            "recovery unmarks the surfaced conditions"
+        );
+        match cmd_rx.try_recv() {
+            Ok(session::Cmd::SetDevice(name)) => assert_eq!(name, "hpaio:/usb/x"),
+            other => panic!("expected SetDevice from re-check, got {other:?}"),
+        }
+    }
+
+    /// Auto-close is reserved for the APP-opened dialog and requires an
+    /// otherwise-healthy report: a user-opened dialog stays open, and a
+    /// recovery report with OTHER failing checks keeps it open too.
+    #[tokio::test]
+    async fn diagnostics_stays_open_for_user_dialog_or_other_failures() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+
+        // User-opened dialog (the ! key) with a user-opened marker.
+        let mut app = test_app();
+        app.overlay = Some(Overlay::diagnostics_user());
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Ok,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &cmd_tx,
+        )
+        .await;
+        assert!(
+            matches!(app.overlay, Some(Overlay::Diagnostics { .. })),
+            "user-opened dialog must not auto-close"
+        );
+
+        // App-opened dialog, but other checks still fail -> stays open.
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Diagnostics { auto_opened: true });
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Fail, // e.g. missing ocrmypdf
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &cmd_tx,
+        )
+        .await;
+        assert!(
+            matches!(app.overlay, Some(Overlay::Diagnostics { .. })),
+            "dialog with remaining failures must stay open"
+        );
+        assert!(app.device_known, "but the device still arrives");
+    }
+
+    /// The app-opened dialog is only auto-closed, never re-opened: after
+    /// the user closes it, later automatic re-checks reporting the SAME
+    /// condition must keep the screen clear (status-line hints only).
+    #[tokio::test]
+    async fn user_closed_auto_dialog_is_not_reopened() {
+        let mut app = test_app();
+
+        // Startup failure auto-opens the dialog.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(app.overlay.is_some());
+
+        // The user closes it (Esc) — via the overlay key handler so the
+        // marker-clearing path runs exactly as in production.
+        let mut overlay = app.overlay.take().expect("dialog open");
+        assert!(
+            !overlays::handle_key(
+                &mut app,
+                &mut overlay,
+                ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Esc),
+                &mpsc::channel(1).0,
+            )
+            .await,
+            "Esc closes diagnostics"
+        );
+        assert!(app.overlay.is_none());
+
+        // Later failing automatic re-checks must NOT re-steal the screen.
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            app.overlay.is_none(),
+            "auto re-checks must not reopen a user-closed dialog"
+        );
+        assert!(!app.device_known);
+    }
+
+    /// A NEW genuine failure must be surfaced even after the user dismissed
+    /// an earlier auto-opened dialog (no recovery in between): the same
+    /// ongoing condition stays silent, but a distinct failing check
+    /// (e.g. ocrmypdf disappears mid-session) auto-opens the dialog again.
+    #[tokio::test]
+    async fn new_different_failure_reopens_dialog_after_dismissal() {
+        let mut app = test_app();
+
+        // Startup failure auto-opens the dialog; the user closes it.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(app.overlay.take().is_some());
+
+        // The same ongoing condition (still no scanner) stays silent.
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            app.overlay.is_none(),
+            "same condition must not re-steal the screen"
+        );
+
+        // A different condition fails (e.g. ocrmypdf was uninstalled):
+        // that new failure MUST be surfaced.
+        let mut r = report_with_source(
+            None,
+            crate::check::Status::Fail,
+            crate::check::ReportSource::AutoRecheck,
+        );
+        r.items.push(crate::check::CheckItem {
+            what: "ocrmypdf (OCRmyPDF (searchable PDFs))".into(),
+            status: crate::check::Status::Fail,
+            detail: String::new(),
+            hint: Some("install it".into()),
+            pending_detail: None,
+        });
+        apply_report(&mut app, r, &mpsc::channel(1).0).await;
+        assert!(
+            matches!(app.overlay, Some(Overlay::Diagnostics { .. })),
+            "a NEW distinct failure must auto-open the dialog"
+        );
+
+        // And it stays silent on the next report of that same condition.
+        let mut again = report_with_source(
+            None,
+            crate::check::Status::Fail,
+            crate::check::ReportSource::AutoRecheck,
+        );
+        again.items.push(crate::check::CheckItem {
+            what: "ocrmypdf (OCRmyPDF (searchable PDFs))".into(),
+            status: crate::check::Status::Fail,
+            detail: String::new(),
+            hint: Some("install it".into()),
+            pending_detail: None,
+        });
+        app.overlay = None;
+        apply_report(&mut app, again, &mpsc::channel(1).0).await;
+        assert!(
+            app.overlay.is_none(),
+            "the now-surfaced condition must not re-open"
+        );
+    }
+
+    /// The surface tracking resets when the condition RESOLVES, even if
+    /// the dialog was already dismissed: close -> recovery (overlay is
+    /// None) -> markers cleared -> a LATER failure may auto-open again.
+    /// (Bug regression: the marker used to stay set forever if the user
+    /// closed the dialog before recovery, silencing all future auto-opens.)
+    #[tokio::test]
+    async fn marker_resets_on_recovery_even_after_dialog_dismissed() {
+        let mut app = test_app();
+
+        // Startup failure auto-opens the dialog; the user closes it.
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(app.overlay.take().is_some());
+
+        // Recovery arrives with NO dialog open (the old bug skipped the
+        // reset here): the marker must still clear.
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Ok,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            app.surfaced_failures.is_empty(),
+            "markers cleared on recovery"
+        );
+
+        // A later failure may auto-open again.
+        apply_report(
+            &mut app,
+            report_with_source(
+                None,
+                crate::check::Status::Fail,
+                crate::check::ReportSource::AutoRecheck,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert!(
+            matches!(app.overlay, Some(Overlay::Diagnostics { .. })),
+            "new failure auto-opens after a resolved+refailed cycle"
+        );
+    }
+
+    /// A failed startup verdict followed by a failed manual re-run keeps
+    /// exit 1 (recovery only upgrades), and the manual re-run's recovery
+    /// ALSO upgrades a decided failure (same rule as automatic re-checks).
+    #[tokio::test]
+    async fn rerun_recovery_upgrades_verdict() {
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert_eq!(app.startup_report_ok, Some(false));
+
+        apply_report(
+            &mut app,
+            report_with_source(
+                Some(device("hpaio:/usb/x")),
+                crate::check::Status::Ok,
+                crate::check::ReportSource::ReRun,
+            ),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        assert_eq!(
+            app.startup_report_ok,
+            Some(true),
+            "manual re-run recovery upgrades too"
+        );
+    }
+
+    /// The tick path spawns at most one re-check: with one already in
+    /// flight (or a device known) no second spawns.
+    #[tokio::test]
+    async fn auto_redetect_guards() {
+        let (report_tx, _report_rx) = mpsc::channel(8);
+
+        // Device known: never.
+        let mut app = test_app();
+        app.device_known = true;
+        maybe_auto_redetect(&mut app, &report_tx, &default_check_runner()).await;
+        assert!(!app.checks_in_flight, "no spawn when device is known");
+
+        // Report not settled (still detecting): never.
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Pending),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        maybe_auto_redetect(&mut app, &report_tx, &default_check_runner()).await;
+        assert!(
+            !app.checks_in_flight,
+            "no spawn while startup detection is running"
+        );
+
+        // Healthy report (device present): never.
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with(Some(device("hpaio:/x")), crate::check::Status::Ok),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        maybe_auto_redetect(&mut app, &report_tx, &default_check_runner()).await;
+        assert!(!app.checks_in_flight, "no spawn on a healthy report");
+
+        // Failed settled report without device: spawn.
+        let mut app = test_app();
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        maybe_auto_redetect(&mut app, &report_tx, &default_check_runner()).await;
+        assert!(app.checks_in_flight, "re-check spawned while no scanner");
+
+        // In-flight guard: no second spawn.
+        maybe_auto_redetect(&mut app, &report_tx, &default_check_runner()).await;
+        assert!(app.checks_in_flight, "guard still armed (one at a time)");
+
+        // scanimage absent: spawn suppressed (flag cached on first call).
+        let mut app = test_app();
+        app.scanimage_available = Some(false);
+        apply_report(
+            &mut app,
+            report_with(None, crate::check::Status::Fail),
+            &mpsc::channel(1).0,
+        )
+        .await;
+        maybe_auto_redetect(&mut app, &report_tx, &default_check_runner()).await;
+        assert!(!app.checks_in_flight, "no spawn without scanimage");
     }
 
     #[tokio::test]
