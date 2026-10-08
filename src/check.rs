@@ -44,9 +44,9 @@ pub struct CheckItem {
     pub pending_detail: Option<String>,
 }
 
-/// Where a report came from. The TUI branches on this: only a manual
-/// re-run clears `checks_in_flight`, and only the startup final report
-/// may set the exit-code flag.
+/// Where a report came from. The TUI branches on this: a manual re-run
+/// or an automatic re-check clears `checks_in_flight`, and only the
+/// startup final report may initially set the exit-code flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReportSource {
     /// TUI startup: fast preflight half (scanner item still Pending).
@@ -56,6 +56,9 @@ pub enum ReportSource {
     StartupFinal,
     /// Manual diagnostics re-run from the overlay.
     ReRun,
+    /// Automatic re-check while no scanner is present (the TUI keeps
+    /// looking for a plugged-in scanner without user action).
+    AutoRecheck,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -150,6 +153,18 @@ fn hint_for(bin: &str) -> Option<&'static str> {
 /// scanner matched): manual re-runs rely on it to re-deliver the device
 /// to the actor.
 pub async fn run_checks(cfg: &Config) -> Report {
+    run_checks_as(cfg, ReportSource::ReRun).await
+}
+
+/// [`run_checks`] labeled with an explicit source: the automatic
+/// no-scanner re-check runs the same suite but must not be told apart
+/// from a manual re-run by name alone — the TUI treats both as "newer
+/// than startup preflight". The source still matters for the exit-code
+/// verdict (only the startup final report decides it) and the stale-
+/// report rule; the buffered-scan drop countdown is driven by the TUI's
+/// failed-re-check counter, which counts every settled no-scanner
+/// report regardless of source.
+pub async fn run_checks_as(cfg: &Config, source: ReportSource) -> Report {
     let mut items = Vec::new();
 
     // --- required/optional binaries
@@ -168,7 +183,7 @@ pub async fn run_checks(cfg: &Config) -> Report {
     Report {
         items,
         device,
-        source: ReportSource::ReRun,
+        source,
     }
 }
 
