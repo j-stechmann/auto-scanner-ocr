@@ -9,9 +9,22 @@ use super::app::App;
 #[derive(Debug)]
 pub enum Overlay {
     Help,
-    Diagnostics,
+    /// Diagnostics dialog. `auto_opened` marks the variant the app opened
+    /// itself (e.g. "no scanner found" at startup): such a dialog may be
+    /// auto-closed again when the condition resolves (scanner plugged in,
+    /// all checks ok). A user-opened one (`!`, `r`) never auto-closes.
+    Diagnostics {
+        auto_opened: bool,
+    },
     LangPicker(LangPicker),
     Confirm(Confirm),
+}
+
+impl Overlay {
+    /// Convenience constructor for the user-opened diagnostics dialog.
+    pub fn diagnostics_user() -> Self {
+        Overlay::Diagnostics { auto_opened: false }
+    }
 }
 
 /// What a confirm overlay resolves to when accepted.
@@ -181,8 +194,13 @@ pub async fn handle_key(
     use KeyCode::*;
     let keep = match overlay {
         Overlay::Help => !matches!(key.code, Esc | Char('?') | Char('q')),
-        Overlay::Diagnostics => {
+        Overlay::Diagnostics { .. } => {
             match key.code {
+                // Closing (key-only; mouse can't) does NOT clear the app's
+                // auto-opened marker: the marker means "the app already
+                // surfaced this condition once" (see App). It is reset only
+                // when the condition resolves (see apply_report) — user
+                // confirmation is not required again afterwards.
                 Esc | Char('!') | Char('q') => false,
                 Char('r') | Char('R') => {
                     // Non-blocking re-run: queue a request token; the
@@ -308,7 +326,7 @@ pub fn handle_mouse(app: &mut App, overlay: &mut Overlay, mouse: MouseEvent) -> 
         && mouse.column < rect.x + rect.width
         && mouse.row >= rect.y
         && mouse.row < rect.y + rect.height;
-    inside || matches!(overlay, Overlay::Diagnostics)
+    inside || matches!(overlay, Overlay::Diagnostics { .. })
 }
 
 #[cfg(test)]
@@ -398,8 +416,14 @@ mod tests {
                 &mut Overlay::LangPicker(LangPicker::new("eng".into())),
                 click
             ));
-            // Diagnostics never mouse-closes (accidental dismissal hurts).
-            assert!(handle_mouse(&mut app, &mut Overlay::Diagnostics, click));
+            // Diagnostics never mouse-closes (accidental dismissal hurts):
+            // the user must close it with a key, which clears the
+            // auto-opened marker.
+            assert!(handle_mouse(
+                &mut app,
+                &mut Overlay::Diagnostics { auto_opened: false },
+                click
+            ));
         }
     }
 

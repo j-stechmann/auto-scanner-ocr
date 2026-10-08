@@ -155,7 +155,11 @@ mid-pass.
 
 Exit code: `0` on a healthy session and also when quitting while the
 background scanner detection was still running (neutral); `1` only when the
-startup checks finished with failures or no scanner found.
+machine was still unhealthy at quit time (failed checks or no scanner).
+While no scanner is found, the app keeps re-checking in the background
+(every few seconds) — plug one in and it is picked up automatically: the
+error screen closes by itself and scanning unlocks. If a scanner arrives
+later and everything is healthy, a normal quit still exits `0`.
 
 ### Configuration
 

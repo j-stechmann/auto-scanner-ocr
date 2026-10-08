@@ -455,7 +455,7 @@ pub async fn handle_key(
             app.close_editor();
         }
         K::Char('?') => app.overlay = Some(Overlay::Help),
-        K::Char('!') => app.overlay = Some(Overlay::Diagnostics),
+        K::Char('!') => app.overlay = Some(Overlay::diagnostics_user()),
         K::Char('c') => {
             let Some(e) = app.editor.as_mut() else {
                 return Ok(());

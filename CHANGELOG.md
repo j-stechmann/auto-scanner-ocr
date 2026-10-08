@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Automatic scanner re-detection**: when no scanner is found (at startup or
+  after a manual diagnostics re-run), the app no longer sits on a dead-end
+  error screen — it keeps re-running detection in the background (a few
+  seconds apart) so a scanner plugged in later is picked up without user
+  action. Recovery clears the app-opened diagnostics screen by itself
+  (user-opened ones stay), unlocks scanning, and fires a buffered scan
+  intent; the status line reports what happened.
+
+### Changed
+
+- A scan intent pressed while no scanner is present is kept buffered across
+  the first failed re-checks (it fires the moment one is detected) and is
+  only dropped after 3 consecutive failed checks; previously the first
+  failed startup detection dropped it immediately.
+- Exit-code semantics: a startup failure still exits `1`, but if the scanner
+  arrives later and quitting happens on an otherwise healthy machine, the
+  exit code is `0` (recovery upgrades the verdict).
+
 ## [0.4.1] - 2026-09-23
 
 ### Changed
