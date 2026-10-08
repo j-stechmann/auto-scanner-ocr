@@ -925,7 +925,7 @@ async fn apply_report(app: &mut App, report: Report, cmd_tx: &mpsc::Sender<sessi
     // automatic re-checks keep it buffered for a few attempts before
     // giving up (see DROP_BUFFERED_SCAN_AFTER) so the intent isn't lost
     // to a single flaky detection run.
-    if app.pending_scan && !device.is_some() {
+    if app.pending_scan && device.is_none() {
         let attempts = app.failed_rechecks.max(1);
         match attempts.cmp(&DROP_BUFFERED_SCAN_AFTER) {
             std::cmp::Ordering::Less => {
@@ -1833,12 +1833,16 @@ mod tests {
 
     /// App with throwaway channels; meta/pages are set per-test. The
     /// automatic re-check timer is armed immediately so tick-driven tests
-    /// don't have to model the 2s throttle.
+    /// don't have to model the 2s throttle, and `scanimage_available` is
+    /// pre-seeded so tests don't depend on the running machine's PATH
+    /// (CI has no scanimage — the lazy `which()` probe would disable the
+    /// re-check there and spawn-less assertions would fail).
     fn test_app() -> App {
         let (diag_tx, _diag_rx) = mpsc::channel(4);
         let (finish_tx, _finish_rx) = mpsc::channel(1);
         let mut app = App::new(Config::default(), diag_tx, finish_tx);
         app.next_redetect_at = std::time::Instant::now();
+        app.scanimage_available = Some(true);
         app
     }
 
