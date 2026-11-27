@@ -367,6 +367,24 @@ impl PreviewWorker {
             if thumb.pending {
                 return; // keep the previous frame's cells until decode lands
             }
+            // Render only a COMPLETED encode. A freshly decoded protocol has
+            // not been encoded yet (its backend size is 0); the Kitty
+            // renderer computes `size.width - 1` from that and panics on the
+            // underflow. `needs_resize` is Some exactly while the current
+            // area has no encode yet, so skip the draw until sync_cells' kick
+            // lands. (Same blank-then-appear behavior as the crate's own
+            // resize_encode_render, which takes the protocol out before
+            // rendering.)
+            if thumb
+                .protocol
+                .needs_resize(
+                    &Resize::Fit(Some(FilterType::Triangle)),
+                    Size::new(rect.width, rect.height),
+                )
+                .is_some()
+            {
+                return;
+            }
             thumb.protocol.render(rect, buf);
         }
     }
@@ -777,6 +795,13 @@ impl EditorWorker {
         if rect.width == 0 || rect.height == 0 {
             return;
         }
+        // A decode adoption installs the FRESH protocol before any encode
+        // has run (size 0); the Kitty renderer underflows on that and
+        // aborts. Wait for the first completed encode (poll_encodes sets
+        // encoded_size) exactly like the "decoding…" frame.
+        if self.encoded_size.is_none() {
+            return;
+        }
         if let Some(d) = self.display.as_mut() {
             d.render(rect, buf);
         }
@@ -1029,6 +1054,45 @@ mod tests {
         let same = downscale(img, 1600);
         assert_eq!(same.width(), 800);
         assert_eq!(same.height(), 600);
+    }
+
+    /// Kitty picker for the zero-size render regressions: a freshly decoded
+    /// protocol has no encoded size yet, and the Kitty encoder underflows
+    /// `size.width - 1` when rendered in that state (panic in debug, huge
+    /// allocation / abort in release). This is the crash-on-first-page path.
+    #[allow(deprecated)]
+    pub(super) fn kitty_picker() -> ratatui_image::picker::Picker {
+        let mut picker =
+            ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(10, 20));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        picker
+    }
+
+    #[test]
+    fn render_cell_skips_freshly_decoded_protocol_before_first_encode() {
+        let mut w = PreviewWorker::new(kitty_picker());
+        let proto = w
+            .picker
+            .new_resize_protocol(image::DynamicImage::new_rgb8(100, 100));
+        let (req_tx, _req_rx) = mpsc::unbounded_channel();
+        let (_resp_tx, resp_rx) = mpsc::unbounded_channel();
+        // A thumb exactly as `poll()` installs it after a decode: protocol
+        // present, `pending` cleared, but no encode has run yet.
+        w.thumbs.insert(
+            1,
+            Thumb {
+                path: PathBuf::from("/tmp/fresh.png"),
+                gen: 0,
+                protocol: ThreadProtocol::new(req_tx, Some(proto)),
+                response_rx: resp_rx,
+                pending: false,
+            },
+        );
+        let area = Rect::new(0, 0, 20, 10);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        w.render_cell(1, area, &mut buf);
+        // Nothing was drawn (no panic, no unterminated escape sequence).
+        assert!(buf.content().iter().all(|c| c.symbol() == " "));
     }
 }
 
@@ -1463,5 +1527,22 @@ mod editor_tests {
             w.take_failure().is_some(),
             "failure surfaced for the requested content"
         );
+    }
+
+    /// Same zero-size hazard as the thumbnails: a decode adoption installs a
+    /// FRESH protocol (no encode yet) into `display`, and Kitty rendering it
+    /// in that state aborts. The worker must wait for the first encode.
+    #[test]
+    fn render_skips_fresh_display_before_first_encode() {
+        let mut w = EditorWorker::new(super::tests::kitty_picker());
+        let proto = w
+            .picker
+            .new_resize_protocol(image::DynamicImage::new_rgb8(100, 100));
+        w.display = Some(proto);
+        w.encoded_size = None;
+        let area = Rect::new(0, 0, 20, 10);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        w.render(area, &mut buf);
+        assert!(buf.content().iter().all(|c| c.symbol() == " "));
     }
 }
