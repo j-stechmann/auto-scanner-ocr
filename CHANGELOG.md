@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Crash when a scan finished (Kitty graphics)**: the first render of a
+  freshly decoded page thumbnail — and the editor's first frame after a
+  decode — passed ratatui-image a protocol that had no encoded size yet. Its
+  Kitty backend underflows on `size.width - 1` in that state, aborting the
+  whole TUI right as the scanned page appeared. Thumbnails and the editor now
+  wait for the first completed encode before drawing; the page appears a
+  moment later instead of the app dying.
+
 ## [0.5.0] - 2026-10-08
 
 ### Added
