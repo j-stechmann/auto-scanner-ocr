@@ -82,6 +82,16 @@ struct Thumb {
     response_rx: mpsc::UnboundedReceiver<Result<ResizeResponse, ratatui_image::errors::Errors>>,
     /// Decode in flight for a newer (path, gen) than the protocol holds.
     pending: bool,
+    /// A completed encode for the current protocol has been adopted. False
+    /// from the moment a fresh (re)decoded protocol is installed until the
+    /// first encode lands: rendering an unencoded protocol aborts under
+    /// Kitty (`size.width - 1` underflow). A rect change does NOT clear
+    /// this, so the draw before a resize's re-encode is kicked still uses
+    /// the last completed encode (the `needs_resize` guard skipped that
+    /// frame). Once `sync_cells` kicks, `ThreadProtocol::resize_encode`
+    /// takes the inner protocol and render is a no-op until the new encode
+    /// is adopted — the crate blanks during the encode itself.
+    encoded: bool,
 }
 
 /// Max pixel width/height we pre-decode a page to. Thumbnails can never
@@ -265,6 +275,7 @@ impl PreviewWorker {
                             thumb.path = path;
                             thumb.gen = gen;
                             thumb.pending = false;
+                            thumb.encoded = false;
                         }
                         None => {
                             // First decode for this page: create its thumb
@@ -281,6 +292,7 @@ impl PreviewWorker {
                                     protocol: ThreadProtocol::new(req_tx, Some(*proto)),
                                     response_rx: resp_rx,
                                     pending: false,
+                                    encoded: false,
                                 },
                             );
                             // The protocol sends resize requests on req_rx;
@@ -314,6 +326,7 @@ impl PreviewWorker {
                             // otherwise indicates channel-routing trouble.
                             tracing::debug!("preview: dropped stale encode response");
                         } else {
+                            thumb.encoded = true;
                             changed = true;
                         }
                     }
@@ -370,19 +383,13 @@ impl PreviewWorker {
             // Render only a COMPLETED encode. A freshly decoded protocol has
             // not been encoded yet (its backend size is 0); the Kitty
             // renderer computes `size.width - 1` from that and panics on the
-            // underflow. `needs_resize` is Some exactly while the current
-            // area has no encode yet, so skip the draw until sync_cells' kick
-            // lands. (Same blank-then-appear behavior as the crate's own
-            // resize_encode_render, which takes the protocol out before
-            // rendering.)
-            if thumb
-                .protocol
-                .needs_resize(
-                    &Resize::Fit(Some(FilterType::Triangle)),
-                    Size::new(rect.width, rect.height),
-                )
-                .is_some()
-            {
+            // underflow. Unlike `needs_resize` (which also reports Some on
+            // every rect change), this flag stays set across a resize, so
+            // the draw before sync_cells' kick still uses the last completed
+            // encode. After the kick the crate's ThreadProtocol holds no
+            // inner protocol until the re-encode is adopted, so render is a
+            // no-op for that window (pre-existing crate behavior).
+            if !thumb.encoded {
                 return;
             }
             thumb.protocol.render(rect, buf);
@@ -390,9 +397,11 @@ impl PreviewWorker {
     }
 
     /// Is the given page's thumbnail loaded (decode done, not replaced by a
-    /// newer pending decode)? Note: mid-re-encode the protocol still counts
-    /// as "has image" — the cell just re-renders blank until the encode
-    /// lands (crate design); showing "no image" there would be wrong.
+    /// newer pending decode)? Note: a fresh decode counts as "has image"
+    /// even before its first encode lands — the cell renders blank for that
+    /// brief window. The draw before a resize's re-encode is kicked still
+    /// shows the previous encode; the crate blanks while the encode is in
+    /// flight. Showing "no image" there would be wrong.
     pub fn has_image_for(&self, id: PageId) -> bool {
         self.thumbs.get(&id).is_some_and(|t| !t.pending)
     }
@@ -1086,6 +1095,7 @@ mod tests {
                 protocol: ThreadProtocol::new(req_tx, Some(proto)),
                 response_rx: resp_rx,
                 pending: false,
+                encoded: false,
             },
         );
         let area = Rect::new(0, 0, 20, 10);
@@ -1093,6 +1103,99 @@ mod tests {
         w.render_cell(1, area, &mut buf);
         // Nothing was drawn (no panic, no unterminated escape sequence).
         assert!(buf.content().iter().all(|c| c.symbol() == " "));
+    }
+
+    /// Complement of the skip test: once the first encode is adopted the
+    /// thumb renders, and a rect change (terminal resize / grid re-layout)
+    /// still renders the LAST encode on the frame before `sync_cells` kicks
+    /// — the extra blank frame the `needs_resize` guard introduced. This
+    /// does NOT cover the window after the kick:
+    /// `ThreadProtocol::resize_encode` takes the inner protocol, so render
+    /// is a no-op until the re-encode is adopted (pre-existing crate
+    /// behavior).
+    #[tokio::test]
+    async fn render_cell_draws_encoded_thumb_until_resize_kick() {
+        let mut w = PreviewWorker::new(kitty_picker());
+        let proto = w
+            .picker
+            .new_resize_protocol(image::DynamicImage::new_rgb8(100, 100));
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        spawn_encode_worker(req_rx, resp_tx);
+        w.thumbs.insert(
+            1,
+            Thumb {
+                path: PathBuf::from("/tmp/encoded.png"),
+                gen: 0,
+                protocol: ThreadProtocol::new(req_tx, Some(proto)),
+                response_rx: resp_rx,
+                pending: false,
+                encoded: false,
+            },
+        );
+        let area = Rect::new(0, 0, 20, 10);
+        w.sync_cells(&[(1, area)]);
+        let mut adopted = false;
+        for _ in 0..100 {
+            if w.poll_resizes() {
+                adopted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(adopted, "first encode adopted");
+        assert!(w.thumbs.get(&1).is_some_and(|t| t.encoded));
+
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        w.render_cell(1, area, &mut buf);
+        assert!(
+            buf.content().iter().any(|c| c.symbol() != " "),
+            "adopted encode must render"
+        );
+
+        // Shrink below the encoded size so the new rect genuinely needs a
+        // re-encode (Resize::Fit caps at the source dims, so a larger area
+        // maps to the same rect).
+        let resized = Rect::new(0, 0, 8, 4);
+        let needs = w
+            .thumbs
+            .get(&1)
+            .unwrap()
+            .protocol
+            .needs_resize(
+                &Resize::Fit(Some(FilterType::Triangle)),
+                Size::new(resized.width, resized.height),
+            )
+            .is_some();
+        assert!(needs, "sanity: the smaller rect needs a re-encode");
+
+        // Before the kick the last encode still draws into the new rect (the
+        // old `needs_resize` guard skipped this frame).
+        let mut buf = ratatui::buffer::Buffer::empty(resized);
+        w.render_cell(1, resized, &mut buf);
+        assert!(
+            buf.content().iter().any(|c| c.symbol() != " "),
+            "resized cell must keep the last encode before the kick"
+        );
+
+        // And the re-encode the resize kicked off converges: once adopted,
+        // the resized cell renders again.
+        w.sync_cells(&[(1, resized)]);
+        let mut adopted = false;
+        for _ in 0..100 {
+            if w.poll_resizes() {
+                adopted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(adopted, "resize re-encode adopted");
+        let mut buf = ratatui::buffer::Buffer::empty(resized);
+        w.render_cell(1, resized, &mut buf);
+        assert!(
+            buf.content().iter().any(|c| c.symbol() != " "),
+            "adopted resize encode must render"
+        );
     }
 }
 
@@ -1531,18 +1634,39 @@ mod editor_tests {
 
     /// Same zero-size hazard as the thumbnails: a decode adoption installs a
     /// FRESH protocol (no encode yet) into `display`, and Kitty rendering it
-    /// in that state aborts. The worker must wait for the first encode.
-    #[test]
-    fn render_skips_fresh_display_before_first_encode() {
+    /// in that state aborts. The worker must wait for the first encode, then
+    /// render it.
+    #[tokio::test]
+    async fn render_skips_fresh_display_until_first_encode() {
         let mut w = EditorWorker::new(super::tests::kitty_picker());
-        let proto = w
-            .picker
-            .new_resize_protocol(image::DynamicImage::new_rgb8(100, 100));
+        let img = image::DynamicImage::new_rgb8(100, 100);
+        let proto = w.picker.new_resize_protocol(img.clone());
         w.display = Some(proto);
+        w.base = Some(img);
         w.encoded_size = None;
         let area = Rect::new(0, 0, 20, 10);
         let mut buf = ratatui::buffer::Buffer::empty(area);
         w.render(area, &mut buf);
         assert!(buf.content().iter().all(|c| c.symbol() == " "));
+
+        // Once the first encode is adopted the display renders (the guard
+        // must open; otherwise the editor would stay blank forever).
+        w.request_encode(ratatui::layout::Size::new(8, 4), None);
+        let mut adopted = false;
+        for _ in 0..100 {
+            w.flush_queue();
+            if w.poll_encodes() {
+                adopted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(adopted, "first encode adopted");
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        w.render(area, &mut buf);
+        assert!(
+            buf.content().iter().any(|c| c.symbol() != " "),
+            "adopted encode must render"
+        );
     }
 }

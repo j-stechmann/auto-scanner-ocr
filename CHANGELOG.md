@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   decode — passed ratatui-image a protocol that had no encoded size yet. Its
   Kitty backend underflows on `size.width - 1` in that state, aborting the
   whole TUI right as the scanned page appeared. Thumbnails and the editor now
-  wait for the first completed encode before drawing; the page shows up
-  normally instead of the app dying.
+  wait for the first completed encode before drawing; the page appears a
+  moment later instead of the app dying.
 
 ## [0.5.0] - 2026-10-08
 
